@@ -47,8 +47,8 @@ if os.path.exists(x509_verify):
 # 2. 全局强制 InsecureSkipVerify = true
 tls_conf_path = "transport/internet/tls/config.go"
 if os.path.exists(tls_conf_path):
-  with open(tls_conf_path, "r", encoding="utf-8") as f:
-    code = f.read()
+  with open(tls_conf_path, "r", encoding="utf-8") as file:
+    code = file.read()
   code = re.sub(
       r"(&tls\.Config\{)", r"\1\n\t\tInsecureSkipVerify: true,", code
   )
@@ -84,16 +84,15 @@ for root, _, files in os.walk("."):
         with open(fpath, "w", encoding="utf-8") as file:
           file.write(c)
 
-# 3. 注入带真实出站标签的 UDP 10091 广播钩子（修复：Dispatch 和 DispatchLink 双挂钩）
+# 3. 注入 UDP 10091 双保险广播钩子
 disp_path = "app/dispatcher/default.go"
 if os.path.exists(disp_path):
   with open(disp_path, "r", encoding="utf-8") as file:
     disp = file.read()
 
   if 'stdnet "net"' not in disp:
-    disp = disp.replace("import (", 'import (\n\tstdnet "net"', 1)
+    disp = disp.replace("import (", 'import (\n\tstdnet "net"\n\t"fmt"', 1)
 
-  # 纯净的 notifyHUD 函数，严禁加任何无用前缀
   hud_func = """
 
 // notifyHUD 内存广播钩子
@@ -104,39 +103,56 @@ func notifyHUD(tag interface{}, dest net.Destination) {
 				conn.Write([]byte(tStr + "|" + target))
 				conn.Close()
 			}
-		}(toTagStr(tag), dest.String())
+		}(fmt.Sprint(tag), dest.String())
 	}
-}
-
-func toTagStr(v interface{}) string {
-	if s, ok := v.(string); ok && s != "" {
-		return s
-	}
-	return "proxy"
 }
 """
   if "func notifyHUD" not in disp:
     disp += hud_func
 
-  # 核心修复：对所有出现 taking detour 的地方全部注入（覆盖浏览器走的 DispatchLink）
-  lines = disp.splitlines()
-  new_lines = []
-  hook_count = 0
-  for line in lines:
-    new_lines.append(line)
-    if 'newError("taking detour [' in line:
-      indent = line[: len(line) - len(line.lstrip())]
-      if "destination.Tag" in line:
-        new_lines.append(f"{indent}notifyHUD(destination.Tag, destination)")
-        hook_count += 1
-      elif "tag" in line:
-        new_lines.append(f"{indent}notifyHUD(tag, destination)")
-        hook_count += 1
+  # 方案 A：通用正则动态捕获 taking detour 那一行的真实 tag 变量与 destination 变量
+  pattern_detour = r'(taking detour \[\",\s*([^,]+),\s*\"\] for \[\",\s*([^,\)]+))'
+  m_detour = re.search(pattern_detour, disp)
+  if m_detour:
+    tag_var = m_detour.group(2)
+    dest_var = m_detour.group(3)
+    disp = re.sub(
+        pattern_detour,
+        rf'\1\n\tnotifyHUD({tag_var}, {dest_var})',
+        disp,
+        count=1,
+    )
+    print(f"[Patch 3/3] 成功挂钩 detour 决断点: tag={tag_var}, dest={dest_var}")
 
-  disp = "\n".join(new_lines)
-  print(f"[Patch 3/3] 成功挂钩 {hook_count} 处决断点（已覆盖所有代理入站流量）！")
+  # 方案 B（双保险）：在 Dispatch 与 DispatchLink 入口始终植入保底广播，杜绝断流
+  match_dispatch = re.search(
+      r"func \(d \*DefaultDispatcher\) Dispatch\([^,]+,\s*([a-zA-Z0-9_]+)\s+net\.Destination",
+      disp,
+  )
+  if match_dispatch:
+    pname = match_dispatch.group(1)
+    disp = re.sub(
+        r"(func \(d \*DefaultDispatcher\) Dispatch\([^{]+\{)",
+        rf'\1\n\tnotifyHUD("ingress", {pname})',
+        disp,
+        count=1,
+    )
+
+  match_link = re.search(
+      r"func \(d \*DefaultDispatcher\) DispatchLink\([^,]+,\s*([a-zA-Z0-9_]+)\s+net\.Destination",
+      disp,
+  )
+  if match_link:
+    pname_link = match_link.group(1)
+    disp = re.sub(
+        r"(func \(d \*DefaultDispatcher\) DispatchLink\([^{]+\{)",
+        rf'\1\n\tnotifyHUD("ingress", {pname_link})',
+        disp,
+        count=1,
+    )
 
   with open(disp_path, "w", encoding="utf-8") as file:
     file.write(disp)
+  print("[Patch 3/3] UDP 10091 双保险内存广播注入完成！")
 
 print(">>> 全部补丁写入完成！")
