@@ -47,8 +47,8 @@ if os.path.exists(x509_verify):
 # 2. 全局强制 InsecureSkipVerify = true
 tls_conf_path = "transport/internet/tls/config.go"
 if os.path.exists(tls_conf_path):
-  with open(tls_conf_path, "r", encoding="utf-8") as file:
-    code = file.read()
+  with open(tls_conf_path, "r", encoding="utf-8") as f:
+    code = f.read()
   code = re.sub(
       r"(&tls\.Config\{)", r"\1\n\t\tInsecureSkipVerify: true,", code
   )
@@ -84,75 +84,51 @@ for root, _, files in os.walk("."):
         with open(fpath, "w", encoding="utf-8") as file:
           file.write(c)
 
-# 3. 注入 UDP 10091 双保险广播钩子
+# 3. 注入精确到行的 UDP 10091 广播钩子（无需任何正则，零报错风险）
 disp_path = "app/dispatcher/default.go"
 if os.path.exists(disp_path):
   with open(disp_path, "r", encoding="utf-8") as file:
-    disp = file.read()
+    content = file.read()
 
-  if 'stdnet "net"' not in disp:
-    disp = disp.replace("import (", 'import (\n\tstdnet "net"\n\t"fmt"', 1)
+  # 导入标准库 net (别名 stdnet，绝不引入多余包)
+  if 'stdnet "net"' not in content:
+    content = content.replace("import (", 'import (\n\tstdnet "net"', 1)
 
+  # 纯净广播函数：原生字符串拼接，无多余依赖
   hud_func = """
 
 // notifyHUD 内存广播钩子
-func notifyHUD(tag interface{}, dest net.Destination) {
-	if dest.Address != nil {
-		go func(tStr, target string) {
+func notifyHUD(tag string, dest string) {
+	if dest != "" {
+		go func(msg string) {
 			if conn, err := stdnet.Dial("udp", "127.0.0.1:10091"); err == nil {
-				conn.Write([]byte(tStr + "|" + target))
+				conn.Write([]byte(msg))
 				conn.Close()
 			}
-		}(fmt.Sprint(tag), dest.String())
+		}(tag + "|" + dest)
 	}
 }
 """
-  if "func notifyHUD" not in disp:
-    disp += hud_func
+  if "func notifyHUD" not in content:
+    content += hud_func
 
-  # 方案 A：通用正则动态捕获 taking detour 那一行的真实 tag 变量与 destination 变量
-  pattern_detour = r'(taking detour \[\",\s*([^,]+),\s*\"\] for \[\",\s*([^,\)]+))'
-  m_detour = re.search(pattern_detour, disp)
-  if m_detour:
-    tag_var = m_detour.group(2)
-    dest_var = m_detour.group(3)
-    disp = re.sub(
-        pattern_detour,
-        rf'\1\n\tnotifyHUD({tag_var}, {dest_var})',
-        disp,
-        count=1,
-    )
-    print(f"[Patch 3/3] 成功挂钩 detour 决断点: tag={tag_var}, dest={dest_var}")
+  lines = content.splitlines()
+  new_lines = []
+  hook_injected = False
 
-  # 方案 B（双保险）：在 Dispatch 与 DispatchLink 入口始终植入保底广播，杜绝断流
-  match_dispatch = re.search(
-      r"func \(d \*DefaultDispatcher\) Dispatch\([^,]+,\s*([a-zA-Z0-9_]+)\s+net\.Destination",
-      disp,
-  )
-  if match_dispatch:
-    pname = match_dispatch.group(1)
-    disp = re.sub(
-        r"(func \(d \*DefaultDispatcher\) Dispatch\([^{]+\{)",
-        rf'\1\n\tnotifyHUD("ingress", {pname})',
-        disp,
-        count=1,
-    )
+  for line in lines:
+    new_lines.append(line)
+    # 精准锚定 taking detour 所在行
+    if "taking detour" in line and not line.strip().startswith("//"):
+      indent = line[: len(line) - len(line.lstrip())]
+      new_lines.append(f"{indent}notifyHUD(tag, destination.String())")
+      hook_injected = True
 
-  match_link = re.search(
-      r"func \(d \*DefaultDispatcher\) DispatchLink\([^,]+,\s*([a-zA-Z0-9_]+)\s+net\.Destination",
-      disp,
-  )
-  if match_link:
-    pname_link = match_link.group(1)
-    disp = re.sub(
-        r"(func \(d \*DefaultDispatcher\) DispatchLink\([^{]+\{)",
-        rf'\1\n\tnotifyHUD("ingress", {pname_link})',
-        disp,
-        count=1,
-    )
+  if not hook_injected:
+    raise RuntimeError("【构建中断】未能定位 default.go 中的 'taking detour' 行！")
 
   with open(disp_path, "w", encoding="utf-8") as file:
-    file.write(disp)
-  print("[Patch 3/3] UDP 10091 双保险内存广播注入完成！")
+    file.write("\n".join(new_lines))
+  print("[Patch 3/3] 成功挂钩 taking detour 真实决断点！")
 
 print(">>> 全部补丁写入完成！")
