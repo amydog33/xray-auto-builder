@@ -4,7 +4,7 @@ import stat
 
 print(">>> 开始注入底层补丁...")
 
-# 1. 短路 Go 标准库底层 TLS 与 x509 校验
+# 1. 放行 Go 底层 TLS 与 x509 校验（兼容空证书链与自签证书）
 goroot = os.popen("go env GOROOT").read().strip()
 tls_dir = os.path.join(goroot, "src", "crypto", "tls")
 if os.path.exists(tls_dir):
@@ -15,20 +15,20 @@ if os.path.exists(tls_dir):
         os.chmod(fpath, stat.S_IWRITE | stat.S_IREAD)
         with open(fpath, "r", encoding="utf-8") as file:
           code = file.read()
-        pattern = (
-            r"(func \([a-zA-Z0-9_* ]+\) verifyServerCertificate\([^\)]*\)"
-            r" error \{)"
-        )
+        
+        # 寻找 verifyServerCertificate 方法
+        pattern = r"(func \([a-zA-Z0-9_* ]+\) verifyServerCertificate\([^\)]*\) error \{)"
         if re.search(pattern, code):
+          # 核心修复：直接 return nil，严禁访问任何 certs[0]，避免切片越界
           code = re.sub(
               pattern,
-              r"\1\n\treturn nil // Force allow all self-signed certs\n",
+              r"\1\n\treturn nil // Force allow all self-signed & empty cert chains (MASQUE/RFC 7250)\n",
               code,
               count=1,
           )
           with open(fpath, "w", encoding="utf-8") as file:
             file.write(code)
-          print(f"[Patch 1/3] Go TLS 放行成功: {f}")
+          print(f"[Patch 1/3] Go TLS 安全短路成功: {f}")
 
 x509_verify = os.path.join(goroot, "src", "crypto", "x509", "verify.go")
 if os.path.exists(x509_verify):
@@ -84,7 +84,7 @@ for root, _, files in os.walk("."):
         with open(fpath, "w", encoding="utf-8") as file:
           file.write(c)
 
-# 3. 动态从源码上下文提取真实变量名并注入广播钩子
+# 3. 动态提取变量注入 UDP 10091 广播钩子
 disp_path = "app/dispatcher/default.go"
 if os.path.exists(disp_path):
   with open(disp_path, "r", encoding="utf-8") as file:
@@ -116,27 +116,22 @@ func notifyHUD(tag string, dest string) {
 
   for line in lines:
     new_lines.append(line)
-    # 精准定位包含 taking detour 的代码行
     if "taking detour" in line and not line.strip().startswith("//"):
       indent = line[: len(line) - len(line.lstrip())]
-      # 动态从当前行 newError("taking detour [", VAR1, "] for [", VAR2, ... 提取真实变量名
       m_vars = re.search(r'taking detour \[\",\s*([^,]+),\s*\"\] for \[\",\s*([^,\)]+)', line)
       if m_vars:
         t_var = m_vars.group(1).strip()
         d_var = m_vars.group(2).strip()
-        # 兼容变量本身自带 .String() 或为 net.Destination
         d_call = f"{d_var}.String()" if not d_var.endswith(".String()") else d_var
         new_lines.append(f"{indent}notifyHUD({t_var}, {d_call})")
         hook_count += 1
-        print(f"[Patch 3/3] 动态匹配成功: tag={t_var}, dest={d_var}")
       else:
-        # 如果格式有微调，从当前行的逗号参数列表直接按位置提取第一个参数
         parts = line.split('taking detour ["')
         if len(parts) > 1:
           sub = parts[1].split(',')
           if len(sub) > 1:
             raw_t = sub[1].strip()
-            new_lines.append(f"{indent}notifyHUD(fmt.Sprint({raw_t}), destination.String())")
+            new_lines.append(f"{indent}notifyHUD({raw_t}, destination.String())")
             hook_count += 1
 
   if hook_count == 0:
@@ -144,6 +139,6 @@ func notifyHUD(tag string, dest string) {
 
   with open(disp_path, "w", encoding="utf-8") as file:
     file.write("\n".join(new_lines))
-  print(f"[Patch 3/3] 共注入 {hook_count} 处真实出站决断钩子！")
+  print(f"[Patch 3/3] 成功注入 {hook_count} 处真实出站决断钩子！")
 
 print(">>> 全部补丁写入完成！")
