@@ -1,0 +1,53 @@
+name: Auto Build Latest Xray with allowInsecure
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # 每天自动同步一次官方更新
+  workflow_dispatch:      # 允许随时在网页上手动点击构建
+
+permissions:
+  contents: write         # 授予 Actions 发布 Release 的权限
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Clone Latest Xray-core
+        run: |
+          git clone --depth 1 https://github.com/XTLS/Xray-core.git .
+          TAG=$(git describe --tags `git rev-list --tags --max-count=1` 2>/dev/null || echo "latest")
+          echo "LATEST_TAG=$TAG" >> $GITHUB_ENV
+          echo "Target Version: $TAG"
+
+      - name: Patch allowInsecure Removal
+        run: |
+          # 1. 消除已弃用报错阻断分支
+          find . -type f -name "*.go" -exec sed -i 's/The feature "allowInsecure" has been removed.*/allowInsecure permitted by patch/g' {} +
+          # 2. 强制恢复 TLS InsecureSkipVerify 支持
+          sed -i 's/config.InsecureSkipVerify = false/config.InsecureSkipVerify = true/g' infra/conf/tls.go || true
+          sed -i 's/return nil, newError("The feature \\"allowInsecure\\".*)/config.InsecureSkipVerify = true/g' infra/conf/tls.go || true
+
+      - name: Build Windows Binary
+        run: |
+          export CGO_ENABLED=0
+          export GOOS=windows
+          export GOARCH=amd64
+          go build -o xray.exe -trimpath -ldflags="-s -w -buildid=" ./main
+          zip -9 xray-windows-64.zip xray.exe
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Xray-core ${{ env.LATEST_TAG }} (Insecure-Supported)
+          body: |
+            自动构建完成时间: ${{ github.event.head_commit.timestamp }}
+            基于官方最新主分支源码，已解除 allowInsecure 拦截限制。
+          files: xray-windows-64.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
