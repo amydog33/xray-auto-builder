@@ -1,4 +1,4 @@
-name: Auto Build Latest Xray with allowInsecure
+name: Auto Build Latest Xray (Insecure + HUD Memory Hook)
 
 on:
   schedule:
@@ -24,36 +24,66 @@ jobs:
           go-version: '1.24'
           cache: false
 
-      - name: Patch allowInsecure
+      - name: Patch TLS, Legacy CN and Inject HUD Memory Hook
         run: |
           python3 -c '
-          import os
+          import os, re
 
-          patched = False
+          # 1. 修补 Go 标准库：彻底放行 legacy Common Name，移除 SAN 报错
+          goroot = os.popen("go env GOROOT").read().strip()
+          x509_verify = os.path.join(goroot, "src", "crypto", "x509", "verify.go")
+          if os.path.exists(x509_verify):
+              with open(x509_verify, "r", encoding="utf-8") as f:
+                  code = f.read()
+              # 匹配并移除 Common Name 校验报错拦截
+              code = re.sub(r"return CertificateInvalidError\{[^\}]*legacy Common Name[^\}]*\}", "return nil", code)
+              with open(x509_verify, "w", encoding="utf-8") as f:
+                  f.write(code)
+              print("[Patch 1/3] Go x509: Legacy Common Name 校验已彻底放行！")
+
+          # 2. 修补 Xray 源码：移除 allowInsecure 限制，全局强制 InsecureSkipVerify
           for root, _, files in os.walk("."):
               for file in files:
                   if file.endswith(".go"):
                       fpath = os.path.join(root, file)
                       with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                          lines = f.readlines()
-                      new_lines = []
-                      modified = False
-                      for line in lines:
-                          # 匹配并替换拦截 allowInsecure 报错的语句
-                          if "allowInsecure" in line and ("has been removed" in line or "deprecated" in line):
-                              indent = line[:len(line) - len(line.lstrip())]
-                              new_lines.append(f"{indent}config.InsecureSkipVerify = true // patched\n")
-                              modified = True
-                              patched = True
-                          else:
-                              new_lines.append(line)
-                      if modified:
+                          c = f.read()
+                      orig = c
+                      if "allowInsecure" in c and "has been removed" in c:
+                          c = re.sub(r"return nil, newError\([^\)]*allowInsecure[^\)]*\)", "config.InsecureSkipVerify = true", c)
+                      if "InsecureSkipVerify" in c:
+                          c = c.replace("InsecureSkipVerify: false", "InsecureSkipVerify: true")
+                      if c != orig:
                           with open(fpath, "w", encoding="utf-8") as f:
-                              f.writelines(new_lines)
-                          print(f"Successfully patched: {fpath}")
+                              f.write(c)
+          print("[Patch 2/3] Xray-core: InsecureSkipVerify 强制放行完成！")
 
-          if not patched:
-              print("Warning: Deprecation string not matched, checking general config")
+          # 3. 注入内存广播钩子到核心调度器 (app/dispatcher/default.go)
+          disp_path = "app/dispatcher/default.go"
+          if os.path.exists(disp_path):
+              with open(disp_path, "r", encoding="utf-8") as f:
+                  disp = f.read()
+
+              if "stdnet \"net\"" not in disp:
+                  disp = disp.replace("import (", "import (\n\tstdnet \"net\"", 1)
+
+              # 在 Dispatch 入口植入非阻塞 UDP 内存广播 (127.0.0.1:10091)
+              hook_str = """
+	if dest.Address != nil {
+		go func(target string) {
+			if conn, err := stdnet.Dial("udp", "127.0.0.1:10091"); err == nil {
+				conn.Write([]byte(target))
+				conn.Close()
+			}
+		}(dest.String())
+	}
+"""
+              pattern = r"(func \(d \*DefaultDispatcher\) Dispatch\(ctx context\.Context, dest net\.Destination\) \(\*transport\.Link, error\) \{)"
+              disp = re.sub(pattern, r"\1" + hook_str, disp, count=1)
+
+              with open(disp_path, "w", encoding="utf-8") as f:
+                  f.write(disp)
+              print("[Patch 3/3] Xray-core: 127.0.0.1:10091 内存流广播钩子注入成功！")
           '
 
       - name: Build Windows Binary
@@ -68,10 +98,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
-          name: Xray-core (allowInsecure Enabled)
+          name: Xray-core (Insecure + HUD-MemoryStream)
           body: |
             构建时间: ${{ github.event.head_commit.timestamp }}
-            基于官方最新 Xray-core 构建，已恢复并放行 allowInsecure 自签证书。
+            1. 彻底解决自签 Hy2 节点的 Legacy CN / SAN 证书报错。
+            2. 内置 127.0.0.1:10091 UDP 内存域名流，零磁盘日志读写。
           files: xray-windows-64.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
