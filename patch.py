@@ -51,8 +51,8 @@ if os.path.exists(x509_verify):
 # 2. 移除 Xray 源码内部对 allowInsecure 的报错拦截，全局强制 InsecureSkipVerify = true
 tls_conf_path = "transport/internet/tls/config.go"
 if os.path.exists(tls_conf_path):
-  with open(tls_conf_path, "r", encoding="utf-8") as f:
-    code = f.read()
+  with open(tls_conf_path, "r", encoding="utf-8") as file:
+    code = file.read()
   code = re.sub(
       r"(&tls\.Config\{)", r"\1\n\t\tInsecureSkipVerify: true,", code
   )
@@ -61,8 +61,8 @@ if os.path.exists(tls_conf_path):
       "config.InsecureSkipVerify = true",
       code,
   )
-  with open(tls_conf_path, "w", encoding="utf-8") as f:
-    f.write(code)
+  with open(tls_conf_path, "w", encoding="utf-8") as file:
+    file.write(code)
   print(f"[Patch 2/3] Xray-core TLS 工厂强制放行: {tls_conf_path}")
 
 for root, _, files in os.walk("."):
@@ -94,50 +94,72 @@ if os.path.exists(disp_path):
   with open(disp_path, "r", encoding="utf-8") as file:
     disp = file.read()
 
+  # 纯净注入，绝不引入多余的 fmt 包，避免 Go 编译未使用报错
   if 'stdnet "net"' not in disp:
-    disp = disp.replace("import (", 'import (\n\tstdnet "net"\n\t"fmt"', 1)
+    disp = disp.replace("import (", 'import (\n\tstdnet "net"', 1)
 
-  # 写入升级版通知函数：广播 "tag|target"
   hud_func = """
 
-// notifyHUD 内存广播钩子 (带真实出站 tag)
-func notifyHUD(tag string, dest net.Destination) {
+// notifyHUD 内存广播钩子 (接收 interface{} 类型的 tag，无需外部转换)
+func notifyHUD(tag interface{}, dest net.Destination) {
 	if dest.Address != nil {
-		go func(msg string) {
+		go func(tStr, target string) {
 			if conn, err := stdnet.Dial("udp", "127.0.0.1:10091"); err == nil {
-				conn.Write([]byte(msg))
+				conn.Write([]byte(tStr + "|" + target))
 				conn.Close()
 			}
-		}(tag + "|" + dest.String())
+		}(net.Destination{}.String() + "" + toTagStr(tag), dest.String())
+	}
+}
+
+func toTagStr(v interface{}) string {
+	switch val := v.(type) {
+	case string:
+		return val
+	default:
+		return "proxy"
 	}
 }
 """
   if "func notifyHUD" not in disp:
     disp += hud_func
 
-  # 挂钩到 Xray 确定出站 detour 的决断代码处
-  pattern_detour = r'(newError\("taking detour \[\",\s*([a-zA-Z0-9_\.]+),\s*\"\] for \[\",\s*([a-zA-Z0-9_\.]+))'
-  if re.search(pattern_detour, disp):
-    disp = re.sub(
-        pattern_detour,
-        r"\1\n\tnotifyHUD(fmt.Sprint(\2), \3)",
-        disp,
-        count=1,
-    )
-    print("[Patch 3/3] 成功挂钩 Xray detour 真实出站决策点！")
-  else:
-    # 备用入口
-    pattern_dispatch = r"func \(d \*DefaultDispatcher\) Dispatch\([^,]+,\s*([a-zA-Z0-9_]+)\s+net\.Destination"
-    m = re.search(pattern_dispatch, disp)
-    if m:
-      pname = m.group(1)
+  # 1. 优先挂钩 detour 决策位置（taking detour [tag] for [dest]）
+  if 'taking detour [' in disp:
+    # 只要在 newError("taking detour [", ... 这一行下面直接插调用
+    lines = disp.splitlines()
+    new_lines = []
+    detour_injected = False
+    for line in lines:
+      new_lines.append(line)
+      if 'newError("taking detour [' in line and not detour_injected:
+        # 提取当前上下文变量名，通常是 destination.Tag 或 tag
+        indent = line[:len(line) - len(line.lstrip())]
+        if 'destination.Tag' in line:
+          new_lines.append(f"{indent}notifyHUD(destination.Tag, destination)")
+          detour_injected = True
+        elif 'tag' in line:
+          new_lines.append(f"{indent}notifyHUD(tag, destination)")
+          detour_injected = True
+        else:
+          new_lines.append(f'{indent}notifyHUD("detour", destination)')
+          detour_injected = True
+    disp = "\n".join(new_lines)
+    if detour_injected:
+      print("[Patch 3/3] 成功精准挂钩 detour 决断行！")
+
+  # 2. 如果没挂上 detour，挂钩 Dispatch 入口作为备用
+  if "notifyHUD" not in disp.split("func (d *DefaultDispatcher) Dispatch")[1].split("func (d *DefaultDispatcher) DispatchLink")[0]:
+    match_disp = re.search(r"func \(d \*DefaultDispatcher\) Dispatch\([^,]+,\s*([a-zA-Z0-9_]+)\s+net\.Destination", disp)
+    if match_disp:
+      pname = match_disp.group(1)
       disp = re.sub(
           r"(func \(d \*DefaultDispatcher\) Dispatch\([^{]+\{)",
-          r'\1\n\tnotifyHUD("proxy", ' + pname + ")",
+          r'\1\n\tnotifyHUD("direct_or_proxy", ' + pname + ")",
           disp,
           count=1,
       )
-      print("[Patch 3/3] 备用挂钩 Dispatch 成功！")
+      print("[Patch 3/3] 挂钩 Dispatch 入口完成！")
 
   with open(disp_path, "w", encoding="utf-8") as file:
     file.write(disp)
