@@ -24,50 +24,45 @@ jobs:
           go-version: '1.24'
           cache: false
 
-      - name: Patch TLS, Legacy CN and Inject HUD Memory Hook
+      - name: Patch TLS Handshake and Inject HUD Hook
         run: |
-          python3 -c '
+          cat << 'EOF' > patch.py
           import os, re
 
-          # 1. 修补 Go 标准库：彻底放行 legacy Common Name，移除 SAN 报错
+          # 1. 终极解法：直接短路 Go 标准库的 TLS 证书校验函数
+          # 无论是自签、域名不匹配、过期、还是没有 SAN，Go 都会放行
           goroot = os.popen("go env GOROOT").read().strip()
-          x509_verify = os.path.join(goroot, "src", "crypto", "x509", "verify.go")
-          if os.path.exists(x509_verify):
-              with open(x509_verify, "r", encoding="utf-8") as f:
+          tls_client = os.path.join(goroot, "src", "crypto", "tls", "handshake_client.go")
+          if os.path.exists(tls_client):
+              with open(tls_client, "r", encoding="utf-8") as f:
                   code = f.read()
-              # 匹配并移除 Common Name 校验报错拦截
-              code = re.sub(r"return CertificateInvalidError\{[^\}]*legacy Common Name[^\}]*\}", "return nil", code)
-              with open(x509_verify, "w", encoding="utf-8") as f:
+              # 在 verifyServerCertificate 函数第一行直接插入 return nil
+              pattern = r"(func \(c \*clientHandshakeState[^\)]*\) verifyServerCertificate\([^\)]*\) error \{)"
+              code = re.sub(pattern, r"\1\n\treturn nil // Force allow all self-signed certs\n", code, count=1)
+              with open(tls_client, "w", encoding="utf-8") as f:
                   f.write(code)
-              print("[Patch 1/3] Go x509: Legacy Common Name 校验已彻底放行！")
+              print("[Patch 1/3] Go TLS: 客户端底层证书校验已短路放行！")
 
-          # 2. 修补 Xray 源码：移除 allowInsecure 限制，全局强制 InsecureSkipVerify
+          # 2. 移除 Xray 自身配置解析阶段对 allowInsecure 的报错拦截
           for root, _, files in os.walk("."):
               for file in files:
                   if file.endswith(".go"):
                       fpath = os.path.join(root, file)
                       with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
                           c = f.read()
-                      orig = c
                       if "allowInsecure" in c and "has been removed" in c:
-                          c = re.sub(r"return nil, newError\([^\)]*allowInsecure[^\)]*\)", "config.InsecureSkipVerify = true", c)
-                      if "InsecureSkipVerify" in c:
-                          c = c.replace("InsecureSkipVerify: false", "InsecureSkipVerify: true")
-                      if c != orig:
+                          c = re.sub(r'return nil, newError\([^\)]*allowInsecure[^\)]*\)', 'config.InsecureSkipVerify = true', c)
                           with open(fpath, "w", encoding="utf-8") as f:
                               f.write(c)
-          print("[Patch 2/3] Xray-core: InsecureSkipVerify 强制放行完成！")
+                          print(f"[Patch 2/3] Xray-core: 移除配置废弃拦截 -> {fpath}")
 
-          # 3. 注入内存广播钩子到核心调度器 (app/dispatcher/default.go)
+          # 3. 注入 UDP 127.0.0.1:10091 内存域名广播钩子
           disp_path = "app/dispatcher/default.go"
           if os.path.exists(disp_path):
               with open(disp_path, "r", encoding="utf-8") as f:
                   disp = f.read()
-
-              if "stdnet \"net\"" not in disp:
-                  disp = disp.replace("import (", "import (\n\tstdnet \"net\"", 1)
-
-              # 在 Dispatch 入口植入非阻塞 UDP 内存广播 (127.0.0.1:10091)
+              if 'stdnet "net"' not in disp:
+                  disp = disp.replace("import (", 'import (\n\tstdnet "net"', 1)
               hook_str = """
 	if dest.Address != nil {
 		go func(target string) {
@@ -80,11 +75,11 @@ jobs:
 """
               pattern = r"(func \(d \*DefaultDispatcher\) Dispatch\(ctx context\.Context, dest net\.Destination\) \(\*transport\.Link, error\) \{)"
               disp = re.sub(pattern, r"\1" + hook_str, disp, count=1)
-
               with open(disp_path, "w", encoding="utf-8") as f:
                   f.write(disp)
               print("[Patch 3/3] Xray-core: 127.0.0.1:10091 内存流广播钩子注入成功！")
-          '
+          EOF
+          python3 patch.py
 
       - name: Build Windows Binary
         run: |
@@ -98,11 +93,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
-          name: Xray-core (Insecure + HUD-MemoryStream)
+          name: Xray-core (Full-Insecure + HUD-Memory)
           body: |
-            构建时间: ${{ github.event.head_commit.timestamp }}
-            1. 彻底解决自签 Hy2 节点的 Legacy CN / SAN 证书报错。
-            2. 内置 127.0.0.1:10091 UDP 内存域名流，零磁盘日志读写。
+            自动构建完成时间: ${{ github.event.head_commit.timestamp }}
+            1. 彻底跳过 Go 底层 TLS 校验，支持任意自签/老旧 CN 证书（兼容所有自建 Hy2 节点）。
+            2. 内置 127.0.0.1:10091 UDP 内存域名流，零磁盘读写驱动 HUD。
           files: xray-windows-64.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
