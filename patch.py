@@ -2,17 +2,14 @@ import os
 import re
 import stat
 
-# 1. 终极解法：解除只读并短路 Go 标准库底层 TLS 与 x509 校验
+# 1. 解除只读并短路 Go 标准库底层 TLS 与 x509 校验（自签/老旧 CN 证书无条件放行）
 goroot = os.popen("go env GOROOT").read().strip()
-
-# 1.1 遍历 crypto/tls 目录下的所有客户端握手逻辑，强制 verifyServerCertificate 返回 nil
 tls_dir = os.path.join(goroot, "src", "crypto", "tls")
 if os.path.exists(tls_dir):
   for root, _, files in os.walk(tls_dir):
     for f in files:
       if f.startswith("handshake_client") and f.endswith(".go"):
         fpath = os.path.join(root, f)
-        # 解除只读属性
         os.chmod(fpath, stat.S_IWRITE | stat.S_IREAD)
         with open(fpath, "r", encoding="utf-8") as file:
           code = file.read()
@@ -30,15 +27,13 @@ if os.path.exists(tls_dir):
           )
           with open(fpath, "w", encoding="utf-8") as file:
             file.write(code)
-          print(f"[Patch 1/3] Go TLS 放行成功: {f}")
+          print(f"[Patch 1/3] Go TLS 握手放行成功: {f}")
 
-# 1.2 放行 crypto/x509 中对 legacy Common Name / SAN 缺失的拦截报错
 x509_verify = os.path.join(goroot, "src", "crypto", "x509", "verify.go")
 if os.path.exists(x509_verify):
   os.chmod(x509_verify, stat.S_IWRITE | stat.S_IREAD)
   with open(x509_verify, "r", encoding="utf-8") as file:
     code = file.read()
-  # 移除 Common Name 校验失败时的阻断抛错
   code = re.sub(
       r"return CertificateInvalidError\{[^\}]*legacy Common Name[^\}]*\}",
       "return nil",
@@ -46,7 +41,7 @@ if os.path.exists(x509_verify):
   )
   with open(x509_verify, "w", encoding="utf-8") as file:
     file.write(code)
-  print("[Patch 1/3] Go x509: Legacy Common Name 校验限制已解除！")
+  print("[Patch 1/3] Go x509: Legacy Common Name 校验限制解除！")
 
 # 2. 移除 Xray 自身配置阶段对 allowInsecure 的阻断拦截
 for root, _, files in os.walk("."):
@@ -74,24 +69,52 @@ if os.path.exists(disp_path):
   if 'stdnet "net"' not in disp:
     disp = disp.replace("import (", 'import (\n\tstdnet "net"', 1)
 
-  hook_code = (
-      "\n\tif dest.Address != nil {\n"
-      "\t\tgo func(target string) {\n"
-      '\t\t\tif conn, err := stdnet.Dial("udp", "127.0.0.1:10091"); err == nil'
-      " {\n"
-      "\t\t\t\tconn.Write([]byte(target))\n"
-      "\t\t\t\tconn.Close()\n"
-      "\t\t\t}\n"
-      "\t\t}(dest.String())\n"
-      "\t}\n"
-  )
+  # 在文件末尾追加 notifyHUD 函数，确保 stdnet 始终被显式引用，解决未使用报错
+  hud_func = """
 
-  pattern = (
-      r"(func \(d \*DefaultDispatcher\) Dispatch\(ctx context\.Context, dest"
-      r" net\.Destination\) \(\*transport\.Link, error\) \{)"
+// notifyHUD 内存域名广播钩子
+func notifyHUD(dest net.Destination) {
+	if dest.Address != nil {
+		go func(target string) {
+			if conn, err := stdnet.Dial("udp", "127.0.0.1:10091"); err == nil {
+				conn.Write([]byte(target))
+				conn.Close()
+			}
+		}(dest.String())
+	}
+}
+"""
+  disp += hud_func
+
+  # 动态匹配 Dispatch 与 DispatchLink 的具体参数名并植入调用
+  match_dispatch = re.search(
+      r"func \(d \*DefaultDispatcher\) Dispatch\([^,]+,\s*([a-zA-Z0-9_]+)\s+net\.Destination",
+      disp,
   )
-  disp = re.sub(pattern, r"\1" + hook_code, disp, count=1)
+  if match_dispatch:
+    pname = match_dispatch.group(1)
+    disp = re.sub(
+        r"(func \(d \*DefaultDispatcher\) Dispatch\([^{]+\{)",
+        r"\1\n\tnotifyHUD(" + pname + ")",
+        disp,
+        count=1,
+    )
+    print(f"[Patch 3/3] 成功挂钩 Dispatch (参数: {pname})")
+
+  match_link = re.search(
+      r"func \(d \*DefaultDispatcher\) DispatchLink\([^,]+,\s*([a-zA-Z0-9_]+)\s+net\.Destination",
+      disp,
+  )
+  if match_link:
+    pname_link = match_link.group(1)
+    disp = re.sub(
+        r"(func \(d \*DefaultDispatcher\) DispatchLink\([^{]+\{)",
+        r"\1\n\tnotifyHUD(" + pname_link + ")",
+        disp,
+        count=1,
+    )
+    print(f"[Patch 3/3] 成功挂钩 DispatchLink (参数: {pname_link})")
 
   with open(disp_path, "w", encoding="utf-8") as file:
     file.write(disp)
-  print("[Patch 3/3] 127.0.0.1:10091 内存流广播钩子注入成功！")
+  print("[Patch 3/3] UDP 127.0.0.1:10091 内存广播注入完成！")
