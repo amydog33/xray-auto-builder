@@ -1,15 +1,15 @@
-name: Auto Build Latest Xray (Insecure + HUD Memory Hook)
+name: Auto Sync & Build Latest Xray
 
 on:
   schedule:
-    - cron: '0 0 * * *'
-  workflow_dispatch:
+    - cron: '0 */6 * * *'  # 每 6 小时自动检测一次官方是否有新版本
+  workflow_dispatch:        # 也支持随时手动强制构建
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  check-and-build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Helper Repo
@@ -17,25 +17,49 @@ jobs:
         with:
           path: helper
 
-      - name: Checkout Latest Xray-core
+      - name: Check Upstream Official Release
+        id: check_release
+        run: |
+          # 1. 获取官方 XTLS/Xray-core 最新 Release Tag
+          UPSTREAM_TAG=$(curl -sL https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
+          echo "Upstream latest tag: $UPSTREAM_TAG"
+          echo "upstream_tag=$UPSTREAM_TAG" >> $GITHUB_OUTPUT
+
+          # 2. 获取自己仓库是否已经发布过该版本的 Release
+          MY_RELEASE=$(curl -sL -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/${{ github.repository }}/releases/tags/$UPSTREAM_TAG | jq -r .tag_name)
+
+          # 如果是定时任务且已经发布过，则跳过本次构建，避免重复编译
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$MY_RELEASE" = "$UPSTREAM_TAG" ]; then
+            echo "already_built=true" >> $GITHUB_OUTPUT
+            echo "该版本已经编译发布过，跳过构建。"
+          else
+            echo "already_built=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout Specific Version of Xray-core
+        if: steps.check_release.outputs.already_built == 'false'
         uses: actions/checkout@v4
         with:
           repository: 'XTLS/Xray-core'
-          fetch-depth: 1
+          ref: ${{ steps.check_release.outputs.upstream_tag }}
           path: xray
 
       - name: Set up Go
+        if: steps.check_release.outputs.already_built == 'false'
         uses: actions/setup-go@v5
         with:
           go-version: '1.24'
           cache: false
 
       - name: Run Patch Script
+        if: steps.check_release.outputs.already_built == 'false'
         run: |
           cd xray
           python3 ../helper/patch.py
 
       - name: Build Windows Binary
+        if: steps.check_release.outputs.already_built == 'false'
         run: |
           cd xray
           export CGO_ENABLED=0
@@ -45,15 +69,16 @@ jobs:
           zip -9 xray-windows-64.zip xray.exe
           mv xray-windows-64.zip ../
 
-      - name: Create Release
+      - name: Create GitHub Release
+        if: steps.check_release.outputs.already_built == 'false'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: build-${{ github.run_number }}
-          name: Xray-core (Full-Insecure + HUD-Memory)
+          tag_name: ${{ steps.check_release.outputs.upstream_tag }}
+          name: Xray-core ${{ steps.check_release.outputs.upstream_tag }} (Insecure + HUD Memory)
           body: |
-            自动构建完成时间: ${{ github.event.head_commit.timestamp }}
-            1. 彻底跳过底层 TLS 证书校验（自签与老旧 CN 证书直接放行）。
-            2. 内置 127.0.0.1:10091 UDP 内存域名流，零磁盘读写驱动 HUD。
+            自动同步官方版本：**${{ steps.check_release.outputs.upstream_tag }}**
+            - 彻底移除 TLS / legacy Common Name / SAN 限制，完美支持自签 Hysteria 2 节点。
+            - 内置 UDP 127.0.0.1:10091 内存流广播，完美驱动 Web 面板与 HUD 悬浮窗，零磁盘 I/O。
           files: xray-windows-64.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
