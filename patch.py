@@ -47,8 +47,8 @@ if os.path.exists(x509_verify):
 # 2. 全局强制 InsecureSkipVerify = true
 tls_conf_path = "transport/internet/tls/config.go"
 if os.path.exists(tls_conf_path):
-  with open(tls_conf_path, "r", encoding="utf-8") as f:
-    code = f.read()
+  with open(tls_conf_path, "r", encoding="utf-8") as file:
+    code = file.read()
   code = re.sub(
       r"(&tls\.Config\{)", r"\1\n\t\tInsecureSkipVerify: true,", code
   )
@@ -84,17 +84,15 @@ for root, _, files in os.walk("."):
         with open(fpath, "w", encoding="utf-8") as file:
           file.write(c)
 
-# 3. 注入精确到行的 UDP 10091 广播钩子（无需任何正则，零报错风险）
+# 3. 动态从源码上下文提取真实变量名并注入广播钩子
 disp_path = "app/dispatcher/default.go"
 if os.path.exists(disp_path):
   with open(disp_path, "r", encoding="utf-8") as file:
     content = file.read()
 
-  # 导入标准库 net (别名 stdnet，绝不引入多余包)
   if 'stdnet "net"' not in content:
     content = content.replace("import (", 'import (\n\tstdnet "net"', 1)
 
-  # 纯净广播函数：原生字符串拼接，无多余依赖
   hud_func = """
 
 // notifyHUD 内存广播钩子
@@ -114,21 +112,38 @@ func notifyHUD(tag string, dest string) {
 
   lines = content.splitlines()
   new_lines = []
-  hook_injected = False
+  hook_count = 0
 
   for line in lines:
     new_lines.append(line)
-    # 精准锚定 taking detour 所在行
+    # 精准定位包含 taking detour 的代码行
     if "taking detour" in line and not line.strip().startswith("//"):
       indent = line[: len(line) - len(line.lstrip())]
-      new_lines.append(f"{indent}notifyHUD(tag, destination.String())")
-      hook_injected = True
+      # 动态从当前行 newError("taking detour [", VAR1, "] for [", VAR2, ... 提取真实变量名
+      m_vars = re.search(r'taking detour \[\",\s*([^,]+),\s*\"\] for \[\",\s*([^,\)]+)', line)
+      if m_vars:
+        t_var = m_vars.group(1).strip()
+        d_var = m_vars.group(2).strip()
+        # 兼容变量本身自带 .String() 或为 net.Destination
+        d_call = f"{d_var}.String()" if not d_var.endswith(".String()") else d_var
+        new_lines.append(f"{indent}notifyHUD({t_var}, {d_call})")
+        hook_count += 1
+        print(f"[Patch 3/3] 动态匹配成功: tag={t_var}, dest={d_var}")
+      else:
+        # 如果格式有微调，从当前行的逗号参数列表直接按位置提取第一个参数
+        parts = line.split('taking detour ["')
+        if len(parts) > 1:
+          sub = parts[1].split(',')
+          if len(sub) > 1:
+            raw_t = sub[1].strip()
+            new_lines.append(f"{indent}notifyHUD(fmt.Sprint({raw_t}), destination.String())")
+            hook_count += 1
 
-  if not hook_injected:
-    raise RuntimeError("【构建中断】未能定位 default.go 中的 'taking detour' 行！")
+  if hook_count == 0:
+    raise RuntimeError("【中断】未能在源码中匹配到 taking detour 行！")
 
   with open(disp_path, "w", encoding="utf-8") as file:
     file.write("\n".join(new_lines))
-  print("[Patch 3/3] 成功挂钩 taking detour 真实决断点！")
+  print(f"[Patch 3/3] 共注入 {hook_count} 处真实出站决断钩子！")
 
 print(">>> 全部补丁写入完成！")
