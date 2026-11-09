@@ -2,7 +2,7 @@ import os
 import re
 import stat
 
-print(">>> [Patch] 开始对编译环境执行精准深度修复...")
+print(">>> [Patch] 开始对编译环境执行全指纹与多协议兼容深度修复...")
 
 goroot = os.popen("go env GOROOT").read().strip()
 if not goroot:
@@ -11,24 +11,20 @@ if not goroot:
 tls_dir = os.path.join(goroot, "src", "crypto", "tls")
 
 # =========================================================================
-# 1. 深度修补 Go TLS 1.2 与 TLS 1.3 证书验证链（彻底解决 Panic 并放行自签）
+# 1. 修补 Go 标准库 TLS 1.2 与 1.3（修复 MASQUE 崩溃与自签名证书）
 # =========================================================================
 if os.path.exists(tls_dir):
-    # --- A. 修补 TLS 1.2 (handshake_client.go) ---
+    # A. TLS 1.2
     hc_path = os.path.join(tls_dir, "handshake_client.go")
     if os.path.exists(hc_path):
         os.chmod(hc_path, stat.S_IWRITE | stat.S_IREAD)
         with open(hc_path, "r", encoding="utf-8") as f:
             code = f.read()
-
-        # 清除旧补丁的截断注入
         code = re.sub(
             r"c\.peerCertificates = certs\s*\n\treturn nil[^\n]*\n",
             "c.peerCertificates = certs\n",
             code
         )
-
-        # 在 Verify 报错或 InsecureSkipVerify 时，安全填充 verifiedChains 且吞掉错误
         target_v12 = r"(c\.verifiedChains,\s*err\s*=\s*certs\[0\]\.Verify\(opts\))"
         patch_v12 = (
             r"\1\n"
@@ -45,14 +41,12 @@ if os.path.exists(tls_dir):
                 f.write(code)
             print("  ✔ [TLS 1.2] handshake_client.go 安全放行注入成功")
 
-    # --- B. 修补 TLS 1.3 (handshake_client_tls13.go) [关键！] ---
+    # B. TLS 1.3
     hc13_path = os.path.join(tls_dir, "handshake_client_tls13.go")
     if os.path.exists(hc13_path):
         os.chmod(hc13_path, stat.S_IWRITE | stat.S_IREAD)
         with open(hc13_path, "r", encoding="utf-8") as f:
             code = f.read()
-
-        # 防御 MASQUE 空证书越界，并在 TLS 1.3 下兜底填充 verifiedChains
         target_v13 = r"(c\.verifiedChains,\s*err\s*=\s*certs\[0\]\.Verify\(opts\))"
         patch_v13 = (
             r"\tif len(certs) > 0 {\n"
@@ -86,7 +80,44 @@ if os.path.exists(x509_verify):
         print("  ✔ Go x509 Legacy Common Name 限制已解除")
 
 # =========================================================================
-# 2. Xray-core TLS 工厂放行配置
+# 2. 深度修补 uTLS：使 Fingerprint (如 Chrome) 完美兼容 HTTPUpgrade 与 gRPC
+# =========================================================================
+utls_path = "transport/internet/tls/u_tls.go"
+if os.path.exists(utls_path):
+    with open(utls_path, "r", encoding="utf-8") as f:
+        code = f.read()
+
+    # 提取 receiver 变量名 (如 c 或 config)
+    m = re.search(r"func\s*\(([a-zA-Z0-9_]+)\s*\*Config\)\s*UClient", code)
+    recv = m.group(1) if m else "c"
+
+    # 在 uConn 返回前，动态强制同步真实 ALPN，消除 Chrome 指纹导致的版本协商踩踏
+    alpn_hook = f"""
+\t// [UTLS-ALPN-FIX] 强制让 Chrome 等指纹遵循节点协议所要求的真实 ALPN
+\tif len({recv}.NextProtos) > 0 {{
+\t\tfor _, ext := range uConn.Extensions {{
+\t\t\tif alpnExt, ok := ext.(*utls.ALPNExtension); ok {{
+\t\t\t\talpnExt.AlpnProtocols = {recv}.NextProtos
+\t\t\t}}
+\t\t}}
+\t\t_ = uConn.BuildHandshakeState()
+\t}}
+"""
+    if "[UTLS-ALPN-FIX]" not in code:
+        if "return uConn, nil" in code:
+            code = code.replace("return uConn, nil", alpn_hook + "\treturn uConn, nil", 1)
+        elif "return uConn" in code:
+            code = code.replace("return uConn", alpn_hook + "\treturn uConn", 1)
+
+    # 确保 uTLS 模式下自签证书同样放行
+    code = re.sub(r"(uConfig\s*:=\s*&utls\.Config\{)", r"\1\n\t\tInsecureSkipVerify: true,", code)
+
+    with open(utls_path, "w", encoding="utf-8") as f:
+        f.write(code)
+    print("  ✔ [uTLS] 已成功注入指纹 ALPN 协议同步与放行补丁！")
+
+# =========================================================================
+# 3. Xray-core 标准 TLS 工厂放行配置
 # =========================================================================
 tls_conf_path = "transport/internet/tls/config.go"
 if os.path.exists(tls_conf_path):
@@ -100,7 +131,7 @@ if os.path.exists(tls_conf_path):
         print(f"  ✔ Xray TLS 工厂已配置放行: {tls_conf_path}")
 
 # =========================================================================
-# 3. 动态提取变量注入 UDP 10091 HUD 广播钩子
+# 4. 动态提取变量注入 UDP 10091 HUD 广播钩子
 # =========================================================================
 disp_path = "app/dispatcher/default.go"
 if os.path.exists(disp_path):
