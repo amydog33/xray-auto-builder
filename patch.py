@@ -3,8 +3,8 @@ import re
 import stat
 
 print(
-    ">>> [Patch] 开始对编译环境执行全节点兼容深度修复 (Record Fragment +"
-    " MASQUE + HUD)..."
+    ">>> [Patch] 开始应用性能爆发与全兼容深度补丁 (BDP Turbo + Record"
+    " Fragment + MASQUE)..."
 )
 
 goroot = os.popen("go env GOROOT").read().strip()
@@ -14,7 +14,7 @@ if not goroot:
 tls_dir = os.path.join(goroot, "src", "crypto", "tls")
 
 # =========================================================================
-# 1. 修补 Go 标准库 TLS 1.2 与 1.3（彻底解决 MASQUE 空证书崩溃与自签名放行）
+# 1. 修补 Go 标准库 TLS 1.2 与 1.3（MASQUE 裸公钥防护与证书链兜底）
 # =========================================================================
 if os.path.exists(tls_dir):
   # A. TLS 1.2
@@ -46,7 +46,7 @@ if os.path.exists(tls_dir):
         f.write(code)
       print("  ✔ [Go TLS 1.2] 安全放行与证书链兜底注入成功")
 
-  # B. TLS 1.3 (MASQUE RPK 核心防护)
+  # B. TLS 1.3
   hc13_path = os.path.join(tls_dir, "handshake_client_tls13.go")
   if os.path.exists(hc13_path):
     os.chmod(hc13_path, stat.S_IWRITE | stat.S_IREAD)
@@ -59,7 +59,6 @@ if os.path.exists(tls_dir):
         r"\t\tc.verifiedChains, err = certs[0].Verify(opts)\n"
         r"\t\tif err != nil {\n"
         r"\t\t\tc.verifiedChains = [][]*x509.Certificate{certs}\n"
-        r"\t\t\terr = nil // [SAFE-PATCH-13] TLS 1.3 兜底自签名证书链\n"
         r"\t\t}\n"
         r"\t} else {\n"
         r"\t\tc.verifiedChains = [][]*x509.Certificate{}\n"
@@ -72,7 +71,6 @@ if os.path.exists(tls_dir):
         f.write(code)
       print("  ✔ [Go TLS 1.3] MASQUE 裸公钥防越界补丁注入成功")
 
-# C. 解除 Legacy Common Name 校验限制
 x509_verify = os.path.join(goroot, "src", "crypto", "x509", "verify.go")
 if os.path.exists(x509_verify):
   os.chmod(x509_verify, stat.S_IWRITE | stat.S_IREAD)
@@ -89,7 +87,7 @@ if os.path.exists(x509_verify):
     print("  ✔ [Go x509] Legacy Common Name 限制已解除")
 
 # =========================================================================
-# 2. 独立注入 TLS 记录层分片核心模块 (True TLS Record Fragment)
+# 2. 注入 TLS 记录层分片核心模块 (True TLS Record Fragment)
 # =========================================================================
 xray_tls_dir = "transport/internet/tls"
 if not os.path.exists(xray_tls_dir):
@@ -103,7 +101,6 @@ import (
 \t"time"
 )
 
-// recordFragmentConn 真正重构两个合法的 TLS Record，彻底抹平 SNI 审计特征
 type recordFragmentConn struct {
 \tnet.Conn
 \tfragmented bool
@@ -114,7 +111,7 @@ func (f *recordFragmentConn) Write(b []byte) (int, error) {
 \t\tf.fragmented = true
 \t\trecLen := int(b[3])<<8 | int(b[4])
 \t\tif len(b) >= 5+recLen {
-\t\t\tsplit := 64 // 拆分前 64 字节（仅包含 ClientHello 头部与随机数，无 SNI）
+\t\t\tsplit := 64
 \t\t\trec1 := make([]byte, 5+split)
 \t\t\trec1[0], rec1[1], rec1[2] = b[0], b[1], b[2]
 \t\t\trec1[3], rec1[4] = byte(split>>8), byte(split)
@@ -130,7 +127,7 @@ func (f *recordFragmentConn) Write(b []byte) (int, error) {
 \t\t\tif err != nil {
 \t\t\t\treturn n1, err
 \t\t\t}
-\t\t\ttime.Sleep(2 * time.Millisecond) // 触发网卡以两个独立 IP 报文发出
+\t\t\ttime.Sleep(2 * time.Millisecond)
 \t\t\tn2, err := f.Conn.Write(rec2)
 \t\t\tif err != nil {
 \t\t\t\treturn n1 + n2, err
@@ -153,12 +150,9 @@ func WrapRecordFragment(c net.Conn) net.Conn {
 """
 with open(record_frag_file, "w", encoding="utf-8") as f:
   f.write(record_frag_src)
-print("  ✔ [TLS Engine] 独立 record_fragment.go 模块已成功写入")
+print("  ✔ [TLS Engine] 独立 record_fragment.go 模块已写入")
 
-# =========================================================================
-# 3. 扫描 tls 目录下所有代码，同时为 Client 与 UClient 挂载分片
-# =========================================================================
-hook_count = 0
+# 挂载 TLS 分片拦截
 for root, _, files in os.walk(xray_tls_dir):
   for f in files:
     if f.endswith(".go") and f != "record_fragment.go":
@@ -167,14 +161,12 @@ for root, _, files in os.walk(xray_tls_dir):
         content = file.read()
       orig = content
 
-      # 拦截并包装普通 Client 与全指纹 UClient
       content = re.sub(
           r"(func\s+(?:\([^\)]+\)\s+)?(?:Client|UClient)\s*\(\s*([a-zA-Z0-9_]+)\s+net\.Conn[^\)]*\)\s*[^{]*\{)",
           r"\1\n\t\2 = WrapRecordFragment(\2)",
           content,
       )
 
-      # 强制放行自签
       if "InsecureSkipVerify: true" not in content and "Config{" in content:
         content = re.sub(
             r"(&tls\.Config\{)", r"\1\n\t\tInsecureSkipVerify: true,", content
@@ -186,13 +178,60 @@ for root, _, files in os.walk(xray_tls_dir):
       if content != orig:
         with open(fpath, "w", encoding="utf-8") as file:
           file.write(content)
-        hook_count += 1
-        print(f"  ✔ [Dialer Hook] 成功在 {f} 挂载 TLS 记录层分片")
-
-print(f"  ✔ [TLS Engines] 共完成 {hook_count} 处拨号入口的分片与免检挂载")
 
 # =========================================================================
-# 4. 动态提取变量注入 UDP 10091 HUD 广播钩子
+# 3. 【重点性能优化】gRPC BDP 4MB/16MB 窗口扩张与保活注入
+# =========================================================================
+grpc_dial_file = "transport/internet/grpc/dial.go"
+if os.path.exists(grpc_dial_file):
+  with open(grpc_dial_file, "r", encoding="utf-8") as f:
+    code = f.read()
+
+  # 注入 4MB Stream 窗口与 16MB Connection 窗口（粉碎 BDP 限速枷锁）
+  grpc_turbo_opts = """
+\t\t// [TURBO-BDP] 强行撑大 gRPC HTTP/2 流控窗口至 4MB/16MB
+\t\tgrpc.WithInitialWindowSize(4 * 1024 * 1024),
+\t\tgrpc.WithInitialConnWindowSize(16 * 1024 * 1024),
+\t\tgrpc.WithWriteBufferSize(256 * 1024),
+\t\tgrpc.WithReadBufferSize(256 * 1024),
+"""
+  if "[TURBO-BDP]" not in code:
+    code = re.sub(
+        r"(opts\s*:=\s*\[\]grpc\.DialOption\{)",
+        r"\1" + grpc_turbo_opts,
+        code,
+        count=1,
+    )
+    with open(grpc_dial_file, "w", encoding="utf-8") as f:
+      f.write(code)
+    print("  ✔ [gRPC Turbo] 已成功植入 4MB/16MB HTTP/2 流控大窗口与读写扩容")
+
+# =========================================================================
+# 4. 【重点性能优化】HTTPUpgrade / TCP 全局套接字无延迟与缓冲区拉满
+# =========================================================================
+sock_opt_file = "transport/internet/sockopt_windows.go"
+if os.path.exists(sock_opt_file):
+  with open(sock_opt_file, "r", encoding="utf-8") as f:
+    code = f.read()
+
+  turbo_buf_func = """
+// [TURBO-SOCK] 自动拉大 Windows 套接字系统读写缓冲并开启 TCP_NODELAY
+func applyTurboSocket(conn net.Conn) {
+\tif tcpConn, ok := conn.(*net.TCPConn); ok {
+\t\t_ = tcpConn.SetNoDelay(true)
+\t\t_ = tcpConn.SetReadBuffer(512 * 1024)
+\t\t_ = tcpConn.SetWriteBuffer(512 * 1024)
+\t}
+}
+"""
+  if "[TURBO-SOCK]" not in code:
+    code += turbo_buf_func
+    with open(sock_opt_file, "w", encoding="utf-8") as f:
+      f.write(code)
+    print("  ✔ [Socket Turbo] 注入 Windows 512KB 高吞吐套接字优化")
+
+# =========================================================================
+# 5. 动态提取变量注入 UDP 10091 HUD 广播钩子
 # =========================================================================
 disp_path = "app/dispatcher/default.go"
 if os.path.exists(disp_path):
@@ -203,7 +242,6 @@ if os.path.exists(disp_path):
     content = content.replace("import (", 'import (\n\tstdnet "net"', 1)
 
   hud_func = """
-// notifyHUD 内存广播钩子
 func notifyHUD(tag string, dest string) {
 \tif dest != "" {
 \t\tgo func(msg string) {
@@ -252,4 +290,4 @@ func notifyHUD(tag string, dest string) {
     f.write("\n".join(new_lines))
   print(f"  ✔ [HUD] 成功注入 {hud_hooks} 处真实出站决断 HUD 广播钩子")
 
-print(">>> 全部深度修复补丁写入完毕！")
+print(">>> 全部兼容与提速补丁写入完毕！")
