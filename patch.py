@@ -173,49 +173,43 @@ for root, _, files in os.walk(xray_tls_dir):
 # =========================================================================
 # 3. 解除公网 80 端口无 TLS VLESS 限制 + 注入浏览器伪装防明文指纹识别
 # =========================================================================
-vless_conf_file = "infra/conf/vless.go"
-if os.path.exists(vless_conf_file):
-  with open(vless_conf_file, "r", encoding="utf-8") as f:
-    code = f.read()
+patched_vless = False
+for root, _, files in os.walk("infra/conf"):
+  for fname in files:
+    if not fname.endswith(".go"):
+      continue
+    fpath = os.path.join(root, fname)
+    with open(fpath, "r", encoding="utf-8") as f:
+      lines = f.readlines()
 
-  # 支持跨行匹配 errors.New(...) 或 newError(...)
-  target_err = (
-      r"return\s+nil,\s*(?:errors\.New|newError)\s*\([\s\S]*?"
-      r'"vless without TLS or other encryption is prohibited[^"]*"[\s\S]*?\)'
-  )
-  if re.search(target_err, code):
-    code = re.sub(
-        target_err,
-        "// [ALLOW-PLAIN-VLESS] 已解除 80 端口无 TLS 限制",
-        code,
-        count=1,
-    )
-    with open(vless_conf_file, "w", encoding="utf-8") as f:
-      f.write(code)
-    print("  ✔ [VLESS Conf] 成功解除 80 端口无 TLS VLESS 限制")
-  else:
-    raise RuntimeError("❌ 未能在 infra/conf/vless.go 中匹配到目标限制代码，请检查源码！")
+    for idx, line in enumerate(lines):
+      if "vless without TLS" in line:
+        # 向上定位 return 语句起点，向下定位括号结束行（兼容单行与多行写法）
+        start = idx
+        while start > max(0, idx - 5) and "return" not in lines[start]:
+          start -= 1
+        end = idx
+        while end < min(len(lines) - 1, idx + 5) and not lines[
+            end
+        ].strip().endswith(")"):
+          end += 1
 
-ws_dialer_file = "transport/internet/websocket/dialer.go"
-if os.path.exists(ws_dialer_file):
-  with open(ws_dialer_file, "r", encoding="utf-8") as f:
-    code = f.read()
+        indent = lines[start][: len(lines[start]) - len(lines[start].lstrip())]
+        matched_snippet = "".join(lines[start : end + 1]).strip()
+        print(f"  ✔ [VLESS Conf] 在 {fpath} 命中限制代码:\n    {matched_snippet}")
 
-  target_hdr = r"(header\s*:=\s*config\.GetRequestHeader\(\))"
-  patch_hdr = (
-      r"\1\n"
-      r'\tif header.Get("User-Agent") == "" {\n'
-      r'\t\theader.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64;'
-      r" x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0"
-      r' Safari/537.36")\n'
-      r"\t} // [WS-STEALTH] 消除 80 端口明文握手的 Go-http-client 特征"
-  )
-  if "[WS-STEALTH]" not in code and re.search(target_hdr, code):
-    code = re.sub(target_hdr, patch_hdr, code, count=1)
-    with open(ws_dialer_file, "w", encoding="utf-8") as f:
-      f.write(code)
-    print("  ✔ [WS Stealth] 80 端口 WebSocket 浏览器 User-Agent 伪装注入成功")
+        lines[start : end + 1] = [
+            f"{indent}// [ALLOW-PLAIN-VLESS] 已解除 80 端口无 TLS 限制\n"
+        ]
+        with open(fpath, "w", encoding="utf-8") as f:
+          f.writelines(lines)
+        patched_vless = True
+        break
+  if patched_vless:
+    break
 
+if not patched_vless:
+  raise RuntimeError("❌ 未能在 infra/conf 中找到 vless without TLS 限制代码！")
 # =========================================================================
 # 4. gRPC BDP 4MB/16MB 窗口扩张与 Windows 512KB 高吞吐套接字优化
 # =========================================================================
