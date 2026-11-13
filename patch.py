@@ -3,8 +3,7 @@ import re
 import stat
 
 print(
-    ">>> [Patch] 开始应用性能爆发与全兼容深度补丁 (BDP Turbo + Record"
-    " Fragment + MASQUE)..."
+    ">>> [Patch] 开始应用全能加速、安全加固与 80/443 全协议兼容补丁..."
 )
 
 goroot = os.popen("go env GOROOT").read().strip()
@@ -17,7 +16,6 @@ tls_dir = os.path.join(goroot, "src", "crypto", "tls")
 # 1. 修补 Go 标准库 TLS 1.2 与 1.3（MASQUE 裸公钥防护与证书链兜底）
 # =========================================================================
 if os.path.exists(tls_dir):
-  # A. TLS 1.2
   hc_path = os.path.join(tls_dir, "handshake_client.go")
   if os.path.exists(hc_path):
     os.chmod(hc_path, stat.S_IWRITE | stat.S_IREAD)
@@ -46,7 +44,6 @@ if os.path.exists(tls_dir):
         f.write(code)
       print("  ✔ [Go TLS 1.2] 安全放行与证书链兜底注入成功")
 
-  # B. TLS 1.3
   hc13_path = os.path.join(tls_dir, "handshake_client_tls13.go")
   if os.path.exists(hc13_path):
     os.chmod(hc13_path, stat.S_IWRITE | stat.S_IREAD)
@@ -65,7 +62,7 @@ if os.path.exists(tls_dir):
         r"\t\terr = nil // [MASQUE-RPK] 适配裸公钥与空证书握手\n"
         r"\t}"
     )
-    if "[SAFE-PATCH-13]" not in code and re.search(target_v13, code):
+    if "[MASQUE-RPK]" not in code and re.search(target_v13, code):
       code = re.sub(target_v13, patch_v13, code, count=1)
       with open(hc13_path, "w", encoding="utf-8") as f:
         f.write(code)
@@ -87,7 +84,7 @@ if os.path.exists(x509_verify):
     print("  ✔ [Go x509] Legacy Common Name 限制已解除")
 
 # =========================================================================
-# 2. 注入 TLS 记录层分片核心模块 (True TLS Record Fragment)
+# 2. 注入三段深度 TLS 记录层分片 (彻底切碎 workers.dev SNI 特征)
 # =========================================================================
 xray_tls_dir = "transport/internet/tls"
 if not os.path.exists(xray_tls_dir):
@@ -107,30 +104,25 @@ type recordFragmentConn struct {
 }
 
 func (f *recordFragmentConn) Write(b []byte) (int, error) {
-\tif !f.fragmented && len(b) > 100 && b[0] == 0x16 && b[1] == 0x03 && b[5] == 0x01 {
+\tif !f.fragmented && len(b) > 160 && b[0] == 0x16 && b[1] == 0x03 && b[5] == 0x01 {
 \t\tf.fragmented = true
 \t\trecLen := int(b[3])<<8 | int(b[4])
-\t\tif len(b) >= 5+recLen {
-\t\t\tsplit := 64
-\t\t\trec1 := make([]byte, 5+split)
-\t\t\trec1[0], rec1[1], rec1[2] = b[0], b[1], b[2]
-\t\t\trec1[3], rec1[4] = byte(split>>8), byte(split)
-\t\t\tcopy(rec1[5:], b[5:5+split])
-
-\t\t\trem := recLen - split
-\t\t\trec2 := make([]byte, 5+rem)
-\t\t\trec2[0], rec2[1], rec2[2] = b[0], b[1], b[2]
-\t\t\trec2[3], rec2[4] = byte(rem>>8), byte(rem)
-\t\t\tcopy(rec2[5:], b[5+split:5+recLen])
-
-\t\t\tn1, err := f.Conn.Write(rec1)
-\t\t\tif err != nil {
-\t\t\t\treturn n1, err
-\t\t\t}
-\t\t\ttime.Sleep(2 * time.Millisecond)
-\t\t\tn2, err := f.Conn.Write(rec2)
-\t\t\tif err != nil {
-\t\t\t\treturn n1 + n2, err
+\t\tif len(b) >= 5+recLen && recLen > 140 {
+\t\t\tcuts := []int{40, 110, recLen}
+\t\t\tprev := 0
+\t\t\tfor i, end := range cuts {
+\t\t\t\tchunkLen := end - prev
+\t\t\t\trec := make([]byte, 5+chunkLen)
+\t\t\t\trec[0], rec[1], rec[2] = b[0], b[1], b[2]
+\t\t\t\trec[3], rec[4] = byte(chunkLen>>8), byte(chunkLen)
+\t\t\t\tcopy(rec[5:], b[5+prev:5+end])
+\t\t\t\tif _, err := f.Conn.Write(rec); err != nil {
+\t\t\t\t\treturn 0, err
+\t\t\t\t}
+\t\t\t\tif i < len(cuts)-1 {
+\t\t\t\t\ttime.Sleep(2 * time.Millisecond)
+\t\t\t\t}
+\t\t\t\tprev = end
 \t\t\t}
 \t\t\tif len(b) > 5+recLen {
 \t\t\t\t_, _ = f.Conn.Write(b[5+recLen:])
@@ -150,9 +142,8 @@ func WrapRecordFragment(c net.Conn) net.Conn {
 """
 with open(record_frag_file, "w", encoding="utf-8") as f:
   f.write(record_frag_src)
-print("  ✔ [TLS Engine] 独立 record_fragment.go 模块已写入")
+print("  ✔ [TLS Engine] 三段深度 SNI 分片模块已写入")
 
-# 挂载 TLS 分片拦截
 for root, _, files in os.walk(xray_tls_dir):
   for f in files:
     if f.endswith(".go") and f != "record_fragment.go":
@@ -180,14 +171,55 @@ for root, _, files in os.walk(xray_tls_dir):
           file.write(content)
 
 # =========================================================================
-# 3. 【重点性能优化】gRPC BDP 4MB/16MB 窗口扩张与保活注入
+# 3. 解除公网 80 端口无 TLS VLESS 限制 + 注入浏览器伪装防明文指纹识别
+# =========================================================================
+vless_conf_file = "infra/conf/vless.go"
+if os.path.exists(vless_conf_file):
+  with open(vless_conf_file, "r", encoding="utf-8") as f:
+    code = f.read()
+
+  target_err = (
+      r"return\s+nil,\s*[^\n]*vless without TLS or other encryption is"
+      r" prohibited[^\n]*"
+  )
+  if re.search(target_err, code):
+    code = re.sub(
+        target_err,
+        "// [ALLOW-PLAIN-VLESS] 已解除 80 端口无 TLS 限制",
+        code,
+    )
+    with open(vless_conf_file, "w", encoding="utf-8") as f:
+      f.write(code)
+    print("  ✔ [VLESS Conf] 成功解除 80 端口无 TLS VLESS 限制")
+
+ws_dialer_file = "transport/internet/websocket/dialer.go"
+if os.path.exists(ws_dialer_file):
+  with open(ws_dialer_file, "r", encoding="utf-8") as f:
+    code = f.read()
+
+  target_hdr = r"(header\s*:=\s*config\.GetRequestHeader\(\))"
+  patch_hdr = (
+      r"\1\n"
+      r'\tif header.Get("User-Agent") == "" {\n'
+      r'\t\theader.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64;'
+      r" x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0"
+      r' Safari/537.36")\n'
+      r"\t} // [WS-STEALTH] 消除 80 端口明文握手的 Go-http-client 特征"
+  )
+  if "[WS-STEALTH]" not in code and re.search(target_hdr, code):
+    code = re.sub(target_hdr, patch_hdr, code, count=1)
+    with open(ws_dialer_file, "w", encoding="utf-8") as f:
+      f.write(code)
+    print("  ✔ [WS Stealth] 80 端口 WebSocket 浏览器 User-Agent 伪装注入成功")
+
+# =========================================================================
+# 4. gRPC BDP 4MB/16MB 窗口扩张与 Windows 512KB 高吞吐套接字优化
 # =========================================================================
 grpc_dial_file = "transport/internet/grpc/dial.go"
 if os.path.exists(grpc_dial_file):
   with open(grpc_dial_file, "r", encoding="utf-8") as f:
     code = f.read()
 
-  # 注入 4MB Stream 窗口与 16MB Connection 窗口（粉碎 BDP 限速枷锁）
   grpc_turbo_opts = """
 \t\t// [TURBO-BDP] 强行撑大 gRPC HTTP/2 流控窗口至 4MB/16MB
 \t\tgrpc.WithInitialWindowSize(4 * 1024 * 1024),
@@ -204,11 +236,8 @@ if os.path.exists(grpc_dial_file):
     )
     with open(grpc_dial_file, "w", encoding="utf-8") as f:
       f.write(code)
-    print("  ✔ [gRPC Turbo] 已成功植入 4MB/16MB HTTP/2 流控大窗口与读写扩容")
+    print("  ✔ [gRPC Turbo] 已成功植入 4MB/16MB HTTP/2 流控大窗口")
 
-# =========================================================================
-# 4. 【重点性能优化】HTTPUpgrade / TCP 全局套接字无延迟与缓冲区拉满
-# =========================================================================
 sock_opt_file = "transport/internet/sockopt_windows.go"
 if os.path.exists(sock_opt_file):
   with open(sock_opt_file, "r", encoding="utf-8") as f:
@@ -290,4 +319,4 @@ func notifyHUD(tag string, dest string) {
     f.write("\n".join(new_lines))
   print(f"  ✔ [HUD] 成功注入 {hud_hooks} 处真实出站决断 HUD 广播钩子")
 
-print(">>> 全部兼容与提速补丁写入完毕！")
+print(">>> 全部兼容、提速与安全加固补丁写入完毕！")
