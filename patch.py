@@ -178,19 +178,23 @@ if os.path.exists(vless_conf_file):
   with open(vless_conf_file, "r", encoding="utf-8") as f:
     code = f.read()
 
+  # 支持跨行匹配 errors.New(...) 或 newError(...)
   target_err = (
-      r"return\s+nil,\s*[^\n]*vless without TLS or other encryption is"
-      r" prohibited[^\n]*"
+      r"return\s+nil,\s*(?:errors\.New|newError)\s*\([\s\S]*?"
+      r'"vless without TLS or other encryption is prohibited[^"]*"[\s\S]*?\)'
   )
   if re.search(target_err, code):
     code = re.sub(
         target_err,
         "// [ALLOW-PLAIN-VLESS] 已解除 80 端口无 TLS 限制",
         code,
+        count=1,
     )
     with open(vless_conf_file, "w", encoding="utf-8") as f:
       f.write(code)
     print("  ✔ [VLESS Conf] 成功解除 80 端口无 TLS VLESS 限制")
+  else:
+    raise RuntimeError("❌ 未能在 infra/conf/vless.go 中匹配到目标限制代码，请检查源码！")
 
 ws_dialer_file = "transport/internet/websocket/dialer.go"
 if os.path.exists(ws_dialer_file):
