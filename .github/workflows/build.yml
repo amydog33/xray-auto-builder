@@ -20,9 +20,18 @@ jobs:
       - name: Check Upstream Official Release
         id: check_release
         run: |
-          # 1. 获取官方 XTLS/Xray-core 最新 Release Tag
-          UPSTREAM_TAG=$(curl -sL https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
+          # 1. 带鉴权获取官方 XTLS/Xray-core 最新 Release Tag（防止 API 触发限制返回 null）
+          UPSTREAM_TAG=$(curl -sL -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
+          
           echo "Upstream latest tag: $UPSTREAM_TAG"
+
+          # 校验获取到的标签是否有效
+          if [ "$UPSTREAM_TAG" = "null" ] || [ -z "$UPSTREAM_TAG" ]; then
+            echo "错误：无法获取上游最新 Tag，API 可能受限或网络异常。"
+            exit 1
+          fi
+
           echo "upstream_tag=$UPSTREAM_TAG" >> $GITHUB_OUTPUT
 
           # 2. 获取自己仓库是否已经发布过该版本的 Release
@@ -36,6 +45,8 @@ jobs:
           else
             echo "already_built=false" >> $GITHUB_OUTPUT
           fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Checkout Specific Version of Xray-core
         if: steps.check_release.outputs.already_built == 'false'
