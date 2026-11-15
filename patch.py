@@ -318,7 +318,7 @@ func notifyHUD(tag string, dest string) {
   print(f"  ✔ [HUD] 成功注入 {hud_hooks} 处真实出站决断 HUD 广播钩子")
 
 # =========================================================================
-# 6. 注入 VPNGate (抢跑极速握手 + 全透明 IPCP 诊断日志) 补丁
+# 6. 注入 VPNGate (修复 CALL_CONNECTED 0x02 哈希绑定与并发拨号锁) 补丁
 # =========================================================================
 socks_dir = "proxy/socks"
 if os.path.exists(socks_dir):
@@ -329,6 +329,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
@@ -363,6 +364,7 @@ type sstpSession struct {
 
 var (
 	sessMu   sync.Mutex
+	dialMu   sync.Mutex // 防止浏览器并发请求触发多次重复 SSTP 拨号
 	sessPool = make(map[string]*sstpSession)
 )
 
@@ -379,6 +381,8 @@ func isVPNGateServer(server *protocol.ServerSpec) bool {
 
 func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dialer internet.Dialer) (*sstpSession, error) {
 	key := serverDest.String()
+
+	// 先快速检查缓存池
 	sessMu.Lock()
 	if sess, ok := sessPool[key]; ok {
 		select {
@@ -386,7 +390,23 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 			delete(sessPool, key)
 		default:
 			sessMu.Unlock()
-			errors.LogWarning(ctx, "[VPNGate] ⚡ 复用已拨通的内存隧道 -> ", key)
+			return sess, nil
+		}
+	}
+	sessMu.Unlock()
+
+	// 加拨号互斥锁，让并发进来的请求排队等第一个隧道拨通后直接复用
+	dialMu.Lock()
+	defer dialMu.Unlock()
+
+	sessMu.Lock()
+	if sess, ok := sessPool[key]; ok {
+		select {
+		case <-sess.dead:
+			delete(sessPool, key)
+		default:
+			sessMu.Unlock()
+			errors.LogWarning(ctx, "[VPNGate] ⚡ 复用刚拨通的内存隧道 -> ", key)
 			return sess, nil
 		}
 	}
@@ -412,6 +432,12 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 		errors.LogWarning(ctx, "[VPNGate] ❌ TLS 握手失败: ", err)
 		return nil, err
 	}
+
+	// 计算服务端证书 SHA-256 指纹，供 SSTP CALL_CONNECTED 绑定校验使用
+	var certHash [32]byte
+	if peers := tlsConn.ConnectionState().PeerCertificates; len(peers) > 0 {
+		certHash = sha256.Sum256(peers[0].Raw)
+	}
 	errors.LogWarning(ctx, "[VPNGate] ✔ 1. TLS 握手成功 (", key, ")")
 
 	guid := "{BA195980-CD49-458b-9E23-C84EE0ADCD75}"
@@ -436,7 +462,6 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 	}
 	errors.LogWarning(ctx, "[VPNGate] ✔ 2. SSTP 隧道建立 (HTTP 200 OK)")
 
-	// 抢跑优化：将 CALL_CONNECT_REQUEST 与 LCP Conf-Req 合并同一帧发出，节省 1 个 RTT (约 0.6s)
 	callReq := []byte{
 		0x10, 0x01, 0x00, 0x0e,
 		0x00, 0x01, 0x00, 0x01,
@@ -444,7 +469,6 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 		0x00, 0x01,
 	}
 	_, _ = tlsConn.Write(callReq)
-	sendPPP(tlsConn, 0xc021, []byte{0x01, 0x01, 0x00, 0x04})
 
 	s := stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
@@ -478,9 +502,30 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 		defer markDead()
 		hdr := make([]byte, 4)
 		papSent := false
+		connSent := false
+		var serverNonce [32]byte
+
+		sendCallConnected := func() {
+			if connSent {
+				return
+			}
+			connSent = true
+			// 严格按照 MS-SSTP 规范构造 112 字节 CALL_CONNECTED 报文
+			connMsg := make([]byte, 112)
+			connMsg[0], connMsg[1] = 0x10, 0x01
+			binary.BigEndian.PutUint16(connMsg[2:4], 112)
+			binary.BigEndian.PutUint16(connMsg[4:6], 0x0004) // SSTP_MSG_CALL_CONNECTED
+			binary.BigEndian.PutUint16(connMsg[6:8], 0x0001) // 1 Attribute
+			connMsg[9] = 0x03                                // SSTP_ATTRIB_CRYPTO_BINDING
+			binary.BigEndian.PutUint16(connMsg[10:12], 104)  // Attribute Length = 104
+			connMsg[15] = 0x02                               // CERT_HASH_PROTOCOL_SHA256 (关键字节！避免被回 0x0008 Reject)
+			copy(connMsg[16:48], serverNonce[:])
+			copy(connMsg[48:80], certHash[:])
+			_, _ = tlsConn.Write(connMsg)
+		}
+
 		for {
 			if _, err := io.ReadFull(br, hdr); err != nil {
-				errors.LogWarning(ctx, "[VPNGate] 底层读取断开: ", err)
 				return
 			}
 			length := int(binary.BigEndian.Uint16(hdr[2:4]) & 0x0FFF)
@@ -493,10 +538,14 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 			}
 			if (hdr[1] & 0x01) != 0 {
 				msgType := binary.BigEndian.Uint16(payload[0:2])
-				if msgType == 0x0002 {
-					errors.LogWarning(ctx, "[VPNGate] ✔ 3. 收到 SSTP CONNECT_ACK")
-				} else if msgType == 0x0005 {
-					_, _ = tlsConn.Write([]byte{0x10, 0x01, 0x00, 0x08, 0x00, 0x06, 0x00, 0x00})
+				if msgType == 0x0002 { // CALL_CONNECT_ACK
+					if len(payload) >= 40 {
+						copy(serverNonce[:], payload[12:44])
+					}
+					errors.LogWarning(ctx, "[VPNGate] ✔ 3. 收到 SSTP CONNECT_ACK，开始 LCP 协商")
+					sendPPP(tlsConn, 0xc021, []byte{0x01, 0x01, 0x00, 0x04})
+				} else if msgType == 0x0008 { // Echo Request (0x0008 in MS-SSTP) -> 回复 Echo Response (0x0009)
+					_, _ = tlsConn.Write([]byte{0x10, 0x01, 0x00, 0x08, 0x00, 0x09, 0x00, 0x00})
 				} else {
 					errors.LogWarning(ctx, fmt.Sprintf("[VPNGate] 收到 SSTP 控制帧 type=0x%04x", msgType))
 				}
@@ -526,6 +575,7 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 				if code == 0x01 {
 					opts := pppData[4:]
 					needNakPAP := false
+					var rejectOpts []byte
 					for len(opts) >= 2 {
 						optType := opts[0]
 						optLen := int(opts[1])
@@ -537,10 +587,18 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 							if authProto != 0xc023 {
 								needNakPAP = true
 							}
+						} else if optType != 0x01 && optType != 0x03 && optType != 0x05 {
+							rejectOpts = append(rejectOpts, opts[:optLen]...)
 						}
 						opts = opts[optLen:]
 					}
-					if needNakPAP {
+					if len(rejectOpts) > 0 {
+						rej := make([]byte, 4+len(rejectOpts))
+						rej[0], rej[1] = 0x04, id
+						binary.BigEndian.PutUint16(rej[2:4], uint16(len(rej)))
+						copy(rej[4:], rejectOpts)
+						sendPPP(tlsConn, 0xc021, rej)
+					} else if needNakPAP {
 						nak := []byte{0x03, id, 0x00, 0x08, 0x03, 0x04, 0xc0, 0x23}
 						sendPPP(tlsConn, 0xc021, nak)
 					} else {
@@ -560,11 +618,7 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 			case 0xc023: // PAP
 				if pppData[0] == 0x02 {
 					errors.LogWarning(ctx, "[VPNGate] ✔ 4. PAP 认证通过，发送 CALL_CONNECTED 与 IPCP 请求")
-					connMsg := make([]byte, 112)
-					connMsg[0], connMsg[1], connMsg[3] = 0x10, 0x01, 112
-					connMsg[5], connMsg[7], connMsg[9], connMsg[11] = 0x04, 0x01, 0x03, 104
-					_, _ = tlsConn.Write(connMsg)
-					// 请求分配 IP (0.0.0.0)
+					sendCallConnected()
 					sendPPP(tlsConn, 0x8021, []byte{0x01, 0x01, 0x00, 0x0a, 0x03, 0x06, 0, 0, 0, 0})
 				} else if pppData[0] == 0x03 {
 					errors.LogWarning(ctx, "[VPNGate] ❌ PAP 认证被拒绝")
@@ -573,18 +627,17 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 			case 0x8021: // IPCP
 				code := pppData[0]
 				id := pppData[1]
-				errors.LogWarning(ctx, fmt.Sprintf("[VPNGate] 收到 IPCP 帧 code=%d len=%d hex=%x", code, len(pppData), pppData))
-				if code == 0x01 { // Server Conf-Req (通常包含网关 IP 如 10.211.254.254)
+				if code == 0x01 { // Server Conf-Req
 					ack := append([]byte{0x02}, pppData[1:]...)
 					sendPPP(tlsConn, 0x8021, ack)
-				} else if (code == 0x03 || code == 0x02) && len(pppData) >= 10 {
+				} else if code == 0x03 && len(pppData) >= 10 { // Conf-Nak 给出分配的 IP
 					ip := pppData[6:10]
-					if code == 0x03 {
-						// 收到 Conf-Nak 给出的真实分配 IP，立即回发 Conf-Req 确认，同时直接激活网卡（抢跑省去最后一轮等待！）
-						sendPPP(tlsConn, 0x8021, []byte{0x01, id + 1, 0x00, 0x0a, 0x03, 0x06, ip[0], ip[1], ip[2], ip[3]})
-					}
+					sendPPP(tlsConn, 0x8021, []byte{0x01, id + 1, 0x00, 0x0a, 0x03, 0x06, ip[0], ip[1], ip[2], ip[3]})
+				} else if code == 0x02 && len(pppData) >= 10 { // Conf-Ack 服务端正式确认开启 IPv4 转发！
+					sendCallConnected()
+					ip := pppData[6:10]
 					addr := tcpip.AddrFromSlice(ip)
-					errors.LogWarning(ctx, "[VPNGate] 🎉 5. 成功获取日本家宽内网 IP: ", addr.String())
+					errors.LogWarning(ctx, "[VPNGate] 🎉 5. 成功获取日本家宽内网 IP 并激活转发: ", addr.String())
 					once.Do(func() { ipReady <- addr })
 				}
 			case 0x0021: // IPv4 Packet
@@ -593,8 +646,6 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 				})
 				ep.InjectInbound(header.IPv4ProtocolNumber, pkt)
 				pkt.DecRef()
-			default:
-				errors.LogWarning(ctx, fmt.Sprintf("[VPNGate] 收到其他 PPP 协议帧 proto=0x%04x len=%d", proto, len(pppData)))
 			}
 		}
 	}()
