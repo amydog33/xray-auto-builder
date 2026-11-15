@@ -354,6 +354,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/common"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 )
 
@@ -467,6 +468,16 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 	})
+	sackEnabled := tcpip.TCPSACKEnabled(true)
+	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sackEnabled)
+	ccOpt := tcpip.CongestionControlOption("cubic")
+	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &ccOpt)
+	rcvBuf := tcpip.TCPReceiveBufferSizeRangeOption{Min: 4096, Default: 262144, Max: 4 * 1024 * 1024}
+	sndBuf := tcpip.TCPSendBufferSizeRangeOption{Min: 4096, Default: 262144, Max: 4 * 1024 * 1024}
+	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &rcvBuf)
+	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sndBuf)
+	modOpt := tcpip.TCPModerateReceiveBufferOption(true)
+	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &modOpt)
 	ep := channel.New(2048, 1200, "")
 	if tcpipErr := s.CreateNIC(1, ep); tcpipErr != nil {
 		s.Close()
@@ -639,15 +650,20 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 
 	go func() {
 		defer markDead()
+		ticker := time.NewTicker(25 * time.Second)
+		defer ticker.Stop()
 		for {
-			pkt := ep.ReadContext(context.Background())
-			if pkt == nil {
+			select {
+			case <-sess.dead:
 				return
+			case <-ticker.C:
+				// 每 25 秒主动发一个 SSTP Echo Request 探测并保活 NAT 映射
+				_ = tlsConn.SetWriteDeadline(time.Now().Add(8 * time.Second))
+				if _, err := tlsConn.Write([]byte{0x10, 0x01, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00}); err != nil {
+					return // 一旦底层断流，立即触发 markDead() 从连接池剔除该死节点
+				}
+				_ = tlsConn.SetWriteDeadline(time.Time{})
 			}
-			view := pkt.ToView()
-			sendPPP(tlsConn, 0x0021, view.AsSlice())
-			view.Release()
-			pkt.DecRef()
 		}
 	}()
 
@@ -764,14 +780,15 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
 		return err
 	}
 	defer gConn.Close()
+	_ = gConn.SetNoDelay(true)
 
 	errCh := make(chan error, 2)
 	go func() {
-		b := make([]byte, 64*1024)
+		b := make([]byte, buf.Size)
 		for {
 			n, err := gConn.Read(b)
 			if n > 0 {
-				mb := buf.NewSize(int32(n))
+				mb := buf.New()
 				_, _ = mb.Write(b[:n])
 				if wErr := link.Writer.WriteMultiBuffer(buf.MultiBuffer{mb}); wErr != nil {
 					errCh <- wErr
@@ -803,8 +820,24 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
 	return nil
 }
 
+var pppBufPool = sync.Pool{
+	New: func() any { b := make([]byte, 2048); return &b },
+}
+
 func sendPPP(w io.Writer, proto uint16, data []byte) {
-	total := 4 + 4 + len(data)
+	total := 8 + len(data)
+	if total <= 2048 {
+		bp := pppBufPool.Get().(*[]byte)
+		pkt := (*bp)[:total]
+		pkt[0], pkt[1] = 0x10, 0x00
+		binary.BigEndian.PutUint16(pkt[2:4], uint16(total))
+		pkt[4], pkt[5] = 0xff, 0x03
+		binary.BigEndian.PutUint16(pkt[6:8], proto)
+		copy(pkt[8:], data)
+		_, _ = w.Write(pkt)
+		pppBufPool.Put(bp)
+		return
+	}
 	pkt := make([]byte, total)
 	pkt[0], pkt[1] = 0x10, 0x00
 	binary.BigEndian.PutUint16(pkt[2:4], uint16(total))
