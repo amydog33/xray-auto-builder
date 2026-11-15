@@ -520,18 +520,45 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 				return
 			}
 			connSent = true
+			// 使用之前实测通过的 112 字节标准 CALL_CONNECTED 结构
 			connMsg := make([]byte, 112)
-			connMsg[0], connMsg[1] = 0x10, 0x01
-			binary.BigEndian.PutUint16(connMsg[2:4], 112)
-			binary.BigEndian.PutUint16(connMsg[4:6], 0x0004)
-			binary.BigEndian.PutUint16(connMsg[6:8], 0x0001)
-			connMsg[9] = 0x03
-			binary.BigEndian.PutUint16(connMsg[10:12], 104)
+			connMsg[0], connMsg[1], connMsg[3] = 0x10, 0x01, 112
+			connMsg[5], connMsg[7], connMsg[9], connMsg[11] = 0x04, 0x01, 0x03, 104
 			connMsg[15] = 0x02
 			copy(connMsg[16:48], serverNonce[:])
 			copy(connMsg[48:80], certHash[:])
 			_, _ = tlsConn.Write(connMsg)
 		}
+
+		for {
+			if _, err := io.ReadFull(br, hdr); err != nil {
+				errors.LogWarning(ctx, "[VPNGate] 读取断开: ", err)
+				return
+			}
+			length := int(binary.BigEndian.Uint16(hdr[2:4]) & 0x0FFF)
+			if length < 4 {
+				continue
+			}
+			payload := make([]byte, length-4)
+			if _, err := io.ReadFull(br, payload); err != nil {
+				return
+			}
+			if (hdr[1] & 0x01) != 0 {
+				msgType := binary.BigEndian.Uint16(payload[0:2])
+				if msgType == 0x0002 {
+					if len(payload) >= 44 {
+						copy(serverNonce[:], payload[12:44])
+					}
+					errors.LogWarning(ctx, "[VPNGate] ✔ 1. 收到 CONNECT_ACK，开始 LCP")
+					sendPPP(tlsConn, 0xc021, []byte{0x01, 0x01, 0x00, 0x04})
+				} else if msgType == 0x0008 {
+					_, _ = tlsConn.Write([]byte{0x10, 0x01, 0x00, 0x08, 0x00, 0x09, 0x00, 0x00})
+				} else if msgType == 0x0005 || msgType == 0x0006 {
+					errors.LogWarning(ctx, fmt.Sprintf("[VPNGate] ❌ 服务端拒绝并终止了会话 (msgType=0x%04x)", msgType))
+					return
+				}
+				continue
+			}
 
 		for {
 			if _, err := io.ReadFull(br, hdr); err != nil {
@@ -623,9 +650,11 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 				}
 			case 0xc023:
 				if pppData[0] == 0x02 {
-					sendCallConnected()
+					errors.LogWarning(ctx, "[VPNGate] ✔ 2. PAP 认证通过，请求内网 IP")
+					// 绝对不要在这里提前发 sendCallConnected()，否则 SoftEther 会判定状态非法！
 					sendPPP(tlsConn, 0x8021, []byte{0x01, 0x01, 0x00, 0x0a, 0x03, 0x06, 0, 0, 0, 0})
 				} else if pppData[0] == 0x03 {
+					errors.LogWarning(ctx, "[VPNGate] ❌ PAP 认证被拒")
 					return
 				}
 			case 0x8021:
@@ -638,10 +667,11 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 					ip := pppData[6:10]
 					sendPPP(tlsConn, 0x8021, []byte{0x01, id + 1, 0x00, 0x0a, 0x03, 0x06, ip[0], ip[1], ip[2], ip[3]})
 				} else if code == 0x02 && len(pppData) >= 10 {
+					// IPCP 协商完成，此时再发送 CALL_CONNECTED 正式激活数据面！
 					sendCallConnected()
 					ip := pppData[6:10]
 					addr := tcpip.AddrFromSlice(ip)
-					errors.LogWarning(ctx, "[VPNGate] 🎉 隧道就绪! 分配内网 IP: ", addr.String())
+					errors.LogWarning(ctx, "[VPNGate] 🎉 3. 隧道就绪! 分配内网 IP: ", addr.String())
 					once.Do(func() { ipReady <- addr })
 				}
 			case 0x0021:
@@ -679,7 +709,7 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 				return
 			case <-ticker.C:
 				_ = tlsConn.SetWriteDeadline(time.Now().Add(8 * time.Second))
-				if _, err := tlsConn.Write([]byte{0x10, 0x01, 0x00, 0x08, 0x00, 0x05, 0x00, 0x00}); err != nil {
+				if _, err := tlsConn.Write([]byte{0x10, 0x01, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00}); err != nil {
 					return
 				}
 				_ = tlsConn.SetWriteDeadline(time.Time{})
