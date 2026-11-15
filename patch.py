@@ -184,7 +184,6 @@ for root, _, files in os.walk("infra/conf"):
 
     for idx, line in enumerate(lines):
       if "vless without TLS" in line:
-        # 向上定位 return 语句起点，向下定位括号结束行（兼容单行与多行写法）
         start = idx
         while start > max(0, idx - 5) and "return" not in lines[start]:
           start -= 1
@@ -210,6 +209,7 @@ for root, _, files in os.walk("infra/conf"):
 
 if not patched_vless:
   raise RuntimeError("❌ 未能在 infra/conf 中找到 vless without TLS 限制代码！")
+
 # =========================================================================
 # 4. gRPC BDP 4MB/16MB 窗口扩张与 Windows 512KB 高吞吐套接字优化
 # =========================================================================
@@ -366,7 +366,6 @@ var (
 	sessPool = make(map[string]*sstpSession)
 )
 
-// 判断当前 Socks 服务器是否配置了 vpngate / vpn 用户名
 func isVPNGateServer(server *protocol.ServerSpec) bool {
 	if server == nil || server.User == nil || server.User.Account == nil {
 		return false
@@ -437,7 +436,6 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 	}
 	errors.LogWarning(ctx, "[VPNGate] ✔ 2. SSTP 隧道建立 (HTTP 200 OK)")
 
-	// 发送 SSTP CALL_CONNECT_REQUEST
 	callReq := []byte{
 		0x10, 0x01, 0x00, 0x0e,
 		0x00, 0x01, 0x00, 0x01,
@@ -495,10 +493,10 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 			}
 			if (hdr[1] & 0x01) != 0 {
 				msgType := binary.BigEndian.Uint16(payload[0:2])
-				if msgType == 0x0002 { // CALL_CONNECT_ACK
+				if msgType == 0x0002 {
 					errors.LogWarning(ctx, "[VPNGate] ✔ 3. 收到 SSTP CONNECT_ACK，开始 LCP 协商")
 					sendPPP(tlsConn, 0xc021, []byte{0x01, 0x01, 0x00, 0x04})
-				} else if msgType == 0x0005 { // Echo Request
+				} else if msgType == 0x0005 {
 					_, _ = tlsConn.Write([]byte{0x10, 0x01, 0x00, 0x08, 0x00, 0x06, 0x00, 0x00})
 				}
 				continue
@@ -515,17 +513,16 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 			if len(pppData) < 4 {
 				continue
 			}
-			// 严格按 PPP 自身的长度字段截断，剔除 SSTP 尾部对齐填充字节
 			pppLen := int(binary.BigEndian.Uint16(pppData[2:4]))
 			if pppLen >= 4 && pppLen <= len(pppData) {
 				pppData = pppData[:pppLen]
 			}
 
 			switch proto {
-			case 0xc021: // LCP
+			case 0xc021:
 				code := pppData[0]
 				id := pppData[1]
-				if code == 0x01 { // Server Configure-Request
+				if code == 0x01 {
 					opts := pppData[4:]
 					needNakPAP := false
 					for len(opts) >= 2 {
@@ -534,7 +531,7 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 						if optLen < 2 || optLen > len(opts) {
 							break
 						}
-						if optType == 0x03 && optLen >= 4 { // Auth-Proto Option
+						if optType == 0x03 && optLen >= 4 {
 							authProto := binary.BigEndian.Uint16(opts[2:4])
 							if authProto != 0xc023 {
 								needNakPAP = true
@@ -559,8 +556,8 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 				} else if code == 0x09 {
 					sendPPP(tlsConn, 0xc021, append([]byte{0x0a}, pppData[1:]...))
 				}
-			case 0xc023: // PAP
-				if pppData[0] == 0x02 { // Auth-Ack
+			case 0xc023:
+				if pppData[0] == 0x02 {
 					errors.LogWarning(ctx, "[VPNGate] ✔ 4. PAP (vpn/vpn) 认证通过，请求分配内网 IP")
 					connMsg := make([]byte, 112)
 					connMsg[0], connMsg[1], connMsg[3] = 0x10, 0x01, 112
@@ -571,21 +568,21 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 					errors.LogWarning(ctx, "[VPNGate] ❌ PAP 认证被拒绝")
 					return
 				}
-			case 0x8021: // IPCP
+			case 0x8021:
 				code := pppData[0]
 				id := pppData[1]
-				if code == 0x01 { // Server Conf-Req
+				if code == 0x01 {
 					ack := append([]byte{0x02}, pppData[1:]...)
 					sendPPP(tlsConn, 0x8021, ack)
-				} else if code == 0x03 && len(pppData) >= 10 { // Conf-Nak 给出分配的 IP
+				} else if code == 0x03 && len(pppData) >= 10 {
 					ip := pppData[6:10]
 					sendPPP(tlsConn, 0x8021, []byte{0x01, id + 1, 0x00, 0x0a, 0x03, 0x06, ip[0], ip[1], ip[2], ip[3]})
-				} else if code == 0x02 && len(pppData) >= 10 { // Conf-Ack 最终确认 IP
+				} else if code == 0x02 && len(pppData) >= 10 {
 					addr := tcpip.AddrFromSlice(pppData[6:10])
 					errors.LogWarning(ctx, "[VPNGate] 🎉 5. 成功获取日本家宽内网 IP: ", addr.String())
 					once.Do(func() { ipReady <- addr })
 				}
-			case 0x0021: // IPv4 Packet
+			case 0x0021:
 				pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 					Payload: buffer.MakeWithData(pppData),
 				})
@@ -754,14 +751,12 @@ func sendPPP(w io.Writer, proto uint16, data []byte) {
   with open(client_go, "r", encoding="utf-8") as f:
     c_code = f.read()
 
-  # 兼容新版与旧版 Xray proxy/socks/client.go 的 server 变量位置
   hook_snippet = """
 \tif isVPNGateServer(server) {
-\t\treturn handleVPNGateFixedNode(ctx, server.Destination(), destination, link, dialer)
+\t\treturn handleVPNGateFixedNode(ctx, server.Destination, destination, link, dialer)
 \t}
 """
   if "handleVPNGateFixedNode" not in c_code:
-    # 匹配 server 变量赋值行（无论是 server := c.server 还是 server := c.serverPicker...）
     new_code, n = re.subn(
         r"(server\s*:=\s*[^\n]+)",
         r"\1\n" + hook_snippet,
@@ -769,7 +764,9 @@ func sendPPP(w io.Writer, proto uint16, data []byte) {
         count=1,
     )
     if n == 0:
-      raise RuntimeError("❌ 未能在 proxy/socks/client.go 中匹配到 server 变量赋值行！")
+      raise RuntimeError(
+          "❌ 未能在 proxy/socks/client.go 中匹配到 server 变量赋值行！"
+      )
     with open(client_go, "w", encoding="utf-8") as f:
       f.write(new_code)
     print("  ✔ [VPNGate Engine] 成功注入固定节点直连与会话复用补丁")
