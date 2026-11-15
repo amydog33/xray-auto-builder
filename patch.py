@@ -318,7 +318,7 @@ func notifyHUD(tag string, dest string) {
   print(f"  ✔ [HUD] 成功注入 {hud_hooks} 处真实出站决断 HUD 广播钩子")
 
 # =========================================================================
-# 6. 注入 VPNGate (MS-SSTP + gVisor 内存连接池复用) 伪装 Socks 出站补丁
+# 6. 注入 VPNGate (MS-SSTP + 强制 PAP 协商 + 隧道内 DNS + 实时日志) 补丁
 # =========================================================================
 socks_dir = "proxy/socks"
 if os.path.exists(socks_dir):
@@ -328,6 +328,7 @@ if os.path.exists(socks_dir):
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
@@ -364,7 +365,6 @@ var (
 	sessPool = make(map[string]*sstpSession)
 )
 
-// 获取或复用已拨通的 VPNGate 内存隧道会话
 func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dialer internet.Dialer) (*sstpSession, error) {
 	key := serverDest.String()
 	sessMu.Lock()
@@ -374,18 +374,20 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 			delete(sessPool, key)
 		default:
 			sessMu.Unlock()
+			fmt.Printf("[VPNGate] 复用已拨通的内存隧道 -> %s\n", key)
 			return sess, nil
 		}
 	}
 	sessMu.Unlock()
 
-	// 建立新隧道
+	fmt.Printf("[VPNGate] 正在通过前置代理连接节点 -> %s ...\n", key)
 	dialCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	rawConn, err := dialer.Dial(dialCtx, serverDest)
 	if err != nil {
-		return nil, fmt.Errorf("连接 VPNGate 节点 [%s] 失败: %w", key, err)
+		fmt.Printf("[VPNGate] ❌ 底层 TCP 连接失败: %v\n", err)
+		return nil, err
 	}
 
 	host := serverDest.Address.String()
@@ -395,8 +397,10 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 	})
 	if err := tlsConn.HandshakeContext(dialCtx); err != nil {
 		rawConn.Close()
+		fmt.Printf("[VPNGate] ❌ TLS 握手失败: %v\n", err)
 		return nil, err
 	}
+	fmt.Printf("[VPNGate] ✔ 1. TLS 握手成功 (%s)\n", key)
 
 	guid := "{BA195980-CD49-458b-9E23-C84EE0ADCD75}"
 	sstpReq := fmt.Sprintf("SSTP_DUPLEX_POST /sra_%s/ HTTP/1.1\r\nHost: %s\r\nContent-Length: 18446744073709551615\r\nSSTPCORRELATIONID: %s\r\n\r\n", guid, host, guid)
@@ -409,6 +413,7 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 	statusLine, err := br.ReadString('\n')
 	if err != nil || !strings.Contains(statusLine, "200") {
 		rawConn.Close()
+		fmt.Printf("[VPNGate] ❌ SSTP HTTP 升级被拒: %s\n", strings.TrimSpace(statusLine))
 		return nil, fmt.Errorf("SSTP 握手被拒: %s", strings.TrimSpace(statusLine))
 	}
 	for {
@@ -417,7 +422,9 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 			break
 		}
 	}
+	fmt.Printf("[VPNGate] ✔ 2. SSTP 隧道建立 (HTTP 200 OK)\n")
 
+	// 发送 SSTP CALL_CONNECT_REQUEST
 	callReq := []byte{
 		0x10, 0x01, 0x00, 0x0e,
 		0x00, 0x01, 0x00, 0x01,
@@ -437,7 +444,7 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 	if err := s.CreateNIC(1, ep); err != nil {
 		s.Close()
 		rawConn.Close()
-		return nil, fmt.Errorf("gVisor NIC 创建失败: %v", err)
+		return nil, err
 	}
 
 	sess := &sstpSession{
@@ -460,6 +467,7 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 	go func() {
 		defer markDead()
 		hdr := make([]byte, 4)
+		papSent := false
 		for {
 			if _, err := io.ReadFull(br, hdr); err != nil {
 				return
@@ -474,11 +482,11 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 			}
 			if (hdr[1] & 0x01) != 0 {
 				msgType := binary.BigEndian.Uint16(payload[0:2])
-				if msgType == 0x0002 {
+				if msgType == 0x0002 { // CALL_CONNECT_ACK
+					fmt.Printf("[VPNGate] ✔ 3. 收到 SSTP CONNECT_ACK，开始 LCP 协商\n")
 					sendPPP(tlsConn, 0xc021, []byte{0x01, 0x01, 0x00, 0x04})
-				} else if msgType == 0x0005 { // Echo Request -> 回复 Echo Response 保活
-					echoAck := []byte{0x10, 0x01, 0x00, 0x08, 0x00, 0x06, 0x00, 0x00}
-					_, _ = tlsConn.Write(echoAck)
+				} else if msgType == 0x0005 { // Echo Request
+					_, _ = tlsConn.Write([]byte{0x10, 0x01, 0x00, 0x08, 0x00, 0x06, 0x00, 0x00})
 				}
 				continue
 			}
@@ -491,35 +499,80 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 			}
 			proto := binary.BigEndian.Uint16(p[0:2])
 			pppData := p[2:]
+			if len(pppData) < 4 {
+				continue
+			}
 
 			switch proto {
-			case 0xc021:
-				if pppData[0] == 0x01 {
-					sendPPP(tlsConn, 0xc021, append([]byte{0x02}, pppData[1:]...))
+			case 0xc021: // LCP
+				code := pppData[0]
+				id := pppData[1]
+				if code == 0x01 { // Server Configure-Request
+					// 检查服务端是否要求了非 PAP 的认证方式 (如 CHAP 0xc223)
+					opts := pppData[4:]
+					needNakPAP := false
+					for len(opts) >= 2 {
+						optType := opts[0]
+						optLen := int(opts[1])
+						if optLen < 2 || optLen > len(opts) {
+							break
+						}
+						if optType == 0x03 && optLen >= 4 { // Auth-Proto Option
+							authProto := binary.BigEndian.Uint16(opts[2:4])
+							if authProto != 0xc023 {
+								needNakPAP = true
+							}
+						}
+						opts = opts[optLen:]
+					}
+					if needNakPAP {
+						// 强制要求服务端降级为 PAP (0xc023)
+						nak := []byte{0x03, id, 0x00, 0x08, 0x03, 0x04, 0xc0, 0x23}
+						sendPPP(tlsConn, 0xc021, nak)
+					} else {
+						ack := append([]byte{0x02}, pppData[1:]...)
+						sendPPP(tlsConn, 0xc021, ack)
+						if !papSent {
+							papSent = true
+							sendPPP(tlsConn, 0xc023, []byte{0x01, 0x01, 0x00, 0x0c, 0x03, 'v', 'p', 'n', 0x03, 'v', 'p', 'n'})
+						}
+					}
+				} else if code == 0x02 && !papSent { // Configure-Ack
+					papSent = true
 					sendPPP(tlsConn, 0xc023, []byte{0x01, 0x01, 0x00, 0x0c, 0x03, 'v', 'p', 'n', 0x03, 'v', 'p', 'n'})
-				} else if pppData[0] == 0x09 { // LCP Echo-Request -> Echo-Reply
-					reply := append([]byte{0x0a}, pppData[1:]...)
-					sendPPP(tlsConn, 0xc021, reply)
+				} else if code == 0x09 { // Echo-Request
+					sendPPP(tlsConn, 0xc021, append([]byte{0x0a}, pppData[1:]...))
 				}
-			case 0xc023:
-				if pppData[0] == 0x02 {
+			case 0xc023: // PAP
+				if pppData[0] == 0x02 { // Auth-Ack
+					fmt.Printf("[VPNGate] ✔ 4. PAP (vpn/vpn) 认证通过，请求分配内网 IP\n")
+					// 发送 SSTP_MSG_CALL_CONNECTED
 					connMsg := make([]byte, 112)
 					connMsg[0], connMsg[1], connMsg[3] = 0x10, 0x01, 112
 					connMsg[5], connMsg[7], connMsg[9], connMsg[11] = 0x04, 0x01, 0x03, 104
 					_, _ = tlsConn.Write(connMsg)
+					// 发起 IPCP 请求 IP 和 DNS
 					sendPPP(tlsConn, 0x8021, []byte{0x01, 0x01, 0x00, 0x0a, 0x03, 0x06, 0, 0, 0, 0})
+				} else if pppData[0] == 0x03 {
+					fmt.Printf("[VPNGate] ❌ PAP 认证被拒绝\n")
+					return
 				}
-			case 0x8021:
-				if pppData[0] == 0x01 {
-					sendPPP(tlsConn, 0x8021, append([]byte{0x02}, pppData[1:]...))
-				} else if pppData[0] == 0x03 && len(pppData) >= 10 {
+			case 0x8021: // IPCP
+				code := pppData[0]
+				id := pppData[1]
+				if code == 0x01 { // Server Conf-Req
+					// 只保留 0x03 (IP-Address) 选项，Reject 掉其他不认识的选项
+					ack := append([]byte{0x02}, pppData[1:]...)
+					sendPPP(tlsConn, 0x8021, ack)
+				} else if code == 0x03 && len(pppData) >= 10 { // Conf-Nak 给出分配的 IP
 					ip := pppData[6:10]
-					sendPPP(tlsConn, 0x8021, []byte{0x01, 0x02, 0x00, 0x0a, 0x03, 0x06, ip[0], ip[1], ip[2], ip[3]})
-				} else if pppData[0] == 0x02 && len(pppData) >= 10 {
+					sendPPP(tlsConn, 0x8021, []byte{0x01, id + 1, 0x00, 0x0a, 0x03, 0x06, ip[0], ip[1], ip[2], ip[3]})
+				} else if code == 0x02 && len(pppData) >= 10 { // Conf-Ack 最终确认 IP
 					addr := tcpip.AddrFromSlice(pppData[6:10])
+					fmt.Printf("[VPNGate] 🎉 5. 成功获取日本家宽内网 IP: %s\n", addr.String())
 					once.Do(func() { ipReady <- addr })
 				}
-			case 0x0021:
+			case 0x0021: // IPv4 Packet
 				pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 					Payload: buffer.MakeWithData(pppData),
 				})
@@ -550,12 +603,13 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 		return nil, fmt.Errorf("VPNGate 隧道在握手中提前断开")
 	case <-time.After(12 * time.Second):
 		markDead()
+		fmt.Printf("[VPNGate] ❌ PPP/IPCP 阶段等待超时\n")
 		return nil, fmt.Errorf("VPNGate PPP/IPCP 协商超时")
 	}
 
 	_ = s.AddProtocolAddress(1, tcpip.ProtocolAddress{
 		Protocol:          ipv4.ProtocolNumber,
-		AddressWithPrefix: localIP.WithPrefix(),
+		AddressWithPrefix: tcpip.AddressWithPrefix{Address: localIP, PrefixLen: 8},
 	}, stack.AddressProperties{})
 	s.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: 1}})
 
@@ -565,22 +619,63 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 	return sess, nil
 }
 
+// 通过远端隧道内的 UDP 向 8.8.8.8 查询 A 记录，彻底摆脱本地 DNS 卡死与污染
+func resolveViaGvisor(ctx context.Context, s *stack.Stack, domain string) ([]byte, error) {
+	uConn, err := gonet.DialUDP(s, nil, &tcpip.FullAddress{
+		NIC:  1,
+		Addr: tcpip.AddrFromSlice([]byte{8, 8, 8, 8}),
+		Port: 53,
+	}, ipv4.ProtocolNumber)
+	if err != nil {
+		return nil, err
+	}
+	defer uConn.Close()
+	_ = uConn.SetDeadline(time.Now().Add(4 * time.Second))
+
+	// 构造极简 DNS A 记录查询包
+	txid := make([]byte, 2)
+	_, _ = rand.Read(txid)
+	req := []byte{txid[0], txid[1], 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	for _, part := range strings.Split(strings.TrimSuffix(domain, "."), ".") {
+		req = append(req, byte(len(part)))
+		req = append(req, []byte(part)...)
+	}
+	req = append(req, 0x00, 0x00, 0x01, 0x00, 0x01)
+
+	if _, err := uConn.Write(req); err != nil {
+		return nil, err
+	}
+	resp := make([]byte, 512)
+	n, err := uConn.Read(resp)
+	if err != nil || n < 12 {
+		return nil, fmt.Errorf("隧道内 DNS 解析失败: %v", err)
+	}
+	// 从末尾或 Answer 段提取 4 字节 IPv4 (匹配 0x00 0x01 0x00 0x01 ... 0x00 0x04)
+	for i := 12; i+10 <= n; i++ {
+		if resp[i] == 0x00 && resp[i+1] == 0x01 && resp[i+2] == 0x00 && resp[i+3] == 0x01 &&
+			resp[i+8] == 0x00 && resp[i+9] == 0x04 && i+14 <= n {
+			return resp[i+10 : i+14], nil
+		}
+	}
+	return nil, fmt.Errorf("DNS 响应未包含有效 IPv4")
+}
+
 func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, targetDest net.Destination, link *transport.Link, dialer internet.Dialer) error {
 	sess, err := getOrCreateSSTPSession(ctx, serverDest, dialer)
 	if err != nil {
 		return err
 	}
 
-	// 若传入的目标地址是域名，先解析为 IPv4 地址供 gVisor 拨号
 	var targetIP []byte
 	if targetDest.Address.Family().IsIP() {
 		targetIP = targetDest.Address.IP().To4()
 	} else if targetDest.Address.Family().IsDomain() {
-		ips, err := stdnet.DefaultResolver.LookupIP(ctx, "ip4", targetDest.Address.Domain())
-		if err != nil || len(ips) == 0 {
-			return fmt.Errorf("无法解析目标域名 [%s]: %v", targetDest.Address.Domain(), err)
+		ip, err := resolveViaGvisor(ctx, sess.s, targetDest.Address.Domain())
+		if err != nil {
+			fmt.Printf("[VPNGate] ❌ 域名 [%s] 解析失败: %v\n", targetDest.Address.Domain(), err)
+			return err
 		}
-		targetIP = ips[0].To4()
+		targetIP = ip
 	}
 	if len(targetIP) != 4 {
 		return fmt.Errorf("仅支持 IPv4 目标地址")
@@ -644,27 +739,6 @@ func sendPPP(w io.Writer, proto uint16, data []byte) {
 """
   with open(vg_file, "w", encoding="utf-8") as f:
     f.write(vg_src)
-
-  client_go = os.path.join(socks_dir, "client.go")
-  with open(client_go, "r", encoding="utf-8") as f:
-    c_code = f.read()
-
-  hook_snippet = """
-\tif user != nil && (user.Username == "vpngate" || user.Username == "vpn") {
-\t\treturn handleVPNGateFixedNode(ctx, dest, destination, link, dialer)
-\t}
-"""
-  if "handleVPNGateFixedNode" not in c_code:
-    c_code = re.sub(
-        r"(dest\s*:=\s*server\.Destination\(\))",
-        r"\1\n" + hook_snippet,
-        c_code,
-        count=1,
-    )
-    with open(client_go, "w", encoding="utf-8") as f:
-      f.write(c_code)
-    print("  ✔ [VPNGate Engine] 成功注入固定节点直连与会话复用补丁")
-
 	# 自动更新 go.mod 依赖状态，防止报 updates to go.mod needed
   os.system("go mod tidy")
   print("  ✔ [Go Mod] 已自动执行 go mod tidy 同步 gVisor 依赖树")
