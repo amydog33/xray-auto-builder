@@ -665,4 +665,8 @@ func sendPPP(w io.Writer, proto uint16, data []byte) {
       f.write(c_code)
     print("  ✔ [VPNGate Engine] 成功注入固定节点直连与会话复用补丁")
 
+	# 自动更新 go.mod 依赖状态，防止报 updates to go.mod needed
+  os.system("go mod tidy")
+  print("  ✔ [Go Mod] 已自动执行 go mod tidy 同步 gVisor 依赖树")
+
 print(">>> 全部兼容、提速与安全加固补丁写入完毕！")
