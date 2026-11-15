@@ -318,7 +318,7 @@ func notifyHUD(tag string, dest string) {
   print(f"  ✔ [HUD] 成功注入 {hud_hooks} 处真实出站决断 HUD 广播钩子")
 
 # =========================================================================
-# 6. 注入 VPNGate (1200 MTU 适配 HY2 + DNS 内存秒解缓存 + 2048 队列加速) 补丁
+# 6. 注入 VPNGate (CUBIC+4MB大窗口+1200MTU+DNS缓存+主动心跳保活) 终极补丁
 # =========================================================================
 socks_dir = "proxy/socks"
 if os.path.exists(socks_dir):
@@ -354,7 +354,6 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
-	"gvisor.dev/gvisor/pkg/tcpip/transport/common"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 )
 
@@ -369,6 +368,9 @@ var (
 	dialMu   sync.Mutex
 	sessPool = make(map[string]*sstpSession)
 	dnsCache sync.Map
+	pppPool  = sync.Pool{
+		New: func() any { b := make([]byte, 2048); return &b },
+	}
 )
 
 func isVPNGateServer(server *protocol.ServerSpec) bool {
@@ -468,6 +470,7 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 	})
+	// 开启 SACK、CUBIC 拥塞控制与 4MB 大滑动窗口，解决跨国高延迟链路吞吐受限
 	sackEnabled := tcpip.TCPSACKEnabled(true)
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sackEnabled)
 	ccOpt := tcpip.CongestionControlOption("cubic")
@@ -478,6 +481,7 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sndBuf)
 	modOpt := tcpip.TCPModerateReceiveBufferOption(true)
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &modOpt)
+
 	ep := channel.New(2048, 1200, "")
 	if tcpipErr := s.CreateNIC(1, ep); tcpipErr != nil {
 		s.Close()
@@ -650,6 +654,21 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 
 	go func() {
 		defer markDead()
+		for {
+			pkt := ep.ReadContext(context.Background())
+			if pkt == nil {
+				return
+			}
+			view := pkt.ToView()
+			sendPPP(tlsConn, 0x0021, view.AsSlice())
+			view.Release()
+			pkt.DecRef()
+		}
+	}()
+
+	// 25 秒主动心跳探测，防止 NAT 超时假死并在断流时秒级熔断剔除死节点
+	go func() {
+		defer markDead()
 		ticker := time.NewTicker(25 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -657,10 +676,9 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 			case <-sess.dead:
 				return
 			case <-ticker.C:
-				// 每 25 秒主动发一个 SSTP Echo Request 探测并保活 NAT 映射
 				_ = tlsConn.SetWriteDeadline(time.Now().Add(8 * time.Second))
-				if _, err := tlsConn.Write([]byte{0x10, 0x01, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00}); err != nil {
-					return // 一旦底层断流，立即触发 markDead() 从连接池剔除该死节点
+				if _, err := tlsConn.Write([]byte{0x10, 0x01, 0x00, 0x08, 0x00, 0x05, 0x00, 0x00}); err != nil {
+					return
 				}
 				_ = tlsConn.SetWriteDeadline(time.Time{})
 			}
@@ -820,14 +838,10 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
 	return nil
 }
 
-var pppBufPool = sync.Pool{
-	New: func() any { b := make([]byte, 2048); return &b },
-}
-
 func sendPPP(w io.Writer, proto uint16, data []byte) {
 	total := 8 + len(data)
 	if total <= 2048 {
-		bp := pppBufPool.Get().(*[]byte)
+		bp := pppPool.Get().(*[]byte)
 		pkt := (*bp)[:total]
 		pkt[0], pkt[1] = 0x10, 0x00
 		binary.BigEndian.PutUint16(pkt[2:4], uint16(total))
@@ -835,7 +849,7 @@ func sendPPP(w io.Writer, proto uint16, data []byte) {
 		binary.BigEndian.PutUint16(pkt[6:8], proto)
 		copy(pkt[8:], data)
 		_, _ = w.Write(pkt)
-		pppBufPool.Put(bp)
+		pppPool.Put(bp)
 		return
 	}
 	pkt := make([]byte, total)
