@@ -333,7 +333,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	stdnet "net"
 	"strings"
 	"sync"
 	"time"
@@ -441,10 +440,10 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 	})
 	ep := channel.New(512, 1350, "")
-	if err := s.CreateNIC(1, ep); err != nil {
+	if tcpipErr := s.CreateNIC(1, ep); tcpipErr != nil {
 		s.Close()
 		rawConn.Close()
-		return nil, err
+		return nil, fmt.Errorf("gVisor NIC 创建失败: %v", tcpipErr)
 	}
 
 	sess := &sstpSession{
@@ -508,7 +507,6 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 				code := pppData[0]
 				id := pppData[1]
 				if code == 0x01 { // Server Configure-Request
-					// 检查服务端是否要求了非 PAP 的认证方式 (如 CHAP 0xc223)
 					opts := pppData[4:]
 					needNakPAP := false
 					for len(opts) >= 2 {
@@ -546,12 +544,10 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 			case 0xc023: // PAP
 				if pppData[0] == 0x02 { // Auth-Ack
 					fmt.Printf("[VPNGate] ✔ 4. PAP (vpn/vpn) 认证通过，请求分配内网 IP\n")
-					// 发送 SSTP_MSG_CALL_CONNECTED
 					connMsg := make([]byte, 112)
 					connMsg[0], connMsg[1], connMsg[3] = 0x10, 0x01, 112
 					connMsg[5], connMsg[7], connMsg[9], connMsg[11] = 0x04, 0x01, 0x03, 104
 					_, _ = tlsConn.Write(connMsg)
-					// 发起 IPCP 请求 IP 和 DNS
 					sendPPP(tlsConn, 0x8021, []byte{0x01, 0x01, 0x00, 0x0a, 0x03, 0x06, 0, 0, 0, 0})
 				} else if pppData[0] == 0x03 {
 					fmt.Printf("[VPNGate] ❌ PAP 认证被拒绝\n")
@@ -561,7 +557,6 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 				code := pppData[0]
 				id := pppData[1]
 				if code == 0x01 { // Server Conf-Req
-					// 只保留 0x03 (IP-Address) 选项，Reject 掉其他不认识的选项
 					ack := append([]byte{0x02}, pppData[1:]...)
 					sendPPP(tlsConn, 0x8021, ack)
 				} else if code == 0x03 && len(pppData) >= 10 { // Conf-Nak 给出分配的 IP
@@ -619,7 +614,7 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 	return sess, nil
 }
 
-// 通过远端隧道内的 UDP 向 8.8.8.8 查询 A 记录，彻底摆脱本地 DNS 卡死与污染
+// 通过远端隧道内的 UDP 向 8.8.8.8 查询 A 记录
 func resolveViaGvisor(ctx context.Context, s *stack.Stack, domain string) ([]byte, error) {
 	uConn, err := gonet.DialUDP(s, nil, &tcpip.FullAddress{
 		NIC:  1,
@@ -632,7 +627,6 @@ func resolveViaGvisor(ctx context.Context, s *stack.Stack, domain string) ([]byt
 	defer uConn.Close()
 	_ = uConn.SetDeadline(time.Now().Add(4 * time.Second))
 
-	// 构造极简 DNS A 记录查询包
 	txid := make([]byte, 2)
 	_, _ = rand.Read(txid)
 	req := []byte{txid[0], txid[1], 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
@@ -650,7 +644,6 @@ func resolveViaGvisor(ctx context.Context, s *stack.Stack, domain string) ([]byt
 	if err != nil || n < 12 {
 		return nil, fmt.Errorf("隧道内 DNS 解析失败: %v", err)
 	}
-	// 从末尾或 Answer 段提取 4 字节 IPv4 (匹配 0x00 0x01 0x00 0x01 ... 0x00 0x04)
 	for i := 12; i+10 <= n; i++ {
 		if resp[i] == 0x00 && resp[i+1] == 0x01 && resp[i+2] == 0x00 && resp[i+3] == 0x01 &&
 			resp[i+8] == 0x00 && resp[i+9] == 0x04 && i+14 <= n {
