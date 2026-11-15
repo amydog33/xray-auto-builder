@@ -470,9 +470,11 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 	})
-	// 开启 SACK、CUBIC 拥塞控制与 4MB 大滑动窗口，解决跨国高延迟链路吞吐受限
+	// 开启 SACK、CUBIC 拥塞控制、禁用 Nagle 攒包，并拉大 TCP 窗口至 4MB
 	sackEnabled := tcpip.TCPSACKEnabled(true)
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sackEnabled)
+	delayEnabled := tcpip.TCPDelayEnabled(false)
+	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &delayEnabled)
 	ccOpt := tcpip.CongestionControlOption("cubic")
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &ccOpt)
 	rcvBuf := tcpip.TCPReceiveBufferSizeRangeOption{Min: 4096, Default: 262144, Max: 4 * 1024 * 1024}
@@ -798,7 +800,6 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
 		return err
 	}
 	defer gConn.Close()
-	_ = gConn.SetNoDelay(true)
 
 	errCh := make(chan error, 2)
 	go func() {
