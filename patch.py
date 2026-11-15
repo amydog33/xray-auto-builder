@@ -364,11 +364,12 @@ type sstpSession struct {
 }
 
 var (
-	sessMu   sync.Mutex
-	dialMu   sync.Mutex
-	sessPool = make(map[string]*sstpSession)
-	dnsCache sync.Map
-	pppPool  = sync.Pool{
+	sessMu    sync.Mutex
+	dialMu    sync.Mutex
+	sessPool  = make(map[string]*sstpSession)
+	dnsCache  sync.Map
+	failCache sync.Map
+	pppPool   = sync.Pool{
 		New: func() any { b := make([]byte, 2048); return &b },
 	}
 )
@@ -413,6 +414,13 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 		}
 	}
 	sessMu.Unlock()
+
+	if failTime, ok := failCache.Load(key); ok {
+		if time.Since(failTime.(time.Time)) < 20*time.Second {
+			return nil, fmt.Errorf("节点 %s 处于失败冷却中", key)
+		}
+		failCache.Delete(key)
+	}
 
 	errors.LogWarning(ctx, "[VPNGate] 正在通过前置代理连接节点 -> ", key)
 	dialCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -470,7 +478,6 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 	})
-	// 开启 SACK、CUBIC 拥塞控制、禁用 Nagle 攒包，并拉大 TCP 窗口至 4MB
 	sackEnabled := tcpip.TCPSACKEnabled(true)
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sackEnabled)
 	delayEnabled := tcpip.TCPDelayEnabled(false)
@@ -520,7 +527,6 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 				return
 			}
 			connSent = true
-			// 使用之前实测通过的 112 字节标准 CALL_CONNECTED 结构
 			connMsg := make([]byte, 112)
 			connMsg[0], connMsg[1], connMsg[3] = 0x10, 0x01, 112
 			connMsg[5], connMsg[7], connMsg[9], connMsg[11] = 0x04, 0x01, 0x03, 104
@@ -532,7 +538,7 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 
 		for {
 			if _, err := io.ReadFull(br, hdr); err != nil {
-				errors.LogWarning(ctx, "[VPNGate] 读取断开: ", err)
+				errors.LogWarning(ctx, "[VPNGate] 底层读取断开: ", err)
 				return
 			}
 			length := int(binary.BigEndian.Uint16(hdr[2:4]) & 0x0FFF)
@@ -554,33 +560,8 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 				} else if msgType == 0x0008 {
 					_, _ = tlsConn.Write([]byte{0x10, 0x01, 0x00, 0x08, 0x00, 0x09, 0x00, 0x00})
 				} else if msgType == 0x0005 || msgType == 0x0006 {
-					errors.LogWarning(ctx, fmt.Sprintf("[VPNGate] ❌ 服务端拒绝并终止了会话 (msgType=0x%04x)", msgType))
+					errors.LogWarning(ctx, fmt.Sprintf("[VPNGate] ❌ 服务端拒绝会话 (msgType=0x%04x)", msgType))
 					return
-				}
-				continue
-			}
-
-		for {
-			if _, err := io.ReadFull(br, hdr); err != nil {
-				return
-			}
-			length := int(binary.BigEndian.Uint16(hdr[2:4]) & 0x0FFF)
-			if length < 4 {
-				continue
-			}
-			payload := make([]byte, length-4)
-			if _, err := io.ReadFull(br, payload); err != nil {
-				return
-			}
-			if (hdr[1] & 0x01) != 0 {
-				msgType := binary.BigEndian.Uint16(payload[0:2])
-				if msgType == 0x0002 {
-					if len(payload) >= 40 {
-						copy(serverNonce[:], payload[12:44])
-					}
-					sendPPP(tlsConn, 0xc021, []byte{0x01, 0x01, 0x00, 0x04})
-				} else if msgType == 0x0005 || msgType == 0x0008 {
-					_, _ = tlsConn.Write([]byte{0x10, 0x01, 0x00, 0x08, 0x00, 0x06, 0x00, 0x00})
 				}
 				continue
 			}
@@ -651,7 +632,6 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 			case 0xc023:
 				if pppData[0] == 0x02 {
 					errors.LogWarning(ctx, "[VPNGate] ✔ 2. PAP 认证通过，请求内网 IP")
-					// 绝对不要在这里提前发 sendCallConnected()，否则 SoftEther 会判定状态非法！
 					sendPPP(tlsConn, 0x8021, []byte{0x01, 0x01, 0x00, 0x0a, 0x03, 0x06, 0, 0, 0, 0})
 				} else if pppData[0] == 0x03 {
 					errors.LogWarning(ctx, "[VPNGate] ❌ PAP 认证被拒")
@@ -667,7 +647,6 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 					ip := pppData[6:10]
 					sendPPP(tlsConn, 0x8021, []byte{0x01, id + 1, 0x00, 0x0a, 0x03, 0x06, ip[0], ip[1], ip[2], ip[3]})
 				} else if code == 0x02 && len(pppData) >= 10 {
-					// IPCP 协商完成，此时再发送 CALL_CONNECTED 正式激活数据面！
 					sendCallConnected()
 					ip := pppData[6:10]
 					addr := tcpip.AddrFromSlice(ip)
@@ -698,7 +677,6 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 		}
 	}()
 
-	// 25 秒主动心跳探测，防止 NAT 超时假死并在断流时秒级熔断剔除死节点
 	go func() {
 		defer markDead()
 		ticker := time.NewTicker(25 * time.Second)
@@ -721,9 +699,11 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 	select {
 	case localIP = <-ipReady:
 	case <-sess.dead:
+		failCache.Store(key, time.Now())
 		return nil, fmt.Errorf("VPNGate 隧道在握手中提前断开")
 	case <-time.After(15 * time.Second):
 		markDead()
+		failCache.Store(key, time.Now())
 		return nil, fmt.Errorf("VPNGate PPP/IPCP 协商超时")
 	}
 
