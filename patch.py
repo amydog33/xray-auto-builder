@@ -367,7 +367,7 @@ var (
 	sessMu   sync.Mutex
 	dialMu   sync.Mutex
 	sessPool = make(map[string]*sstpSession)
-	dnsCache sync.Map // 域名 -> []byte (4字节IPv4)，实现 0ms 秒开复用
+	dnsCache sync.Map
 )
 
 func isVPNGateServer(server *protocol.ServerSpec) bool {
@@ -467,7 +467,6 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 	})
-	// 队列扩至 2048，MTU 设为 1200，防止套在 Hysteria2 内部时产生 QUIC 分片丢包
 	ep := channel.New(2048, 1200, "")
 	if tcpipErr := s.CreateNIC(1, ep); tcpipErr != nil {
 		s.Close()
@@ -674,7 +673,6 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 	return sess, nil
 }
 
-// 极速 DNS 解析：内存缓存 0ms 命中 + 隧道内 1.1.1.1 / 8.8.8.8 并发竞速
 func resolveFast(ctx context.Context, s *stack.Stack, domain string) ([]byte, error) {
 	domain = strings.TrimSuffix(strings.ToLower(domain), ".")
 	if cached, ok := dnsCache.Load(domain); ok {
@@ -719,7 +717,6 @@ func resolveFast(ctx context.Context, s *stack.Stack, domain string) ([]byte, er
 		}
 	}
 
-	// 同时向 1.1.1.1 和 8.8.8.8 发起查询，谁先回用谁
 	go queryServer([]byte{1, 1, 1, 1})
 	go queryServer([]byte{8, 8, 8, 8})
 
@@ -728,7 +725,6 @@ func resolveFast(ctx context.Context, s *stack.Stack, domain string) ([]byte, er
 		dnsCache.Store(domain, ip)
 		return ip, nil
 	case <-time.After(1600 * time.Millisecond):
-		// 兜底：若该家宽节点屏蔽了 UDP 53，回退使用系统解析器
 		ips, err := stdnet.DefaultResolver.LookupIP(ctx, "ip4", domain)
 		if err == nil && len(ips) > 0 {
 			ip := ips[0].To4()
@@ -820,5 +816,33 @@ func sendPPP(w io.Writer, proto uint16, data []byte) {
 """
   with open(vg_file, "w", encoding="utf-8") as f:
     f.write(vg_src)
+
+  client_go = os.path.join(socks_dir, "client.go")
+  with open(client_go, "r", encoding="utf-8") as f:
+    c_code = f.read()
+
+  hook_snippet = """
+\tif isVPNGateServer(server) {
+\t\treturn handleVPNGateFixedNode(ctx, server.Destination, destination, link, dialer)
+\t}
+"""
+  if "handleVPNGateFixedNode" not in c_code:
+    new_code, n = re.subn(
+        r"(server\s*:=\s*[^\n]+)",
+        r"\1\n" + hook_snippet,
+        c_code,
+        count=1,
+    )
+    if n == 0:
+      raise RuntimeError(
+          "❌ 未能在 proxy/socks/client.go 中匹配到 server 变量赋值行！"
+      )
+    with open(client_go, "w", encoding="utf-8") as f:
+      f.write(new_code)
+    print("  ✔ [VPNGate Engine] 成功注入固定节点直连与会话复用补丁")
+
+  if os.system("go mod tidy") != 0:
+    raise RuntimeError("❌ go mod tidy 执行失败！")
+  print("  ✔ [Go Mod] 已自动执行 go mod tidy 同步 gVisor 依赖树")
 
 print(">>> 全部兼容、提速与安全加固补丁写入完毕！")
