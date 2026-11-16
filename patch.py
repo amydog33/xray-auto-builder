@@ -548,7 +548,8 @@ func dialSlotSession(ctx context.Context, serverDest net.Destination, dialer int
 		binary.BigEndian.Uint16(b[8:10]),
 		b[10:16])
 
-	sstpReq := fmt.Sprintf("SSTP_DUPLEX_POST /sra_%s/ HTTP/1.1\r\nHost: %s\r\nContent-Length: 18446744073709551615\r\nSSTPCORRELATIONID: %s\r\n\r\n", guid, host, guid)
+	serviceGUID := "{BA195980-CD49-458b-9E23-C84EE0ADCD75}"
+	sstpReq := fmt.Sprintf("SSTP_DUPLEX_POST /sra_%s/ HTTP/1.1\r\nHost: %s\r\nContent-Length: 18446744073709551615\r\nSSTPCORRELATIONID: %s\r\n\r\n", serviceGUID, host, guid)
 	if _, err := tlsConn.Write([]byte(sstpReq)); err != nil {
 		rawConn.Close()
 		return nil, err
@@ -558,6 +559,9 @@ func dialSlotSession(ctx context.Context, serverDest net.Destination, dialer int
 	statusLine, err := br.ReadString('\n')
 	if err != nil || !strings.Contains(statusLine, "200") {
 		rawConn.Close()
+		if !isBackground && !hasAnyAliveSlot(baseKey) {
+			failCache.Store(baseKey, time.Now())
+		}
 		return nil, fmt.Errorf("SSTP 握手被拒: %s", strings.TrimSpace(statusLine))
 	}
 	for {
