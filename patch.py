@@ -318,7 +318,7 @@ func notifyHUD(tag string, dest string) {
   print(f"  ✔ [HUD] 成功注入 {hud_hooks} 处真实出站决断 HUD 广播钩子")
 
 # =========================================================================
-# 6. 注入 VPNGate (CUBIC+RACK/TLP+批量Flush写入+4路极速DNS+32KB吞吐) 终极补丁
+# 6. 注入 VPNGate (双隧道并发分流池 + CUBIC/RACK + 批量Flush + 单会话节点兼容)
 # =========================================================================
 socks_dir = "proxy/socks"
 if os.path.exists(socks_dir):
@@ -357,6 +357,9 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 )
 
+// 每个节点并发保持 2 条独立 SSTP 隧道，消除单 TCP 队头阻塞并叠加带宽
+const poolSizePerNode = 2
+
 type sstpSession struct {
 	s         *stack.Stack
 	rawConn   net.Conn
@@ -375,10 +378,12 @@ type dnsEntry struct {
 
 var (
 	sessMu          sync.Mutex
-	dialMu          sync.Mutex
+	slotLocks       sync.Map
 	sessPool        = make(map[string]*sstpSession)
+	rrCounter       atomic.Uint32
 	dnsCache        sync.Map
 	failCache       sync.Map
+	slotBackoff     sync.Map
 	tlsSessionCache = tls.NewLRUClientSessionCache(256)
 	pppPool         = sync.Pool{
 		New: func() any { b := make([]byte, 2048); return &b },
@@ -387,6 +392,34 @@ var (
 		New: func() any { b := make([]byte, 32768); return &b },
 	}
 )
+
+func getSlotMutex(slotKey string) *sync.Mutex {
+	val, _ := slotLocks.LoadOrStore(slotKey, &sync.Mutex{})
+	return val.(*sync.Mutex)
+}
+
+func isAlive(sess *sstpSession) bool {
+	if sess == nil {
+		return false
+	}
+	select {
+	case <-sess.dead:
+		return false
+	default:
+		return true
+	}
+}
+
+func hasAnyAliveSlot(baseKey string) bool {
+	sessMu.Lock()
+	defer sessMu.Unlock()
+	for i := 0; i < poolSizePerNode; i++ {
+		if isAlive(sessPool[fmt.Sprintf("%s#%d", baseKey, i)]) {
+			return true
+		}
+	}
+	return false
+}
 
 func isVPNGateServer(server *protocol.ServerSpec) bool {
 	if server == nil || server.User == nil || server.User.Account == nil {
@@ -399,11 +432,10 @@ func isVPNGateServer(server *protocol.ServerSpec) bool {
 	return false
 }
 
-// 线程安全的单包写入（握手与控制帧使用）
 func (sess *sstpSession) writeFrame(data []byte) error {
 	sess.writeMu.Lock()
 	defer sess.writeMu.Unlock()
-	_ = sess.tlsConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	_ = sess.tlsConn.SetWriteDeadline(time.Now().Add(8 * time.Second))
 	_, err := sess.bw.Write(data)
 	if err == nil {
 		err = sess.bw.Flush()
@@ -423,45 +455,67 @@ func (sess *sstpSession) sendPPPControl(proto uint16, data []byte) {
 	_ = sess.writeFrame(pkt)
 }
 
+func triggerBgSlotDial(serverDest net.Destination, dialer internet.Dialer, baseKey, slotKey string) {
+	if t, ok := slotBackoff.Load(slotKey); ok && time.Since(t.(time.Time)) < 60*time.Second {
+		return
+	}
+	slotBackoff.Store(slotKey, time.Now())
+	go func() {
+		_, _ = dialSlotSession(context.Background(), serverDest, dialer, baseKey, slotKey, true)
+	}()
+}
+
 func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dialer internet.Dialer) (*sstpSession, error) {
-	key := serverDest.String()
+	baseKey := serverDest.String()
+	idx := int(rrCounter.Add(1) % poolSizePerNode)
+	slotKey := fmt.Sprintf("%s#%d", baseKey, idx)
 
 	sessMu.Lock()
-	if sess, ok := sessPool[key]; ok {
-		select {
-		case <-sess.dead:
-			delete(sessPool, key)
-		default:
+	sCurr := sessPool[slotKey]
+	if isAlive(sCurr) {
+		altKey := fmt.Sprintf("%s#%d", baseKey, (idx+1)%poolSizePerNode)
+		if !isAlive(sessPool[altKey]) {
+			triggerBgSlotDial(serverDest, dialer, baseKey, altKey)
+		}
+		sessMu.Unlock()
+		return sCurr, nil
+	}
+	for i := 0; i < poolSizePerNode; i++ {
+		altKey := fmt.Sprintf("%s#%d", baseKey, i)
+		if alt := sessPool[altKey]; isAlive(alt) {
 			sessMu.Unlock()
-			return sess, nil
+			triggerBgSlotDial(serverDest, dialer, baseKey, slotKey)
+			return alt, nil
 		}
 	}
 	sessMu.Unlock()
 
-	dialMu.Lock()
-	defer dialMu.Unlock()
+	return dialSlotSession(ctx, serverDest, dialer, baseKey, slotKey, false)
+}
+
+func dialSlotSession(ctx context.Context, serverDest net.Destination, dialer internet.Dialer, baseKey, slotKey string, isBackground bool) (*sstpSession, error) {
+	mu := getSlotMutex(slotKey)
+	mu.Lock()
+	defer mu.Unlock()
 
 	sessMu.Lock()
-	if sess, ok := sessPool[key]; ok {
-		select {
-		case <-sess.dead:
-			delete(sessPool, key)
-		default:
-			sessMu.Unlock()
-			return sess, nil
-		}
+	if sess := sessPool[slotKey]; isAlive(sess) {
+		sessMu.Unlock()
+		return sess, nil
 	}
 	sessMu.Unlock()
 
-	if failTime, ok := failCache.Load(key); ok {
-		if time.Since(failTime.(time.Time)) < 15*time.Second {
-			return nil, fmt.Errorf("节点 %s 处于失败冷却中", key)
+	if !isBackground {
+		if failTime, ok := failCache.Load(baseKey); ok {
+			if time.Since(failTime.(time.Time)) < 12*time.Second {
+				return nil, fmt.Errorf("节点 %s 处于失败冷却中", baseKey)
+			}
+			failCache.Delete(baseKey)
 		}
-		failCache.Delete(key)
 	}
 
-	errors.LogWarning(ctx, "[VPNGate] 正在通过前置代理连接节点 -> ", key)
-	dialCtx, cancel := context.WithTimeout(context.Background(), 18*time.Second)
+	errors.LogWarning(ctx, "[VPNGate] 正在建立并发隧道槽位 -> ", slotKey)
+	dialCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	rawConn, err := dialer.Dial(dialCtx, serverDest)
@@ -485,7 +539,15 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 		certHash = sha256.Sum256(peers[0].Raw)
 	}
 
-	guid := "{BA195980-CD49-458b-9E23-C84EE0ADCD75}"
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	guid := fmt.Sprintf("{%08X-%04X-%04X-%04X-%012X}",
+		binary.BigEndian.Uint32(b[0:4]),
+		binary.BigEndian.Uint16(b[4:6]),
+		binary.BigEndian.Uint16(b[6:8]),
+		binary.BigEndian.Uint16(b[8:10]),
+		b[10:16])
+
 	sstpReq := fmt.Sprintf("SSTP_DUPLEX_POST /sra_%s/ HTTP/1.1\r\nHost: %s\r\nContent-Length: 18446744073709551615\r\nSSTPCORRELATIONID: %s\r\n\r\n", guid, host, guid)
 	if _, err := tlsConn.Write([]byte(sstpReq)); err != nil {
 		rawConn.Close()
@@ -515,11 +577,10 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &delayEnabled)
 	ccOpt := tcpip.CongestionControlOption("cubic")
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &ccOpt)
-	// 显式激活 RACK + TLP 尾丢包快速探测引擎，彻底解决网页偶发卡顿转圈
 	rackOpt := tcpip.TCPRecovery(tcpip.TCPRACKLossDetection)
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &rackOpt)
 
-	rcvBuf := tcpip.TCPReceiveBufferSizeRangeOption{Min: 4096, Default: 1048576, Max: 8 * 1024 * 1024}
+	rcvBuf := tcpip.TCPReceiveBufferSizeRangeOption{Min: 4096, Default: 2097152, Max: 8 * 1024 * 1024}
 	sndBuf := tcpip.TCPSendBufferSizeRangeOption{Min: 4096, Default: 1048576, Max: 8 * 1024 * 1024}
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &rcvBuf)
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sndBuf)
@@ -541,7 +602,6 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 		dead:    make(chan struct{}),
 	}
 
-	// 发送 SSTP CALL_CONNECT_REQUEST
 	_ = sess.writeFrame([]byte{
 		0x10, 0x01, 0x00, 0x0e,
 		0x00, 0x01, 0x00, 0x01,
@@ -556,8 +616,8 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 		deadOnce.Do(func() {
 			close(sess.dead)
 			sessMu.Lock()
-			if cur, ok := sessPool[key]; ok && cur == sess {
-				delete(sessPool, key)
+			if cur, ok := sessPool[slotKey]; ok && cur == sess {
+				delete(sessPool, slotKey)
 			}
 			sessMu.Unlock()
 			rawConn.Close()
@@ -588,9 +648,9 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 		}
 
 		for {
-			_ = tlsConn.SetReadDeadline(time.Now().Add(45 * time.Second))
+			_ = tlsConn.SetReadDeadline(time.Now().Add(40 * time.Second))
 			if _, err := io.ReadFull(br, hdr); err != nil {
-				errors.LogWarning(ctx, "[VPNGate] 底层读取断开或心跳超时: ", err)
+				errors.LogWarning(ctx, "[VPNGate] 槽位断开或超时 (", slotKey, "): ", err)
 				return
 			}
 			length := int(binary.BigEndian.Uint16(hdr[2:4]) & 0x0FFF)
@@ -607,12 +667,10 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 					if len(payload) >= 44 {
 						copy(serverNonce[:], payload[12:44])
 					}
-					errors.LogWarning(ctx, "[VPNGate] ✔ 1. 收到 CONNECT_ACK，开始 LCP")
 					sess.sendPPPControl(0xc021, []byte{0x01, 0x01, 0x00, 0x04})
 				} else if msgType == 0x0008 {
 					_ = sess.writeFrame([]byte{0x10, 0x01, 0x00, 0x08, 0x00, 0x09, 0x00, 0x00})
 				} else if msgType == 0x0005 || msgType == 0x0006 {
-					errors.LogWarning(ctx, fmt.Sprintf("[VPNGate] ❌ 服务端拒绝会话 (msgType=0x%04x)", msgType))
 					return
 				}
 				continue
@@ -683,10 +741,8 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 				}
 			case 0xc023:
 				if pppData[0] == 0x02 {
-					errors.LogWarning(ctx, "[VPNGate] ✔ 2. PAP 认证通过，请求内网 IP")
 					sess.sendPPPControl(0x8021, []byte{0x01, 0x01, 0x00, 0x0a, 0x03, 0x06, 0, 0, 0, 0})
 				} else if pppData[0] == 0x03 {
-					errors.LogWarning(ctx, "[VPNGate] ❌ PAP 认证被拒")
 					return
 				}
 			case 0x8021:
@@ -704,7 +760,7 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 					addr := tcpip.AddrFromSlice(ip)
 					var activeCC tcpip.CongestionControlOption
 					_ = s.TransportProtocolOption(tcp.ProtocolNumber, &activeCC)
-					errors.LogWarning(ctx, fmt.Sprintf("[VPNGate] 🎉 3. 隧道就绪! IP: %s | 算法: %s+RACK | MTU: %d | TLS复用: %v", addr.String(), string(activeCC), ep.MTU(), tlsConn.ConnectionState().DidResume))
+					errors.LogWarning(ctx, fmt.Sprintf("[VPNGate] 🎉 隧道槽位就绪 (%s)! IP: %s | 算法: %s+RACK | MTU: %d | TLS复用: %v", slotKey, addr.String(), string(activeCC), ep.MTU(), tlsConn.ConnectionState().DidResume))
 					once.Do(func() { ipReady <- addr })
 				}
 			case 0x0021:
@@ -717,7 +773,6 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 		}
 	}()
 
-	// 批量合并写入引擎：一次性排空队列里所有 IP 包并合并成一个大 TLS Record 刷出
 	go func() {
 		defer markDead()
 		bp := pppPool.Get().(*[]byte)
@@ -751,9 +806,8 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 				return
 			}
 			sess.writeMu.Lock()
-			_ = tlsConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			_ = tlsConn.SetWriteDeadline(time.Now().Add(8 * time.Second))
 			err := writeOnePacket(pkt)
-			// 非阻塞排空当前队列中同时积压的最多 64 个包，合并成一次系统调用发出
 			for i := 0; i < 64 && err == nil; i++ {
 				nextPkt := ep.Read()
 				if nextPkt == nil {
@@ -774,7 +828,7 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 
 	go func() {
 		defer markDead()
-		ticker := time.NewTicker(15 * time.Second)
+		ticker := time.NewTicker(12 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
@@ -792,11 +846,15 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 	select {
 	case localIP = <-ipReady:
 	case <-sess.dead:
-		failCache.Store(key, time.Now())
+		if !hasAnyAliveSlot(baseKey) {
+			failCache.Store(baseKey, time.Now())
+		}
 		return nil, fmt.Errorf("VPNGate 隧道在握手中提前断开")
-	case <-time.After(15 * time.Second):
+	case <-time.After(12 * time.Second):
 		markDead()
-		failCache.Store(key, time.Now())
+		if !hasAnyAliveSlot(baseKey) {
+			failCache.Store(baseKey, time.Now())
+		}
 		return nil, fmt.Errorf("VPNGate PPP/IPCP 协商超时")
 	}
 
@@ -806,8 +864,9 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 	}, stack.AddressProperties{})
 	s.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: 1}})
 
+	slotBackoff.Delete(slotKey)
 	sessMu.Lock()
-	sessPool[key] = sess
+	sessPool[slotKey] = sess
 	sessMu.Unlock()
 	return sess, nil
 }
@@ -852,7 +911,7 @@ func resolveFast(ctx context.Context, s *stack.Stack, domain string) ([]byte, er
 			return
 		}
 		defer uConn.Close()
-		_ = uConn.SetDeadline(time.Now().Add(900 * time.Millisecond))
+		_ = uConn.SetDeadline(time.Now().Add(750 * time.Millisecond))
 		_, _ = uConn.Write(req)
 		resp := make([]byte, 512)
 		n, err := uConn.Read(resp)
@@ -864,7 +923,6 @@ func resolveFast(ctx context.Context, s *stack.Stack, domain string) ([]byte, er
 		}
 	}
 
-	// 4 路全球任播 DNS 并发竞速，取最快返回的一路
 	go queryUDP([]byte{1, 1, 1, 1})
 	go queryUDP([]byte{8, 8, 8, 8})
 	go queryUDP([]byte{9, 9, 9, 9})
@@ -872,11 +930,10 @@ func resolveFast(ctx context.Context, s *stack.Stack, domain string) ([]byte, er
 
 	select {
 	case ip := <-resCh:
-		dnsCache.Store(domain, dnsEntry{ip: ip, expire: time.Now().Add(10 * time.Minute)})
+		dnsCache.Store(domain, dnsEntry{ip: ip, expire: time.Now().Add(15 * time.Minute)})
 		return ip, nil
-	case <-time.After(950 * time.Millisecond):
-		// 若节点禁用了 UDP 53，自动切换隧道内 TCP 53 兜底（绝不泄露给本地运营商 DNS）
-		tCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	case <-time.After(800 * time.Millisecond):
+		tCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
 		defer cancel()
 		tConn, err := gonet.DialContextTCP(tCtx, s, tcpip.FullAddress{
 			NIC:  1,
@@ -885,7 +942,7 @@ func resolveFast(ctx context.Context, s *stack.Stack, domain string) ([]byte, er
 		}, ipv4.ProtocolNumber)
 		if err == nil {
 			defer tConn.Close()
-			_ = tConn.SetDeadline(time.Now().Add(2 * time.Second))
+			_ = tConn.SetDeadline(time.Now().Add(1500 * time.Millisecond))
 			tcpReq := make([]byte, 2+len(req))
 			binary.BigEndian.PutUint16(tcpReq[0:2], uint16(len(req)))
 			copy(tcpReq[2:], req)
@@ -894,7 +951,7 @@ func resolveFast(ctx context.Context, s *stack.Stack, domain string) ([]byte, er
 			n, err := tConn.Read(resp)
 			if err == nil && n > 14 {
 				if ip := parseDNSResp(resp[2:], n-2); ip != nil {
-					dnsCache.Store(domain, dnsEntry{ip: ip, expire: time.Now().Add(10 * time.Minute)})
+					dnsCache.Store(domain, dnsEntry{ip: ip, expire: time.Now().Add(15 * time.Minute)})
 					return ip, nil
 				}
 			}
@@ -915,8 +972,8 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
 	} else if targetDest.Address.Family().IsDomain() {
 		ip, err := resolveFast(ctx, sess.s, targetDest.Address.Domain())
 		if err != nil {
-			if sess.failCount.Add(1) >= 4 && sess.markDead != nil {
-				errors.LogWarning(ctx, "[VPNGate] 连续解析失败，自动熔断僵尸隧道并重建")
+			if sess.failCount.Add(1) >= 3 && sess.markDead != nil {
+				errors.LogWarning(ctx, "[VPNGate] 连续解析超时，主动回收当前隧道槽位")
 				sess.markDead()
 			}
 			return err
@@ -927,7 +984,7 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
 		return fmt.Errorf("仅支持 IPv4 目标地址")
 	}
 
-	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	dialCtx, cancel := context.WithTimeout(ctx, 4500*time.Millisecond)
 	gConn, err := gonet.DialContextTCP(dialCtx, sess.s, tcpip.FullAddress{
 		NIC:  1,
 		Addr: tcpip.AddrFromSlice(targetIP),
@@ -935,8 +992,8 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
 	}, ipv4.ProtocolNumber)
 	cancel()
 	if err != nil {
-		if sess.failCount.Add(1) >= 4 && sess.markDead != nil {
-			errors.LogWarning(ctx, "[VPNGate] 连续拨号超时，自动销毁失效隧道准备重连")
+		if sess.failCount.Add(1) >= 3 && sess.markDead != nil {
+			errors.LogWarning(ctx, "[VPNGate] 连续拨号超时，主动回收当前隧道槽位")
 			sess.markDead()
 		}
 		return err
@@ -945,7 +1002,6 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
 	defer gConn.Close()
 
 	errCh := make(chan error, 2)
-	// 采用 32KB 大块读取池，大幅减少 gVisor 锁竞争
 	go func() {
 		bp := readBufPool.Get().(*[]byte)
 		defer readBufPool.Put(bp)
@@ -1020,7 +1076,7 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
       )
     with open(client_go, "w", encoding="utf-8") as f:
       f.write(new_code)
-    print("  ✔ [VPNGate Engine] 成功注入固定节点直连与会话复用补丁")
+    print("  ✔ [VPNGate Engine] 成功注入双路并发隧道与会话复用补丁")
 
   if os.system("go mod tidy") != 0:
     raise RuntimeError("❌ go mod tidy 执行失败！")
