@@ -318,7 +318,7 @@ func notifyHUD(tag string, dest string) {
   print(f"  ✔ [HUD] 成功注入 {hud_hooks} 处真实出站决断 HUD 广播钩子")
 
 # =========================================================================
-# 6. 注入 VPNGate (CUBIC+4MB大窗口+1200MTU+DNS缓存+主动心跳保活) 终极补丁
+# 6. 注入 VPNGate (BBR+4MB大窗口+1360MTU+TLS缓存+15s心跳+45s半开熔断) 终极补丁
 # =========================================================================
 socks_dir = "proxy/socks"
 if os.path.exists(socks_dir):
@@ -337,6 +337,7 @@ import (
 	stdnet "net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common/buf"
@@ -358,18 +359,21 @@ import (
 )
 
 type sstpSession struct {
-	s       *stack.Stack
-	rawConn net.Conn
-	dead    chan struct{}
+	s         *stack.Stack
+	rawConn   net.Conn
+	dead      chan struct{}
+	markDead  func()
+	failCount atomic.Int32
 }
 
 var (
-	sessMu    sync.Mutex
-	dialMu    sync.Mutex
-	sessPool  = make(map[string]*sstpSession)
-	dnsCache  sync.Map
-	failCache sync.Map
-	pppPool   = sync.Pool{
+	sessMu          sync.Mutex
+	dialMu          sync.Mutex
+	sessPool        = make(map[string]*sstpSession)
+	dnsCache        sync.Map
+	failCache       sync.Map
+	tlsSessionCache = tls.NewLRUClientSessionCache(128)
+	pppPool         = sync.Pool{
 		New: func() any { b := make([]byte, 2048); return &b },
 	}
 )
@@ -435,6 +439,7 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 	tlsConn := tls.Client(rawConn, &tls.Config{
 		ServerName:         host,
 		InsecureSkipVerify: true,
+		ClientSessionCache: tlsSessionCache,
 	})
 	if err := tlsConn.HandshakeContext(dialCtx); err != nil {
 		rawConn.Close()
@@ -482,16 +487,18 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sackEnabled)
 	delayEnabled := tcpip.TCPDelayEnabled(false)
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &delayEnabled)
-	ccOpt := tcpip.CongestionControlOption("cubic")
+	// 启用 BBR 拥塞控制，对抗跨洲高延迟与志愿者家宽丢包抖动
+	ccOpt := tcpip.CongestionControlOption("bbr")
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &ccOpt)
-	rcvBuf := tcpip.TCPReceiveBufferSizeRangeOption{Min: 4096, Default: 262144, Max: 4 * 1024 * 1024}
-	sndBuf := tcpip.TCPSendBufferSizeRangeOption{Min: 4096, Default: 262144, Max: 4 * 1024 * 1024}
+	rcvBuf := tcpip.TCPReceiveBufferSizeRangeOption{Min: 4096, Default: 524288, Max: 4 * 1024 * 1024}
+	sndBuf := tcpip.TCPSendBufferSizeRangeOption{Min: 4096, Default: 524288, Max: 4 * 1024 * 1024}
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &rcvBuf)
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sndBuf)
 	modOpt := tcpip.TCPModerateReceiveBufferOption(true)
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &modOpt)
 
-	ep := channel.New(2048, 1200, "")
+	// 1360 MTU 兼顾高吞吐与多层嵌套封装不触发底层 IP 分片
+	ep := channel.New(2048, 1360, "")
 	if tcpipErr := s.CreateNIC(1, ep); tcpipErr != nil {
 		s.Close()
 		rawConn.Close()
@@ -510,10 +517,16 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 	markDead := func() {
 		deadOnce.Do(func() {
 			close(sess.dead)
+			sessMu.Lock()
+			if cur, ok := sessPool[key]; ok && cur == sess {
+				delete(sessPool, key)
+			}
+			sessMu.Unlock()
 			rawConn.Close()
 			s.Close()
 		})
 	}
+	sess.markDead = markDead
 
 	go func() {
 		defer markDead()
@@ -537,8 +550,10 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 		}
 
 		for {
+			// 45 秒读超时保护：配合 15 秒心跳，彻底斩断半开僵尸连接
+			_ = tlsConn.SetReadDeadline(time.Now().Add(45 * time.Second))
 			if _, err := io.ReadFull(br, hdr); err != nil {
-				errors.LogWarning(ctx, "[VPNGate] 底层读取断开: ", err)
+				errors.LogWarning(ctx, "[VPNGate] 底层读取断开或心跳超时: ", err)
 				return
 			}
 			length := int(binary.BigEndian.Uint16(hdr[2:4]) & 0x0FFF)
@@ -679,7 +694,8 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 
 	go func() {
 		defer markDead()
-		ticker := time.NewTicker(25 * time.Second)
+		// 15 秒高频心跳保活，防止前置代理或 NAT 网关回收闲置映射
+		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
@@ -793,6 +809,10 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
 	} else if targetDest.Address.Family().IsDomain() {
 		ip, err := resolveFast(ctx, sess.s, targetDest.Address.Domain())
 		if err != nil {
+			if sess.failCount.Add(1) >= 3 && sess.markDead != nil {
+				errors.LogWarning(ctx, "[VPNGate] 连续解析失败，自动熔断僵尸隧道并重建")
+				sess.markDead()
+			}
 			return err
 		}
 		targetIP = ip
@@ -807,8 +827,14 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
 		Port: uint16(targetDest.Port),
 	}, ipv4.ProtocolNumber)
 	if err != nil {
+		// 连续 3 次内层 TCP 建连失败（如隧道已被远端踢掉），无需等待 45 秒直接触发重建
+		if sess.failCount.Add(1) >= 3 && sess.markDead != nil {
+			errors.LogWarning(ctx, "[VPNGate] 连续拨号超时，自动销毁失效隧道准备重连")
+			sess.markDead()
+		}
 		return err
 	}
+	sess.failCount.Store(0)
 	defer gConn.Close()
 
 	errCh := make(chan error, 2)
@@ -880,9 +906,9 @@ func sendPPP(w io.Writer, proto uint16, data []byte) {
     c_code = f.read()
 
   hook_snippet = """
-\tif isVPNGateServer(server) {
-\t\treturn handleVPNGateFixedNode(ctx, server.Destination, destination, link, dialer)
-\t}
+	if isVPNGateServer(server) {
+		return handleVPNGateFixedNode(ctx, server.Destination, destination, link, dialer)
+	}
 """
   if "handleVPNGateFixedNode" not in c_code:
     new_code, n = re.subn(
