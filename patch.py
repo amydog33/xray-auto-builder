@@ -875,7 +875,7 @@ func dialSlotSession(ctx context.Context, serverDest net.Destination, dialer int
 	return sess, nil
 }
 
-func resolveFast(ctx context.Context, s *stack.Stack, domain string) ([]byte, error) {
+func resolveFast(ctx context.Context, dialer internet.Dialer, domain string) ([]byte, error) {
 	domain = strings.TrimSuffix(strings.ToLower(domain), ".")
 	if cached, ok := dnsCache.Load(domain); ok {
 		if entry, ok := cached.(dnsEntry); ok && time.Now().Before(entry.expire) && len(entry.ip) == 4 {
@@ -904,63 +904,55 @@ func resolveFast(ctx context.Context, s *stack.Stack, domain string) ([]byte, er
 		return nil
 	}
 
-	resCh := make(chan []byte, 4)
-	queryUDP := func(dnsIP []byte) {
-		uConn, err := gonet.DialUDP(s, nil, &tcpip.FullAddress{
-			NIC:  1,
-			Addr: tcpip.AddrFromSlice(dnsIP),
-			Port: 53,
-		}, ipv4.ProtocolNumber)
+	// 并发向 1.1.1.1:853 和 8.8.8.8:853 发起 DoT 查询，直接走高速前置代理，彻底跳过慢速 VPNGate 隧道
+	resCh := make(chan []byte, 2)
+	queryDoT := func(dnsIP, sni string) {
+		dCtx, cancel := context.WithTimeout(ctx, 2500*time.Millisecond)
+		defer cancel()
+		dest := net.TCPDestination(net.ParseAddress(dnsIP), 853)
+		rawConn, err := dialer.Dial(dCtx, dest)
 		if err != nil {
 			return
 		}
-		defer uConn.Close()
-		_ = uConn.SetDeadline(time.Now().Add(750 * time.Millisecond))
-		_, _ = uConn.Write(req)
-		resp := make([]byte, 512)
-		n, err := uConn.Read(resp)
-		if err != nil || n < 12 {
+		defer rawConn.Close()
+
+		tlsConn := tls.Client(rawConn, &tls.Config{
+			ServerName:         sni,
+			ClientSessionCache: tlsSessionCache,
+		})
+		_ = tlsConn.SetDeadline(time.Now().Add(2500 * time.Millisecond))
+		if err := tlsConn.HandshakeContext(dCtx); err != nil {
 			return
 		}
-		if ip := parseDNSResp(resp, n); ip != nil {
-			resCh <- ip
+
+		tcpReq := make([]byte, 2+len(req))
+		binary.BigEndian.PutUint16(tcpReq[0:2], uint16(len(req)))
+		copy(tcpReq[2:], req)
+		if _, err := tlsConn.Write(tcpReq); err != nil {
+			return
+		}
+
+		resp := make([]byte, 512)
+		n, err := tlsConn.Read(resp)
+		if err == nil && n > 14 {
+			if ip := parseDNSResp(resp[2:], n-2); ip != nil {
+				select {
+				case resCh <- ip:
+				default:
+				}
+			}
 		}
 	}
 
-	go queryUDP([]byte{1, 1, 1, 1})
-	go queryUDP([]byte{8, 8, 8, 8})
-	go queryUDP([]byte{9, 9, 9, 9})
-	go queryUDP([]byte{208, 67, 222, 222})
+	go queryDoT("1.1.1.1", "cloudflare-dns.com")
+	go queryDoT("8.8.8.8", "dns.google")
 
 	select {
 	case ip := <-resCh:
 		dnsCache.Store(domain, dnsEntry{ip: ip, expire: time.Now().Add(15 * time.Minute)})
 		return ip, nil
-	case <-time.After(800 * time.Millisecond):
-		tCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
-		defer cancel()
-		tConn, err := gonet.DialContextTCP(tCtx, s, tcpip.FullAddress{
-			NIC:  1,
-			Addr: tcpip.AddrFromSlice([]byte{1, 1, 1, 1}),
-			Port: 53,
-		}, ipv4.ProtocolNumber)
-		if err == nil {
-			defer tConn.Close()
-			_ = tConn.SetDeadline(time.Now().Add(1500 * time.Millisecond))
-			tcpReq := make([]byte, 2+len(req))
-			binary.BigEndian.PutUint16(tcpReq[0:2], uint16(len(req)))
-			copy(tcpReq[2:], req)
-			_, _ = tConn.Write(tcpReq)
-			resp := make([]byte, 512)
-			n, err := tConn.Read(resp)
-			if err == nil && n > 14 {
-				if ip := parseDNSResp(resp[2:], n-2); ip != nil {
-					dnsCache.Store(domain, dnsEntry{ip: ip, expire: time.Now().Add(15 * time.Minute)})
-					return ip, nil
-				}
-			}
-		}
-		return nil, fmt.Errorf("隧道内 DNS 解析超时: %s", domain)
+	case <-time.After(2600 * time.Millisecond):
+		return nil, fmt.Errorf("前置加密 DNS 解析超时: %s", domain)
 	}
 }
 
@@ -974,13 +966,9 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
 	if targetDest.Address.Family().IsIP() {
 		targetIP = targetDest.Address.IP().To4()
 	} else if targetDest.Address.Family().IsDomain() {
-		ip, err := resolveFast(ctx, sess.s, targetDest.Address.Domain())
+		ip, err := resolveFast(ctx, dialer, targetDest.Address.Domain())
 		if err != nil {
-			if sess.failCount.Add(1) >= 3 && sess.markDead != nil {
-				errors.LogWarning(ctx, "[VPNGate] 连续解析超时，主动回收当前隧道槽位")
-				sess.markDead()
-			}
-			return err
+    		return err
 		}
 		targetIP = ip
 	}
