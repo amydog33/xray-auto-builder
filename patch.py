@@ -487,7 +487,6 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sackEnabled)
 	delayEnabled := tcpip.TCPDelayEnabled(false)
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &delayEnabled)
-	// 启用 BBR 拥塞控制，对抗跨洲高延迟与志愿者家宽丢包抖动
 	ccOpt := tcpip.CongestionControlOption("bbr")
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &ccOpt)
 	rcvBuf := tcpip.TCPReceiveBufferSizeRangeOption{Min: 4096, Default: 524288, Max: 4 * 1024 * 1024}
@@ -497,7 +496,6 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 	modOpt := tcpip.TCPModerateReceiveBufferOption(true)
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &modOpt)
 
-	// 1360 MTU 兼顾高吞吐与多层嵌套封装不触发底层 IP 分片
 	ep := channel.New(2048, 1360, "")
 	if tcpipErr := s.CreateNIC(1, ep); tcpipErr != nil {
 		s.Close()
@@ -550,7 +548,6 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 		}
 
 		for {
-			// 45 秒读超时保护：配合 15 秒心跳，彻底斩断半开僵尸连接
 			_ = tlsConn.SetReadDeadline(time.Now().Add(45 * time.Second))
 			if _, err := io.ReadFull(br, hdr); err != nil {
 				errors.LogWarning(ctx, "[VPNGate] 底层读取断开或心跳超时: ", err)
@@ -665,7 +662,9 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 					sendCallConnected()
 					ip := pppData[6:10]
 					addr := tcpip.AddrFromSlice(ip)
-					errors.LogWarning(ctx, "[VPNGate] 🎉 3. 隧道就绪! 分配内网 IP: ", addr.String())
+					var activeCC tcpip.CongestionControlOption
+					_ = s.TransportProtocolOption(tcp.ProtocolNumber, &activeCC)
+					errors.LogWarning(ctx, fmt.Sprintf("[VPNGate] 🎉 3. 隧道就绪! IP: %s | 算法: %s | MTU: %d | TLS复用: %v", addr.String(), string(activeCC), ep.MTU(), tlsConn.ConnectionState().DidResume))
 					once.Do(func() { ipReady <- addr })
 				}
 			case 0x0021:
@@ -694,7 +693,6 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 
 	go func() {
 		defer markDead()
-		// 15 秒高频心跳保活，防止前置代理或 NAT 网关回收闲置映射
 		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -738,7 +736,16 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 func resolveFast(ctx context.Context, s *stack.Stack, domain string) ([]byte, error) {
 	domain = strings.TrimSuffix(strings.ToLower(domain), ".")
 	if cached, ok := dnsCache.Load(domain); ok {
-		return cached.([]byte), nil
+		switch v := cached.(type) {
+		case []byte:
+			if len(v) == 4 {
+				return v, nil
+			}
+		case stdnet.IP:
+			if ip4 := v.To4(); len(ip4) == 4 {
+				return []byte(ip4), nil
+			}
+		}
 	}
 
 	txid := make([]byte, 2)
@@ -789,9 +796,12 @@ func resolveFast(ctx context.Context, s *stack.Stack, domain string) ([]byte, er
 	case <-time.After(1600 * time.Millisecond):
 		ips, err := stdnet.DefaultResolver.LookupIP(ctx, "ip4", domain)
 		if err == nil && len(ips) > 0 {
-			ip := ips[0].To4()
-			dnsCache.Store(domain, ip)
-			return ip, nil
+			if ip4 := ips[0].To4(); len(ip4) == 4 {
+				ip := make([]byte, 4)
+				copy(ip, ip4)
+				dnsCache.Store(domain, ip)
+				return ip, nil
+			}
 		}
 		return nil, fmt.Errorf("DNS 解析超时: %s", domain)
 	}
@@ -827,7 +837,6 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
 		Port: uint16(targetDest.Port),
 	}, ipv4.ProtocolNumber)
 	if err != nil {
-		// 连续 3 次内层 TCP 建连失败（如隧道已被远端踢掉），无需等待 45 秒直接触发重建
 		if sess.failCount.Add(1) >= 3 && sess.markDead != nil {
 			errors.LogWarning(ctx, "[VPNGate] 连续拨号超时，自动销毁失效隧道准备重连")
 			sess.markDead()
