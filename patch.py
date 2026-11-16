@@ -487,7 +487,7 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, dia
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sackEnabled)
 	delayEnabled := tcpip.TCPDelayEnabled(false)
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &delayEnabled)
-	ccOpt := tcpip.CongestionControlOption("bbr")
+	ccOpt := tcpip.CongestionControlOption("cubic")
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &ccOpt)
 	rcvBuf := tcpip.TCPReceiveBufferSizeRangeOption{Min: 4096, Default: 524288, Max: 4 * 1024 * 1024}
 	sndBuf := tcpip.TCPSendBufferSizeRangeOption{Min: 4096, Default: 524288, Max: 4 * 1024 * 1024}
