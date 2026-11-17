@@ -3078,7 +3078,7 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
     with open(vg_file, "r", encoding="utf-8") as f:
         vg_code = f.read()
 
-    if "dialOpenVPNSession" not in vg_code:
+	if "dialOpenVPNSession" not in vg_code:
         vg_code = vg_code.replace(
             "_ = tlsConn.SetDeadline(time.Now().Add(6 * time.Second))",
             "_ = tlsConn.SetDeadline(time.Now().Add(2500 * time.Millisecond))",
@@ -3090,7 +3090,7 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
             1,
         )
 
-        # 入口路由: 纯 UDP 节点跳过 SSTP/SoftEther 直连 OpenVPN-UDP；专用 TCP 端口优先试 OpenVPN-TCP
+        # 修复1: 纯 UDP 直接拨 UDP；非 443/995/5555 专用端口先试 OVPN-TCP，若失败且有 UDP 端口立即切换试 OVPN-UDP，均失败直接冷却退出（绝不再去死端口重拨 SSTP）
         ovpn_fast_hook = """
 	{
 		ovpnCfg := getOrDefaultOVPNConfig(baseKey)
@@ -3112,7 +3112,19 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 				ovpnProtoCache.Store(baseKey, "openvpn-tcp")
 				return sess, nil
 			}
-			errors.LogDebug(bgCtx, "[VPNGate] OpenVPN-TCP 直连未命中，继续尝试 SoftEther/SSTP (", slotKey, "): ", ovpnErr)
+			errors.LogDebug(bgCtx, "[VPNGate] OpenVPN-TCP 未命中 (", slotKey, "): ", ovpnErr)
+			if ovpnCfg.udpPort > 0 {
+				if udpSess, udpErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, true); udpErr == nil {
+					ovpnProtoCache.Store(baseKey, "openvpn-udp")
+					return udpSess, nil
+				} else {
+					errors.LogDebug(bgCtx, "[VPNGate] OpenVPN-UDP 切换也失败 (", slotKey, "): ", udpErr)
+				}
+			}
+			if isDedicatedOVPNPort {
+				recordNodeFailureIfNeeded(baseKey, isBackground, ovpnErr)
+				return nil, ovpnErr
+			}
 		}
 	}
 """
@@ -3122,21 +3134,31 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
             1,
         )
 
-        # TCP (SSTP + SoftEther) 均失败后的回退链: 先试 OpenVPN-TCP，若配置含 UDP 端口再兜底 OpenVPN-UDP
+        # 修复2: 当 443/995/5555 端口的 TLS 握手直接失败（如 TCP 端口被封）时，若该节点配有 UDP 端口，在退出前自动尝试 OpenVPN-UDP
+        tls_fail_udp_hook = """if err := tlsConn.HandshakeContext(dialCtx); err != nil {
+		rawConn.Close()
+		if ovpnCfg := getOrDefaultOVPNConfig(baseKey); ovpnCfg.udpPort > 0 {
+			if udpSess, udpErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, true); udpErr == nil {
+				ovpnProtoCache.Store(baseKey, "openvpn-udp")
+				return udpSess, nil
+			}
+		}"""
+        vg_code = vg_code.replace(
+            "if err := tlsConn.HandshakeContext(dialCtx); err != nil {\n\t\trawConn.Close()",
+            tls_fail_udp_hook,
+            1,
+        )
+
         ovpn_fallback_hook = """
 		ovpnCfg := getOrDefaultOVPNConfig(baseKey)
 		if sess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, false); ovpnErr == nil {
 			ovpnProtoCache.Store(baseKey, "openvpn-tcp")
 			return sess, nil
-		} else {
-			errors.LogDebug(bgCtx, "[VPNGate] OpenVPN-TCP 回退未命中 (", slotKey, "): ", ovpnErr)
 		}
-		if ovpnCfg.mode == "both" && ovpnCfg.udpPort > 0 {
+		if ovpnCfg.udpPort > 0 {
 			if sess, udpErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, true); udpErr == nil {
 				ovpnProtoCache.Store(baseKey, "openvpn-udp")
 				return sess, nil
-			} else {
-				errors.LogDebug(bgCtx, "[VPNGate] OpenVPN-UDP 兜底也失败 (", slotKey, "): ", udpErr)
 			}
 		}
 """
