@@ -1891,7 +1891,7 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
     raise RuntimeError("❌ go mod tidy 执行失败！")
   print("  ✔ [Go Mod] 已同步 gVisor 依赖树")
 # =========================================================================
-# 7. 注入 VPNGate OpenVPN 扩展模块 (免证书内置版 + 修复 Go1.27 后量子分片与控制帧 ACK)
+# 7. 注入 VPNGate OpenVPN 扩展模块 (精准 KM2 解析 + 免证书自适应)
 # =========================================================================
 if os.path.exists(socks_dir):
     ovpn_file = os.path.join(socks_dir, "vpngate_openvpn.go")
@@ -1944,7 +1944,6 @@ var (
 	ovpnProtoCache  sync.Map // map[string]string
 )
 
-// 默认内置 VPNGate 标准 OpenVPN 参数（即使订阅密码只是 "vpn" 也能直接连 OpenVPN）
 func getOrDefaultOVPNConfig(baseKey string) *parsedOVPNConfig {
 	if v, ok := ovpnConfigCache.Load(baseKey); ok {
 		return v.(*parsedOVPNConfig)
@@ -2180,7 +2179,6 @@ func (c *ovpnControlConn) Read(b []byte) (int, error) {
 		}
 		opcode := pkt[0] >> 3
 		if opcode == 6 {
-			// 若握手末期提前收到数据帧，忽略即可
 			continue
 		}
 		copy(c.remoteSID[:], pkt[1:9])
@@ -2270,13 +2268,13 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 		rawConn.Close()
 		return nil, err
 	}
-	// 2. 必须先等待服务端 HARD_RESET_SERVER_V2 并回复 ACK
+	// 2. 等待服务端 HARD_RESET_SERVER_V2 并回复 ACK
 	if err := ctrl.waitServerReset(); err != nil {
 		rawConn.Close()
 		return nil, err
 	}
 
-	// 3. 禁用 Go 1.24+ 默认的 1300B 后量子 X25519MLKEM768 扩展，防止 ClientHello 分片触发 SoftEther 状态机 Bug
+	// 3. 限制 TLS 1.2 并关闭后量子大扩展，确保 ClientHello 单包发出
 	tlsConn := tls.Client(ctrl, &tls.Config{
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS10,
@@ -2311,8 +2309,10 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 		buf.Write(b)
 	}
 
+	cipherName := cfg.cipherName
+	authName := cfg.authName
 	keyBits := 128
-	if cfg.cipherName == "AES-256-CBC" {
+	if cipherName == "AES-256-CBC" {
 		keyBits = 256
 	}
 	lzoOpt := ""
@@ -2322,16 +2322,17 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 		extraStub = 1
 	}
 	hmacBytes := 20
-	if cfg.authName == "SHA256" {
+	if authName == "SHA256" {
 		hmacBytes = 32
 	}
 	linkMTU := 1500 + 1 + hmacBytes + 16 + 4 + 1 + extraStub
+
 	var kmBuf bytes.Buffer
 	kmBuf.Write([]byte{0, 0, 0, 0, 2})
 	kmBuf.Write(preMaster[:])
 	kmBuf.Write(cRand1[:])
 	kmBuf.Write(cRand2[:])
-	optStr := fmt.Sprintf("V4,dev-type tun,link-mtu %d,tun-mtu 1500,proto TCPv4_CLIENT,cipher %s,auth %s,keysize %d,key-method 2,tls-client%s", linkMTU, cfg.cipherName, cfg.authName, keyBits, lzoOpt)
+	optStr := fmt.Sprintf("V4,dev-type tun,link-mtu %d,tun-mtu 1500,proto TCPv4_CLIENT,cipher %s,auth %s,keysize %d,key-method 2,tls-client%s", linkMTU, cipherName, authName, keyBits, lzoOpt)
 	writeStr(&kmBuf, optStr)
 	writeStr(&kmBuf, "vpn")
 	writeStr(&kmBuf, "vpn")
@@ -2341,6 +2342,8 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 		return nil, err
 	}
 
+	// 4. 读取服务端 KM2: 4B(0) + 1B(2) + 32B(sRand1) + 32B(sRand2) + 2B(optLen) + OptionString
+	// SoftEther OvsBuildKeyMethod2 在 OptionString 后直接结束，绝不附带 username/password
 	var srvKMHdr [69]byte
 	if _, err := io.ReadFull(tlsConn, srvKMHdr[:]); err != nil {
 		rawConn.Close()
@@ -2352,36 +2355,40 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 	var optLenHdr [2]byte
 	if _, err := io.ReadFull(tlsConn, optLenHdr[:]); err != nil {
 		rawConn.Close()
-		return nil, err
+		return nil, fmt.Errorf("读取 KM2 OptionString 长度失败: %w", err)
 	}
 	srvOptLen := int(binary.BigEndian.Uint16(optLenHdr[:]))
 	var srvOptStr string
-	if srvOptLen > 0 && srvOptLen < 8192 {
+	if srvOptLen > 0 {
+		if srvOptLen > 8192 {
+			rawConn.Close()
+			return nil, fmt.Errorf("OpenVPN KM2 OptionString 长度异常: %d", srvOptLen)
+		}
 		optBytes := make([]byte, srvOptLen)
 		if _, err := io.ReadFull(tlsConn, optBytes); err != nil {
 			rawConn.Close()
-			return nil, err
+			return nil, fmt.Errorf("读取 KM2 OptionString 内容失败: %w", err)
 		}
-		srvOptStr = string(optBytes)
+		srvOptStr = strings.TrimRight(string(optBytes), "\x00")
 	}
-	// 根据服务端实际回传的 options 自动对齐 comp-lzo 状态
-	hasCompLZO := cfg.compLZO || strings.Contains(srvOptStr, "comp-lzo") || strings.Contains(srvOptStr, "compress")
 
-	// 兼容服务端 KM2 是否附带空的 username/password 尾部
-	for i := 0; i < 2; i++ {
-		var tailLen [2]byte
-		_ = rawConn.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
-		_, rErr := io.ReadFull(tlsConn, tailLen[:])
-		if rErr != nil {
-			break
-		}
-		tLen := int(binary.BigEndian.Uint16(tailLen[:]))
-		if tLen > 0 && tLen < 1024 {
-			_, _ = io.ReadFull(tlsConn, make([]byte, tLen))
-		}
+	// 根据服务端实际回传的 OptionString 自动对齐加密套件、摘要算法与 LZO 帧头
+	if strings.Contains(srvOptStr, "AES-256-CBC") {
+		cipherName = "AES-256-CBC"
+	} else if strings.Contains(srvOptStr, "AES-128-CBC") {
+		cipherName = "AES-128-CBC"
 	}
-	_ = rawConn.SetDeadline(time.Now().Add(8 * time.Second))
+	if strings.Contains(srvOptStr, "SHA256") {
+		authName = "SHA256"
+	} else if strings.Contains(srvOptStr, "SHA1") {
+		authName = "SHA1"
+	}
+	hasCompLZO := strings.Contains(srvOptStr, "comp-lzo") || strings.Contains(srvOptStr, "compress")
+	if srvOptStr == "" {
+		hasCompLZO = cfg.compLZO
+	}
 
+	// 5. 立即发送 PUSH_REQUEST\x00 获取虚拟内网 IP（不在 tlsConn 上设置短超时以免触发永久错误锁定）
 	if _, err := tlsConn.Write([]byte("PUSH_REQUEST\x00")); err != nil {
 		rawConn.Close()
 		return nil, err
@@ -2430,6 +2437,7 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 	}
 	_ = rawConn.SetDeadline(time.Time{})
 
+	// 6. 派生数据通道密钥
 	seed1 := append(append([]byte{}, cRand1[:]...), sRand1...)
 	masterSecret := openvpnPRF(preMaster[:], []byte("OpenVPN master secret"), seed1, 48)
 	var seed2 []byte
@@ -2440,7 +2448,7 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 	keyBlock := openvpnPRF(masterSecret, []byte("OpenVPN key expansion"), seed2, 256)
 
 	keyLen := 16
-	if cfg.cipherName == "AES-256-CBC" {
+	if cipherName == "AES-256-CBC" {
 		keyLen = 32
 	}
 	sendCipherBlk, err := aes.NewCipher(keyBlock[0:keyLen])
@@ -2456,7 +2464,7 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 
 	newAuthHash := sha1.New
 	hmacSize := 20
-	if cfg.authName == "SHA256" {
+	if authName == "SHA256" {
 		newAuthHash = sha256.New
 		hmacSize = 32
 	}
@@ -2534,7 +2542,7 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 		return wErr
 	}
 
-	// 下行: 复用 ctrl.br 读取，并对服务端的 P_CONTROL_V1 控制包继续回复 ACK 防止掉线
+	// 下行: P_DATA_V1 解密 -> 注入 gVisor，并为后续控制帧持续回 ACK
 	go func() {
 		defer sess.markDead()
 		var lenHdr [2]byte
@@ -2554,7 +2562,6 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 			}
 			opcode := pkt[0] >> 3
 			if opcode == 4 || opcode == 8 {
-				// 必须继续为服务端发来的控制帧回复 ACK，否则服务端重传超限会主动踢掉连接
 				ackLen := int(pkt[9])
 				pos := 10 + 4*ackLen
 				if ackLen > 0 {
@@ -2678,7 +2685,6 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
             'if u == "vpn" || u == "vpngate" {\n\t\t\tcacheOVPNFromPassword(server.Destination.String(), acc.Password)\n\t\t\treturn true\n\t\t}\n\t\treturn false',
             1,
         )
-        # 无论密码里有没有传 ovpn: 证书，都自动使用内置默认参数尝试 OpenVPN
         ovpn_fast_hook = """
 	{
 		ovpnCfg := getOrDefaultOVPNConfig(baseKey)
