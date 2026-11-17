@@ -2285,13 +2285,13 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 	_ = rawConn.SetDeadline(time.Time{})
 
 	seed1 := append(append([]byte{}, cRand1[:]...), sRand1...)
-	masterSecret := openvpnPRF(preMaster[:], "OpenVPN master secret", seed1, 48)
+	masterSecret := openvpnPRF(preMaster[:], []byte("OpenVPN master secret"), seed1, 48)
 	var seed2 []byte
 	seed2 = append(seed2, cRand2[:]...)
 	seed2 = append(seed2, sRand2...)
 	seed2 = append(seed2, ctrl.localSID[:]...)
 	seed2 = append(seed2, ctrl.remoteSID[:]...)
-	keyBlock := openvpnPRF(masterSecret, "OpenVPN key expansion", seed2, 256)
+	keyBlock := openvpnPRF(masterSecret, []byte("OpenVPN key expansion"), seed2, 256)
 
 	keyLen := 16
 	if cfg.cipherName == "AES-256-CBC" {
