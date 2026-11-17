@@ -2208,7 +2208,7 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 	})
 	if err := tlsConn.HandshakeContext(dialCtx); err != nil {
 		rawConn.Close()
-		return nil, err
+		return nil, fmt.Errorf("OpenVPN TLS 握手失败: %w", err)
 	}
 
 	var preMaster [48]byte
@@ -2225,12 +2225,16 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 		buf.Write(b)
 	}
 
+	keyBits := 128
+	if cfg.cipherName == "AES-256-CBC" {
+		keyBits = 256
+	}
 	var kmBuf bytes.Buffer
 	kmBuf.Write([]byte{0, 0, 0, 0, 2})
 	kmBuf.Write(preMaster[:])
 	kmBuf.Write(cRand1[:])
 	kmBuf.Write(cRand2[:])
-	optStr := fmt.Sprintf("V4,dev-type tun,link-mtu 1542,tun-mtu 1500,proto TCPv4_CLIENT,cipher %s,auth %s,keysize 128,key-method 2,tls-client", cfg.cipherName, cfg.authName)
+	optStr := fmt.Sprintf("V4,dev-type tun,link-mtu 1542,tun-mtu 1500,proto TCPv4_CLIENT,cipher %s,auth %s,keysize %d,key-method 2,tls-client", cfg.cipherName, cfg.authName, keyBits)
 	writeStr(&kmBuf, optStr)
 	writeStr(&kmBuf, "vpn")
 	writeStr(&kmBuf, "vpn")
@@ -2240,47 +2244,88 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 		return nil, err
 	}
 
+	// 读取服务端 Key Method 2 头: 4B(0) + 1B(key_method) + 32B(sRand1) + 32B(sRand2) = 69B
 	var srvKMHdr [69]byte
 	if _, err := io.ReadFull(tlsConn, srvKMHdr[:]); err != nil {
 		rawConn.Close()
-		return nil, err
+		return nil, fmt.Errorf("读取 OpenVPN KM2 失败: %w", err)
 	}
 	sRand1 := srvKMHdr[5:37]
 	sRand2 := srvKMHdr[37:69]
-	var optLenHdr [2]byte
-	if _, err := io.ReadFull(tlsConn, optLenHdr[:]); err != nil {
+
+	// 排空服务端 KM2 中的 options、username、password 字段，避免残留字节污染后续 PUSH_REPLY
+	drainTLSField := func() error {
+		var lHdr [2]byte
+		if _, err := io.ReadFull(tlsConn, lHdr[:]); err != nil {
+			return err
+		}
+		n := int(binary.BigEndian.Uint16(lHdr[:]))
+		if n > 0 {
+			if n > 8192 {
+				return fmt.Errorf("OpenVPN KM2 字段异常: %d", n)
+			}
+			if _, err := io.ReadFull(tlsConn, make([]byte, n)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := drainTLSField(); err != nil {
 		rawConn.Close()
 		return nil, err
 	}
-	srvOptLen := int(binary.BigEndian.Uint16(optLenHdr[:]))
-	if srvOptLen > 0 && srvOptLen < 4096 {
-		_, _ = io.ReadFull(tlsConn, make([]byte, srvOptLen))
+	if err := drainTLSField(); err != nil {
+		rawConn.Close()
+		return nil, err
+	}
+	if err := drainTLSField(); err != nil {
+		rawConn.Close()
+		return nil, err
 	}
 
 	if _, err := tlsConn.Write([]byte("PUSH_REQUEST\x00")); err != nil {
 		rawConn.Close()
 		return nil, err
 	}
-	pushBuf := make([]byte, 2048)
-	n, err := tlsConn.Read(pushBuf)
-	if err != nil {
-		rawConn.Close()
-		return nil, err
-	}
-	pushReply := string(pushBuf[:n])
+
+	// 循环读取直到收齐 PUSH_REPLY（兼容分片与前置控制消息）
 	var assignedIP []byte
-	for _, token := range strings.Split(pushReply, ",") {
-		parts := strings.Fields(strings.TrimSpace(token))
-		if len(parts) >= 2 && parts[0] == "ifconfig" {
-			if ip := net.ParseAddress(parts[1]).IP().To4(); len(ip) == 4 {
-				assignedIP = ip
-				break
+	var pushAcc strings.Builder
+	pushBuf := make([]byte, 2048)
+	for attempts := 0; attempts < 8; attempts++ {
+		n, err := tlsConn.Read(pushBuf)
+		if err != nil {
+			rawConn.Close()
+			return nil, fmt.Errorf("读取 PUSH_REPLY 失败: %w", err)
+		}
+		pushAcc.Write(pushBuf[:n])
+		reply := pushAcc.String()
+		if strings.Contains(reply, "AUTH_FAILED") {
+			rawConn.Close()
+			return nil, fmt.Errorf("OpenVPN 认证被拒绝 (AUTH_FAILED)")
+		}
+		if idx := strings.Index(reply, "PUSH_REPLY"); idx != -1 {
+			sub := reply[idx:]
+			if strings.Contains(sub, "ifconfig ") && (strings.IndexByte(sub, 0) != -1 || len(sub) > 30) {
+				cleanReply := strings.SplitN(sub, "\x00", 2)[0]
+				for _, token := range strings.Split(cleanReply, ",") {
+					parts := strings.Fields(strings.TrimSpace(token))
+					if len(parts) >= 2 && parts[0] == "ifconfig" {
+						if ip := net.ParseAddress(parts[1]).IP().To4(); len(ip) == 4 {
+							assignedIP = ip
+							break
+						}
+					}
+				}
+				if len(assignedIP) == 4 {
+					break
+				}
 			}
 		}
 	}
 	if len(assignedIP) != 4 {
 		rawConn.Close()
-		return nil, fmt.Errorf("OpenVPN 未分配有效 IP: %s", strings.TrimRight(pushReply, "\x00"))
+		return nil, fmt.Errorf("OpenVPN 未分配有效 IP: %q", strings.Trim(pushAcc.String(), "\x00"))
 	}
 	_ = rawConn.SetDeadline(time.Time{})
 
@@ -2343,6 +2388,44 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 		})
 	}
 
+	var dataPktID atomic.Uint32
+	sendEncryptedPayload := func(payload []byte) error {
+		id := dataPktID.Add(1)
+		rawPlainLen := 4 + len(payload)
+		padLen := 16 - (rawPlainLen % 16)
+		padded := make([]byte, rawPlainLen+padLen)
+		binary.BigEndian.PutUint32(padded[0:4], id)
+		copy(padded[4:rawPlainLen], payload)
+		for i := rawPlainLen; i < len(padded); i++ {
+			padded[i] = byte(padLen)
+		}
+
+		var iv [16]byte
+		_, _ = rand.Read(iv[:])
+		ct := make([]byte, len(padded))
+		cipher.NewCBCEncrypter(sendCipherBlk, iv[:]).CryptBlocks(ct, padded)
+
+		mac := hmac.New(newAuthHash, hmacSendKey)
+		mac.Write(iv[:])
+		mac.Write(ct)
+		tag := mac.Sum(nil)
+
+		wireLen := 1 + len(tag) + 16 + len(ct)
+		out := make([]byte, 2+wireLen)
+		binary.BigEndian.PutUint16(out[0:2], uint16(wireLen))
+		out[2] = (6 << 3)
+		copy(out[3:3+len(tag)], tag)
+		copy(out[3+len(tag):3+len(tag)+16], iv[:])
+		copy(out[3+len(tag)+16:], ct)
+
+		sess.writeMu.Lock()
+		_ = rawConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		_, wErr := rawConn.Write(out)
+		_ = rawConn.SetWriteDeadline(time.Time{})
+		sess.writeMu.Unlock()
+		return wErr
+	}
+
 	// 下行: P_DATA_V1 解密 -> 注入 gVisor
 	go func() {
 		defer sess.markDead()
@@ -2403,52 +2486,35 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 	// 上行: gVisor 读取 IPv4 -> P_DATA_V1 加密发送
 	go func() {
 		defer sess.markDead()
-		var dataPktID uint32
 		for {
 			pkt := ep.ReadContext(bgCtx)
 			if pkt == nil {
 				return
 			}
 			v := pkt.ToView()
-			ipData := v.AsSlice()
-			dataPktID++
-
-			rawPlainLen := 4 + len(ipData)
-			padLen := 16 - (rawPlainLen % 16)
-			padded := make([]byte, rawPlainLen+padLen)
-			binary.BigEndian.PutUint32(padded[0:4], dataPktID)
-			copy(padded[4:rawPlainLen], ipData)
-			for i := rawPlainLen; i < len(padded); i++ {
-				padded[i] = byte(padLen)
-			}
+			wErr := sendEncryptedPayload(v.AsSlice())
 			v.Release()
 			pkt.DecRef()
-
-			var iv [16]byte
-			_, _ = rand.Read(iv[:])
-			ct := make([]byte, len(padded))
-			cipher.NewCBCEncrypter(sendCipherBlk, iv[:]).CryptBlocks(ct, padded)
-
-			mac := hmac.New(newAuthHash, hmacSendKey)
-			mac.Write(iv[:])
-			mac.Write(ct)
-			tag := mac.Sum(nil)
-
-			wireLen := 1 + len(tag) + 16 + len(ct)
-			out := make([]byte, 2+wireLen)
-			binary.BigEndian.PutUint16(out[0:2], uint16(wireLen))
-			out[2] = (6 << 3)
-			copy(out[3:3+len(tag)], tag)
-			copy(out[3+len(tag):3+len(tag)+16], iv[:])
-			copy(out[3+len(tag)+16:], ct)
-
-			sess.writeMu.Lock()
-			_ = rawConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			_, wErr := rawConn.Write(out)
-			_ = rawConn.SetWriteDeadline(time.Time{})
-			sess.writeMu.Unlock()
 			if wErr != nil {
 				return
+			}
+		}
+	}()
+
+	// OpenVPN 数据通道心跳保活（每 12 秒发送标准 16 字节 OpenVPN OCC Ping）
+	go func() {
+		defer sess.markDead()
+		ovpnPing := []byte{0x2a, 0x18, 0x7b, 0xf3, 0x64, 0x1e, 0xb4, 0xcb, 0x07, 0xed, 0x2d, 0x0a, 0x98, 0x1f, 0xc7, 0x48}
+		ticker := time.NewTicker(12 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-sess.dead:
+				return
+			case <-ticker.C:
+				if err := sendEncryptedPayload(ovpnPing); err != nil {
+					return
+				}
 			}
 		}
 	}()
@@ -2476,6 +2542,12 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
         vg_code = f.read()
 
     if "dialOpenVPNSession" not in vg_code:
+        # 缩短 SSTP 试探超时为 2.5s，加快回退速度
+        vg_code = vg_code.replace(
+            "_ = tlsConn.SetDeadline(time.Now().Add(6 * time.Second))",
+            "_ = tlsConn.SetDeadline(time.Now().Add(2500 * time.Millisecond))",
+            1,
+        )
         vg_code = vg_code.replace(
             'return u == "vpn" || u == "vpngate"',
             'if u == "vpn" || u == "vpngate" {\n\t\t\tcacheOVPNFromPassword(server.Destination.String(), acc.Password)\n\t\t\treturn true\n\t\t}\n\t\treturn false',
@@ -2485,32 +2557,36 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 	if ovpnCfgVal, hasOVPN := ovpnConfigCache.Load(baseKey); hasOVPN {
 		ovpnCfg := ovpnCfgVal.(*parsedOVPNConfig)
 		pCached, _ := ovpnProtoCache.Load(baseKey)
-		isNonSSTPPort := serverDest.Port != 443 && serverDest.Port != 995 && serverDest.Port != 5555
-		if pCached == "openvpn" || (pCached == nil && isNonSSTPPort) {
-			if sess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg); ovpnErr == nil {
+		isDedicatedOVPNPort := serverDest.Port != 443 && serverDest.Port != 5555
+		if pCached == "openvpn" || (pCached == nil && isDedicatedOVPNPort) {
+			sess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg)
+			if ovpnErr == nil {
 				ovpnProtoCache.Store(baseKey, "openvpn")
 				return sess, nil
 			}
+			errors.LogDebug(bgCtx, "[VPNGate] OpenVPN 直连未命中 (", slotKey, "): ", ovpnErr)
 		}
 	}
 """
         vg_code = vg_code.replace(
-            'bgCtx := context.Background()',
-            'bgCtx := context.Background()' + ovpn_fast_hook,
+            "bgCtx := context.Background()",
+            "bgCtx := context.Background()" + ovpn_fast_hook,
             1,
         )
 
         ovpn_fallback_hook = """
 		if ovpnCfgVal, hasOVPN := ovpnConfigCache.Load(baseKey); hasOVPN {
-			if sess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfgVal.(*parsedOVPNConfig)); ovpnErr == nil {
+			sess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfgVal.(*parsedOVPNConfig))
+			if ovpnErr == nil {
 				ovpnProtoCache.Store(baseKey, "openvpn")
 				return sess, nil
 			}
+			errors.LogDebug(bgCtx, "[VPNGate] OpenVPN 回退也失败 (", slotKey, "): ", ovpnErr)
 		}
 """
         vg_code = vg_code.replace(
-            'if nativeErr != nil {',
-            'if nativeErr != nil {' + ovpn_fallback_hook,
+            "if nativeErr != nil {",
+            "if nativeErr != nil {" + ovpn_fallback_hook,
             1,
         )
 
