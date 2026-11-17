@@ -336,6 +336,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"math/bits"
@@ -687,7 +688,7 @@ func newGVisorStack() (*stack.Stack, *channel.Endpoint, error) {
 }
 
 func recordNodeFailureIfNeeded(baseKey string, isBackground bool, err error) {
-	if isBackground || errors.Is(err, context.Canceled) {
+	if isBackground || stderrors.Is(err, context.Canceled) || errors.Cause(err) == context.Canceled {
 		return
 	}
 	if !hasAnyAliveSlot(baseKey) {
