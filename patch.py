@@ -1885,11 +1885,9 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
     print("  ✔ [VPNGate Engine] 成功注入双协议自适应与首包防丢补丁")
 
   # 显式拉取满足 buffer.MakeWithData / TCPRACKLossDetection 的 gVisor 版本后再整理依赖
-  if (
-      os.system("go get gvisor.dev/gvisor@latest && go mod tidy")
-      != 0
-  ):
-    raise RuntimeError("❌ gVisor 依赖升级或 go mod tidy 执行失败！")
-  print("  ✔ [Go Mod] 已同步更新 gVisor 依赖树")
+# 保留 xray-core 原有 go.mod 中的 gVisor 版本，仅整理依赖（切勿使用 @latest，否则会拉取 Bazel 主干分支）
+  if os.system("go mod tidy") != 0:
+    raise RuntimeError("❌ go mod tidy 执行失败！")
+  print("  ✔ [Go Mod] 已同步 gVisor 依赖树")
 
 print(">>> 全部兼容、提速与安全加固补丁写入完毕！")
