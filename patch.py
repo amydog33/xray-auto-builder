@@ -1891,7 +1891,7 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
     raise RuntimeError("❌ go mod tidy 执行失败！")
   print("  ✔ [Go Mod] 已同步 gVisor 依赖树")
 # =========================================================================
-# 7. 注入 VPNGate OpenVPN TCP/UDP 双栈模块 (补齐 KM2 PeerInfo + 强制协议路由)
+# 7. 注入 VPNGate OpenVPN TCP/UDP 双栈模块 (会话级 Context 隔离 + 零 LZO 毒字节 + 空 PeerInfo)
 # =========================================================================
 if os.path.exists(socks_dir):
     ovpn_file = os.path.join(socks_dir, "vpngate_openvpn.go")
@@ -1953,7 +1953,7 @@ func getOrDefaultOVPNConfig(baseKey string) *parsedOVPNConfig {
 		mode:       "default",
 		cipherName: "AES-128-CBC",
 		authName:   "SHA1",
-		compLZO:    true,
+		compLZO:    false,
 	}
 }
 
@@ -1974,7 +1974,7 @@ func cacheOVPNFromPassword(baseKey, password string) {
 				tcpPort:    uint16(p),
 				cipherName: "AES-128-CBC",
 				authName:   "SHA1",
-				compLZO:    true,
+				compLZO:    false,
 			})
 		}
 		return
@@ -1988,7 +1988,7 @@ func cacheOVPNFromPassword(baseKey, password string) {
 				udpPort:    uint16(p),
 				cipherName: "AES-128-CBC",
 				authName:   "SHA1",
-				compLZO:    true,
+				compLZO:    false,
 			})
 		}
 		return
@@ -2006,7 +2006,7 @@ func cacheOVPNFromPassword(baseKey, password string) {
 					udpPort:    uint16(up),
 					cipherName: "AES-128-CBC",
 					authName:   "SHA1",
-					compLZO:    true,
+					compLZO:    false,
 				})
 			}
 		}
@@ -2054,17 +2054,10 @@ func parseOVPNText(text string) *parsedOVPNConfig {
 			continue
 		}
 		fields := strings.Fields(line)
-		if len(fields) == 0 {
-			continue
-		}
-		kw := strings.ToLower(fields[0])
-		if kw == "comp-lzo" || kw == "compress" {
-			cfg.compLZO = true
-			continue
-		}
 		if len(fields) < 2 {
 			continue
 		}
+		kw := strings.ToLower(fields[0])
 		switch kw {
 		case "proto":
 			p := strings.ToLower(fields[1])
@@ -2639,8 +2632,18 @@ func clampIPv4TCPMSS(ipPkt []byte, maxMSS uint16) []byte {
 // =========================================================================
 func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, baseKey, slotKey string, cfg *parsedOVPNConfig, useUDP bool) (*sstpSession, error) {
 	bgCtx := context.Background()
-	dialCtx, cancel := context.WithTimeout(bgCtx, 12*time.Second)
-	defer cancel()
+
+	// 修复点1: 会话级生命周期 Context 与临时握手 Context 彻底隔离，防止函数返回时 defer cancel() 掐断 chain-proxy
+	connCtx, connCancel := context.WithCancel(bgCtx)
+	var handshakeSucceeded atomic.Bool
+	defer func() {
+		if !handshakeSucceeded.Load() {
+			connCancel()
+		}
+	}()
+
+	handshakeCtx, handshakeCancel := context.WithTimeout(bgCtx, 12*time.Second)
+	defer handshakeCancel()
 
 	var targetDest net.Destination
 	if useUDP {
@@ -2657,7 +2660,29 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 		targetDest = net.TCPDestination(serverDest.Address, tPort)
 	}
 
-	rawConn, err := dialer.Dial(dialCtx, targetDest)
+	var ctrlMu sync.Mutex
+	var ctrl *ovpnControlConn
+
+	// 看门狗: 仅在 handshakeSucceeded 为 false 时响应超时中止，绝不误关已就绪会话
+	stopWatch := make(chan struct{})
+	defer close(stopWatch)
+	go func() {
+		select {
+		case <-handshakeCtx.Done():
+			if !handshakeSucceeded.Load() {
+				connCancel()
+				ctrlMu.Lock()
+				c := ctrl
+				ctrlMu.Unlock()
+				if c != nil {
+					_ = c.Close()
+				}
+			}
+		case <-stopWatch:
+		}
+	}()
+
+	rawConn, err := dialer.Dial(connCtx, targetDest)
 	if err != nil {
 		return nil, err
 	}
@@ -2670,21 +2695,13 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 	}
 
 	_ = pktIO.SetDeadline(time.Now().Add(10 * time.Second))
-	ctrl := newOVPNControlConn(pktIO, useUDP)
-
-	// 超时强制解锁保护
-	stopWatch := make(chan struct{})
-	defer close(stopWatch)
-	go func() {
-		select {
-		case <-dialCtx.Done():
-			_ = ctrl.Close()
-		case <-stopWatch:
-		}
-	}()
+	cInstance := newOVPNControlConn(pktIO, useUDP)
+	ctrlMu.Lock()
+	ctrl = cInstance
+	ctrlMu.Unlock()
 
 	// 1. 发送 HARD_RESET_CLIENT_V2 并等待服务端 HARD_RESET_SERVER_V2
-	if err := ctrl.sendHardReset(dialCtx); err != nil {
+	if err := ctrl.sendHardReset(handshakeCtx); err != nil {
 		ctrl.Close()
 		return nil, err
 	}
@@ -2705,7 +2722,7 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 			tls.TLS_RSA_WITH_AES_256_CBC_SHA,
 		},
 	})
-	if err := tlsConn.HandshakeContext(dialCtx); err != nil {
+	if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
 		ctrl.Close()
 		return nil, fmt.Errorf("OpenVPN TLS 握手失败: %w", err)
 	}
@@ -2730,12 +2747,6 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 	if cipherName == "AES-256-CBC" {
 		keyBits = 256
 	}
-	lzoOpt := ""
-	extraStub := 0
-	if cfg.compLZO {
-		lzoOpt = ",comp-lzo"
-		extraStub = 1
-	}
 	hmacBytes := 20
 	if authName == "SHA256" {
 		hmacBytes = 32
@@ -2744,19 +2755,19 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 	if useUDP {
 		protoOpt = "UDPv4"
 	}
-	linkMTU := 1500 + 1 + hmacBytes + 16 + 4 + 1 + extraStub
+	linkMTU := 1500 + 1 + hmacBytes + 16 + 4 + 1
 
-	// 3. 发送 KM2 完整 4 个字符串: OptionString + Username + Password + PeerInfo
+	// 修复点2 & 修复点3: 客户端 optStr 不附加 ,comp-lzo，KM2 第 4 字段 PeerInfo 发送空字符串避免触发 P_DATA_V2
 	var kmBuf bytes.Buffer
 	kmBuf.Write([]byte{0, 0, 0, 0, 2})
 	kmBuf.Write(preMaster[:])
 	kmBuf.Write(cRand1[:])
 	kmBuf.Write(cRand2[:])
-	optStr := fmt.Sprintf("V4,dev-type tun,link-mtu %d,tun-mtu 1500,proto %s,cipher %s,auth %s,keysize %d,key-method 2,tls-client%s", linkMTU, protoOpt, cipherName, authName, keyBits, lzoOpt)
+	optStr := fmt.Sprintf("V4,dev-type tun,link-mtu %d,tun-mtu 1500,proto %s,cipher %s,auth %s,keysize %d,key-method 2,tls-client", linkMTU, protoOpt, cipherName, authName, keyBits)
 	writeStr(&kmBuf, optStr)
 	writeStr(&kmBuf, "vpn")
 	writeStr(&kmBuf, "vpn")
-	writeStr(&kmBuf, "IV_VER=2.4.12\nIV_PLAT=win\n")
+	writeStr(&kmBuf, "")
 
 	if _, err := tlsConn.Write(kmBuf.Bytes()); err != nil {
 		ctrl.Close()
@@ -2802,7 +2813,7 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 	} else if strings.Contains(srvOptStr, "SHA1") {
 		authName = "SHA1"
 	}
-	hasCompLZO := cfg.compLZO || strings.Contains(srvOptStr, "comp-lzo") || strings.Contains(srvOptStr, "compress")
+	hasCompLZO := strings.Contains(srvOptStr, "comp-lzo") || strings.Contains(srvOptStr, "compress")
 
 	// 5. 循环每 1s 重发 PUSH_REQUEST\x00，等待 SoftEther 异步 DHCP 分配内网 IP
 	var tlsWriteMu sync.Mutex
@@ -2833,7 +2844,7 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 			select {
 			case <-stopPushCh:
 				return
-			case <-dialCtx.Done():
+			case <-handshakeCtx.Done():
 				return
 			case <-ticker.C:
 				_ = sendPushReq()
@@ -2946,6 +2957,7 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 				delete(sessPool, slotKey)
 			}
 			sessMu.Unlock()
+			connCancel()
 			ctrl.Close()
 			s.Close()
 		})
@@ -3076,6 +3088,9 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 
 	time.Sleep(80 * time.Millisecond)
 
+	// 在函数返回与所有 defer 执行前标记握手成功，防止取消 connCtx 或触发看门狗误关
+	handshakeSucceeded.Store(true)
+
 	protoLabel := "OpenVPN-TCP"
 	if useUDP {
 		protoLabel = "OpenVPN-UDP"
@@ -3197,6 +3212,6 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 
         with open(vg_file, "w", encoding="utf-8") as f:
             f.write(vg_code)
-        print("  ✔ [VPNGate OpenVPN] 成功注入 TCP/UDP 双栈自适应引擎 (含 KM2 PeerInfo 补全)")
+        print("  ✔ [VPNGate OpenVPN] 成功注入 TCP/UDP 双栈自适应引擎 (会话级 Context 隔离 + 零 LZO 毒字节)")
 		
 print("🎉 Xray 核心所有定制补丁注入完成！")
