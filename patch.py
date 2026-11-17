@@ -1891,14 +1891,13 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
     raise RuntimeError("❌ go mod tidy 执行失败！")
   print("  ✔ [Go Mod] 已同步 gVisor 依赖树")
 # =========================================================================
-# 7. 注入 VPNGate OpenVPN 扩展模块 (精准 KM2 解析 + 免证书自适应)
+# 7. 注入 VPNGate OpenVPN TCP/UDP 双栈自适应模块 (单读分发 + ARQ重传 + MSS钳制)
 # =========================================================================
 if os.path.exists(socks_dir):
     ovpn_file = os.path.join(socks_dir, "vpngate_openvpn.go")
     ovpn_src = r"""package socks
 
 import (
-	"bufio"
 	"bytes"
 	"compress/zlib"
 	"context"
@@ -1933,7 +1932,9 @@ import (
 )
 
 type parsedOVPNConfig struct {
-	remotePort uint16
+	mode       string // "default" | "udp" | "both"
+	tcpPort    uint16
+	udpPort    uint16
 	cipherName string
 	authName   string
 	compLZO    bool
@@ -1941,7 +1942,7 @@ type parsedOVPNConfig struct {
 
 var (
 	ovpnConfigCache sync.Map // map[string]*parsedOVPNConfig
-	ovpnProtoCache  sync.Map // map[string]string
+	ovpnProtoCache  sync.Map // map[string]string ("openvpn-tcp" | "openvpn-udp")
 )
 
 func getOrDefaultOVPNConfig(baseKey string) *parsedOVPNConfig {
@@ -1949,51 +1950,94 @@ func getOrDefaultOVPNConfig(baseKey string) *parsedOVPNConfig {
 		return v.(*parsedOVPNConfig)
 	}
 	return &parsedOVPNConfig{
+		mode:       "default",
 		cipherName: "AES-128-CBC",
 		authName:   "SHA1",
 		compLZO:    true,
 	}
 }
 
+// 解析密码中的协议路由元数据:
+// 1) vpn:udp:<udpPort>
+// 2) vpn:both:<tcpPort>:<udpPort>
+// 3) ovpn:<zlibBase64> (向后兼容)
 func cacheOVPNFromPassword(baseKey, password string) {
 	pw := strings.TrimSpace(password)
-	if !strings.HasPrefix(pw, "ovpn:") {
+	if pw == "" || pw == "vpn" {
 		return
 	}
 	if _, exists := ovpnConfigCache.Load(baseKey); exists {
 		return
 	}
-	encoded := strings.TrimPrefix(pw, "ovpn:")
-	var raw []byte
-	var err error
-	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding} {
-		if raw, err = enc.DecodeString(encoded); err == nil {
-			break
+
+	if strings.HasPrefix(pw, "udp:") {
+		pStr := strings.TrimPrefix(pw, "udp:")
+		if p, err := strconv.Atoi(pStr); err == nil && p > 0 && p <= 65535 {
+			ovpnConfigCache.Store(baseKey, &parsedOVPNConfig{
+				mode:       "udp",
+				udpPort:    uint16(p),
+				cipherName: "AES-128-CBC",
+				authName:   "SHA1",
+				compLZO:    true,
+			})
 		}
-	}
-	if len(raw) == 0 {
 		return
 	}
-	if len(raw) > 2 && raw[0] == 0x78 {
-		if zr, zErr := zlib.NewReader(bytes.NewReader(raw)); zErr == nil {
-			if unz, rErr := io.ReadAll(zr); rErr == nil {
-				raw = unz
+
+	if strings.HasPrefix(pw, "both:") {
+		parts := strings.Split(strings.TrimPrefix(pw, "both:"), ":")
+		if len(parts) == 2 {
+			tp, err1 := strconv.Atoi(parts[0])
+			up, err2 := strconv.Atoi(parts[1])
+			if err1 == nil && err2 == nil && tp > 0 && tp <= 65535 && up > 0 && up <= 65535 {
+				ovpnConfigCache.Store(baseKey, &parsedOVPNConfig{
+					mode:       "both",
+					tcpPort:    uint16(tp),
+					udpPort:    uint16(up),
+					cipherName: "AES-128-CBC",
+					authName:   "SHA1",
+					compLZO:    true,
+				})
 			}
-			_ = zr.Close()
 		}
+		return
 	}
-	cfg := parseOVPNText(string(raw))
-	if cfg != nil {
-		ovpnConfigCache.Store(baseKey, cfg)
+
+	if strings.HasPrefix(pw, "ovpn:") {
+		encoded := strings.TrimPrefix(pw, "ovpn:")
+		var raw []byte
+		var err error
+		for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding} {
+			if raw, err = enc.DecodeString(encoded); err == nil {
+				break
+			}
+		}
+		if len(raw) == 0 {
+			return
+		}
+		if len(raw) > 2 && raw[0] == 0x78 {
+			if zr, zErr := zlib.NewReader(bytes.NewReader(raw)); zErr == nil {
+				if unz, rErr := io.ReadAll(zr); rErr == nil {
+					raw = unz
+				}
+				_ = zr.Close()
+			}
+		}
+		if cfg := parseOVPNText(string(raw)); cfg != nil {
+			ovpnConfigCache.Store(baseKey, cfg)
+		}
 	}
 }
 
 func parseOVPNText(text string) *parsedOVPNConfig {
 	cfg := &parsedOVPNConfig{
+		mode:       "default",
 		cipherName: "AES-128-CBC",
 		authName:   "SHA1",
 		compLZO:    false,
 	}
+	hasTCP, hasUDP := false, false
+	var remotePort uint16
 	for _, line := range strings.Split(text, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
@@ -2012,10 +2056,17 @@ func parseOVPNText(text string) *parsedOVPNConfig {
 			continue
 		}
 		switch kw {
+		case "proto":
+			p := strings.ToLower(fields[1])
+			if strings.HasPrefix(p, "tcp") {
+				hasTCP = true
+			} else if strings.HasPrefix(p, "udp") {
+				hasUDP = true
+			}
 		case "remote":
 			if len(fields) >= 3 {
 				if p, err := strconv.Atoi(fields[2]); err == nil && p > 0 && p <= 65535 {
-					cfg.remotePort = uint16(p)
+					remotePort = uint16(p)
 				}
 			}
 		case "cipher", "data-ciphers":
@@ -2033,9 +2084,443 @@ func parseOVPNText(text string) *parsedOVPNConfig {
 			}
 		}
 	}
+	if hasUDP && !hasTCP && remotePort > 0 {
+		cfg.mode = "udp"
+		cfg.udpPort = remotePort
+	} else if remotePort > 0 {
+		cfg.tcpPort = remotePort
+	}
 	return cfg
 }
 
+// =========================================================================
+// 帧读写抽象层 (PacketIO: 统一 TCP 流式帧与 UDP 数据报帧)
+// =========================================================================
+type ovpnPacketIO interface {
+	ReadPacket() ([]byte, error)
+	WritePacket(pkt []byte) error
+	Close() error
+	LocalAddr() net.Addr
+	RemoteAddr() net.Addr
+	SetDeadline(t time.Time) error
+	SetReadDeadline(t time.Time) error
+	SetWriteDeadline(t time.Time) error
+}
+
+type tcpPacketIO struct {
+	raw     net.Conn
+	writeMu sync.Mutex
+}
+
+func (t *tcpPacketIO) ReadPacket() ([]byte, error) {
+	var lenHdr [2]byte
+	if _, err := io.ReadFull(t.raw, lenHdr[:]); err != nil {
+		return nil, err
+	}
+	pktLen := int(binary.BigEndian.Uint16(lenHdr[:]))
+	if pktLen <= 0 || pktLen > 16384 {
+		return nil, fmt.Errorf("OpenVPN TCP 帧长度异常: %d", pktLen)
+	}
+	pkt := make([]byte, pktLen)
+	if _, err := io.ReadFull(t.raw, pkt); err != nil {
+		return nil, err
+	}
+	return pkt, nil
+}
+
+func (t *tcpPacketIO) WritePacket(pkt []byte) error {
+	out := make([]byte, 2+len(pkt))
+	binary.BigEndian.PutUint16(out[0:2], uint16(len(pkt)))
+	copy(out[2:], pkt)
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	_, err := t.raw.Write(out)
+	return err
+}
+
+func (t *tcpPacketIO) Close() error                       { return t.raw.Close() }
+func (t *tcpPacketIO) LocalAddr() net.Addr                { return t.raw.LocalAddr() }
+func (t *tcpPacketIO) RemoteAddr() net.Addr               { return t.raw.RemoteAddr() }
+func (t *tcpPacketIO) SetDeadline(tm time.Time) error     { return t.raw.SetDeadline(tm) }
+func (t *tcpPacketIO) SetReadDeadline(tm time.Time) error { return t.raw.SetReadDeadline(tm) }
+func (t *tcpPacketIO) SetWriteDeadline(tm time.Time) error { return t.raw.SetWriteDeadline(tm) }
+
+type udpPacketIO struct {
+	raw     net.Conn
+	writeMu sync.Mutex
+}
+
+func (u *udpPacketIO) ReadPacket() ([]byte, error) {
+	buf := make([]byte, 4096)
+	n, err := u.raw.Read(buf)
+	if err != nil {
+		return nil, err
+	}
+	if n <= 0 {
+		return nil, fmt.Errorf("收到空 UDP 数据报")
+	}
+	pkt := make([]byte, n)
+	copy(pkt, buf[:n])
+	return pkt, nil
+}
+
+func (u *udpPacketIO) WritePacket(pkt []byte) error {
+	u.writeMu.Lock()
+	defer u.writeMu.Unlock()
+	_, err := u.raw.Write(pkt)
+	return err
+}
+
+func (u *udpPacketIO) Close() error                       { return u.raw.Close() }
+func (u *udpPacketIO) LocalAddr() net.Addr                { return u.raw.LocalAddr() }
+func (u *udpPacketIO) RemoteAddr() net.Addr               { return u.raw.RemoteAddr() }
+func (u *udpPacketIO) SetDeadline(tm time.Time) error     { return u.raw.SetDeadline(tm) }
+func (u *udpPacketIO) SetReadDeadline(tm time.Time) error { return u.raw.SetReadDeadline(tm) }
+func (u *udpPacketIO) SetWriteDeadline(tm time.Time) error { return u.raw.SetWriteDeadline(tm) }
+
+// =========================================================================
+// 单读协程多路分发器 + 控制通道 ARQ 可靠传输状态机
+// =========================================================================
+type unackedCtrlPkt struct {
+	pkt      []byte
+	lastSent time.Time
+}
+
+type ovpnControlConn struct {
+	pktIO         ovpnPacketIO
+	isUDP         bool
+	localSID      [8]byte
+	remoteSID     [8]byte
+	hasRemote     atomic.Bool
+	handshakeDone atomic.Bool
+
+	mu         sync.Mutex
+	outPktID   uint32
+	unacked    map[uint32]*unackedCtrlPkt
+	nextRecvID uint32
+	outOfOrder map[uint32][]byte
+	readBuf    []byte
+	closed     bool
+	closeErr   error
+
+	notifyCh     chan struct{}
+	resetAckCh   chan struct{}
+	resetAckOnce sync.Once
+	stopARQ      chan struct{}
+	stopARQOnce  sync.Once
+
+	cbMu         sync.RWMutex
+	onDataPacket func([]byte)
+	onConnClosed func()
+}
+
+func newOVPNControlConn(pktIO ovpnPacketIO, isUDP bool) *ovpnControlConn {
+	c := &ovpnControlConn{
+		pktIO:      pktIO,
+		isUDP:      isUDP,
+		unacked:    make(map[uint32]*unackedCtrlPkt),
+		outOfOrder: make(map[uint32][]byte),
+		notifyCh:   make(chan struct{}, 1),
+		resetAckCh: make(chan struct{}),
+		stopARQ:    make(chan struct{}),
+	}
+	_, _ = rand.Read(c.localSID[:])
+	go c.readerLoop()
+	if isUDP {
+		go c.arqRetransmitLoop()
+	}
+	return c
+}
+
+func (c *ovpnControlConn) stopRetransmit() {
+	c.stopARQOnce.Do(func() {
+		close(c.stopARQ)
+	})
+}
+
+func (c *ovpnControlConn) fail(err error) {
+	c.mu.Lock()
+	if !c.closed {
+		c.closed = true
+		c.closeErr = err
+	}
+	c.mu.Unlock()
+
+	c.stopRetransmit()
+	select {
+	case c.notifyCh <- struct{}{}:
+	default:
+	}
+
+	c.cbMu.RLock()
+	closedCb := c.onConnClosed
+	c.cbMu.RUnlock()
+	if closedCb != nil {
+		closedCb()
+	}
+}
+
+func (c *ovpnControlConn) readerLoop() {
+	for {
+		if c.handshakeDone.Load() {
+			_ = c.pktIO.SetReadDeadline(time.Now().Add(15 * time.Second))
+		}
+		pkt, err := c.pktIO.ReadPacket()
+		if err != nil {
+			c.fail(err)
+			return
+		}
+		if len(pkt) < 1 {
+			continue
+		}
+		opcode := pkt[0] >> 3
+		if opcode == 6 { // P_DATA_V1
+			c.cbMu.RLock()
+			dataCb := c.onDataPacket
+			c.cbMu.RUnlock()
+			if dataCb != nil {
+				dataCb(pkt)
+			}
+			continue
+		}
+		if opcode == 4 || opcode == 5 || opcode == 8 {
+			c.handleControlFrame(opcode, pkt)
+		}
+	}
+}
+
+func (c *ovpnControlConn) arqRetransmitLoop() {
+	ticker := time.NewTicker(800 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.stopARQ:
+			return
+		case <-ticker.C:
+			var toResend [][]byte
+			now := time.Now()
+			c.mu.Lock()
+			if c.closed {
+				c.mu.Unlock()
+				return
+			}
+			// 按 Packet ID 升序重传未确认控制包
+			for id := uint32(0); id <= c.outPktID; id++ {
+				if item, ok := c.unacked[id]; ok && now.Sub(item.lastSent) >= 800*time.Millisecond {
+					item.lastSent = now
+					toResend = append(toResend, item.pkt)
+				}
+			}
+			c.mu.Unlock()
+			for _, p := range toResend {
+				_ = c.pktIO.WritePacket(p)
+			}
+		}
+	}
+}
+
+func (c *ovpnControlConn) sendAck(remotePktID uint32) {
+	if !c.hasRemote.Load() {
+		return
+	}
+	// P_ACK_V1 (opcode=5): 无自身 PacketID 字段，共 22 字节
+	pkt := make([]byte, 22)
+	pkt[0] = (5 << 3)
+	copy(pkt[1:9], c.localSID[:])
+	pkt[9] = 1
+	binary.BigEndian.PutUint32(pkt[10:14], remotePktID)
+	copy(pkt[14:22], c.remoteSID[:])
+	_ = c.pktIO.WritePacket(pkt)
+}
+
+func (c *ovpnControlConn) handleControlFrame(opcode byte, pkt []byte) {
+	if len(pkt) < 10 {
+		return
+	}
+	ackLen := int(pkt[9])
+	pos := 10 + 4*ackLen
+	if len(pkt) < pos {
+		return
+	}
+
+	c.mu.Lock()
+	if !c.hasRemote.Load() {
+		copy(c.remoteSID[:], pkt[1:9])
+		c.hasRemote.Store(true)
+	}
+	// 销账已收到服务端确认的控制包
+	for i := 0; i < ackLen; i++ {
+		ackID := binary.BigEndian.Uint32(pkt[10+4*i : 14+4*i])
+		delete(c.unacked, ackID)
+	}
+	c.mu.Unlock()
+
+	if ackLen > 0 {
+		pos += 8 // 跳过 remote_session_id 回显
+	}
+	if opcode == 5 { // 纯 ACK 帧到此结束
+		return
+	}
+	if pos+4 > len(pkt) {
+		return
+	}
+
+	remotePktID := binary.BigEndian.Uint32(pkt[pos : pos+4])
+	pos += 4
+
+	// 无论是否重复帧，收到 opcode=4 或 8 都必须立即回发 ACK
+	c.sendAck(remotePktID)
+
+	c.mu.Lock()
+	if remotePktID < c.nextRecvID {
+		c.mu.Unlock()
+		return
+	}
+	if opcode == 8 { // P_CONTROL_HARD_RESET_SERVER_V2
+		if remotePktID == c.nextRecvID {
+			c.nextRecvID++
+		}
+		c.mu.Unlock()
+		c.resetAckOnce.Do(func() {
+			close(c.resetAckCh)
+		})
+		return
+	}
+
+	// opcode == 4 (P_CONTROL_V1)
+	if pos < len(pkt) {
+		payload := make([]byte, len(pkt)-pos)
+		copy(payload, pkt[pos:])
+		c.outOfOrder[remotePktID] = payload
+	} else if remotePktID == c.nextRecvID {
+		c.nextRecvID++
+	}
+
+	appended := false
+	for {
+		chunk, ok := c.outOfOrder[c.nextRecvID]
+		if !ok {
+			break
+		}
+		c.readBuf = append(c.readBuf, chunk...)
+		delete(c.outOfOrder, c.nextRecvID)
+		c.nextRecvID++
+		appended = true
+	}
+	c.mu.Unlock()
+
+	if appended {
+		select {
+		case c.notifyCh <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (c *ovpnControlConn) sendHardReset(ctx context.Context) error {
+	pkt := make([]byte, 14)
+	pkt[0] = (7 << 3) // P_CONTROL_HARD_RESET_CLIENT_V2 (PacketID=0)
+	copy(pkt[1:9], c.localSID[:])
+	pkt[9] = 0
+	binary.BigEndian.PutUint32(pkt[10:14], 0)
+
+	c.mu.Lock()
+	c.outPktID = 0
+	if c.isUDP {
+		c.unacked[0] = &unackedCtrlPkt{pkt: pkt, lastSent: time.Now()}
+	}
+	c.mu.Unlock()
+
+	if err := c.pktIO.WritePacket(pkt); err != nil {
+		return err
+	}
+
+	select {
+	case <-c.resetAckCh:
+		return nil
+	case <-c.notifyCh:
+		c.mu.Lock()
+		err := c.closeErr
+		c.mu.Unlock()
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("连接在等待 HARD_RESET_SERVER_V2 时关闭")
+	case <-ctx.Done():
+		return fmt.Errorf("等待 HARD_RESET_SERVER_V2 超时: %w", ctx.Err())
+	}
+}
+
+func (c *ovpnControlConn) Write(b []byte) (int, error) {
+	total := len(b)
+	for len(b) > 0 {
+		chunk := len(b)
+		if chunk > 800 { // 单片上限 800B，避免嵌套 UDP 分片
+			chunk = 800
+		}
+
+		c.mu.Lock()
+		if c.closed {
+			err := c.closeErr
+			c.mu.Unlock()
+			return 0, err
+		}
+		c.outPktID++
+		pktID := c.outPktID
+
+		pkt := make([]byte, 14+chunk)
+		pkt[0] = (4 << 3) // P_CONTROL_V1
+		copy(pkt[1:9], c.localSID[:])
+		pkt[9] = 0
+		binary.BigEndian.PutUint32(pkt[10:14], pktID)
+		copy(pkt[14:], b[:chunk])
+
+		if c.isUDP {
+			c.unacked[pktID] = &unackedCtrlPkt{pkt: pkt, lastSent: time.Now()}
+		}
+		c.mu.Unlock()
+
+		if err := c.pktIO.WritePacket(pkt); err != nil {
+			return 0, err
+		}
+		b = b[chunk:]
+	}
+	return total, nil
+}
+
+func (c *ovpnControlConn) Read(b []byte) (int, error) {
+	for {
+		c.mu.Lock()
+		if len(c.readBuf) > 0 {
+			n := copy(b, c.readBuf)
+			c.readBuf = c.readBuf[n:]
+			c.mu.Unlock()
+			return n, nil
+		}
+		if c.closed {
+			err := c.closeErr
+			c.mu.Unlock()
+			if err == nil {
+				err = io.EOF
+			}
+			return 0, err
+		}
+		c.mu.Unlock()
+
+		<-c.notifyCh
+	}
+}
+
+func (c *ovpnControlConn) Close() error                       { c.stopRetransmit(); return c.pktIO.Close() }
+func (c *ovpnControlConn) LocalAddr() net.Addr                { return c.pktIO.LocalAddr() }
+func (c *ovpnControlConn) RemoteAddr() net.Addr               { return c.pktIO.RemoteAddr() }
+func (c *ovpnControlConn) SetDeadline(t time.Time) error      { return c.pktIO.SetDeadline(t) }
+func (c *ovpnControlConn) SetReadDeadline(t time.Time) error  { return c.pktIO.SetReadDeadline(t) }
+func (c *ovpnControlConn) SetWriteDeadline(t time.Time) error { return c.pktIO.SetWriteDeadline(t) }
+
+// =========================================================================
+// 密码学辅助与 TCP SYN MSS 钳制
+// =========================================================================
 func openvpnPRF(secret, label, seed []byte, outLen int) []byte {
 	fullSeed := append(append([]byte{}, label...), seed...)
 	half := (len(secret) + 1) / 2
@@ -2069,182 +2554,100 @@ func openvpnPRF(secret, label, seed []byte, outLen int) []byte {
 	return res
 }
 
-type ovpnControlConn struct {
-	raw        net.Conn
-	br         *bufio.Reader
-	localSID   [8]byte
-	remoteSID  [8]byte
-	hasRemote  bool
-	outPktID   uint32
-	nextRecvID uint32
-	outOfOrder map[uint32][]byte
-	writeMu    sync.Mutex
-	readBuf    []byte
-}
+func clampIPv4TCPMSS(ipPkt []byte, maxMSS uint16) []byte {
+	if len(ipPkt) < 40 || (ipPkt[0]>>4) != 4 || ipPkt[9] != 6 {
+		return ipPkt
+	}
+	ihl := int(ipPkt[0]&0x0f) * 4
+	if ihl < 20 || len(ipPkt) < ihl+20 {
+		return ipPkt
+	}
+	if (ipPkt[ihl+13] & 0x02) == 0 { // 非 SYN 报文
+		return ipPkt
+	}
+	doff := int(ipPkt[ihl+12]>>4) * 4
+	if doff <= 20 || len(ipPkt) < ihl+doff {
+		return ipPkt
+	}
 
-func (c *ovpnControlConn) writeRawPacket(pkt []byte) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	var buf bytes.Buffer
-	var lenHdr [2]byte
-	binary.BigEndian.PutUint16(lenHdr[:], uint16(len(pkt)))
-	buf.Write(lenHdr[:])
-	buf.Write(pkt)
-	_, err := c.raw.Write(buf.Bytes())
-	return err
-}
-
-func (c *ovpnControlConn) sendAck(remotePktID uint32) error {
-	pkt := make([]byte, 22)
-	pkt[0] = (5 << 3) // P_ACK_V1
-	copy(pkt[1:9], c.localSID[:])
-	pkt[9] = 1
-	binary.BigEndian.PutUint32(pkt[10:14], remotePktID)
-	copy(pkt[14:22], c.remoteSID[:])
-	return c.writeRawPacket(pkt)
-}
-
-func (c *ovpnControlConn) waitServerReset() error {
-	for i := 0; i < 8; i++ {
-		var lenHdr [2]byte
-		if _, err := io.ReadFull(c.br, lenHdr[:]); err != nil {
-			return err
+	out := make([]byte, len(ipPkt))
+	copy(out, ipPkt)
+	modified := false
+	for i := ihl + 20; i < ihl+doff; {
+		kind := out[i]
+		if kind == 0 {
+			break
 		}
-		pktLen := int(binary.BigEndian.Uint16(lenHdr[:]))
-		if pktLen < 14 || pktLen > 4096 {
-			return fmt.Errorf("非 OpenVPN 握手包 (len=%d)", pktLen)
-		}
-		pkt := make([]byte, pktLen)
-		if _, err := io.ReadFull(c.br, pkt); err != nil {
-			return err
-		}
-		opcode := pkt[0] >> 3
-		if opcode == 5 {
+		if kind == 1 {
+			i++
 			continue
 		}
-		if opcode == 8 { // P_CONTROL_HARD_RESET_SERVER_V2
-			copy(c.remoteSID[:], pkt[1:9])
-			c.hasRemote = true
-			ackLen := int(pkt[9])
-			pos := 10 + 4*ackLen
-			if ackLen > 0 {
-				pos += 8
-			}
-			if pos+4 > len(pkt) {
-				return fmt.Errorf("HARD_RESET_SERVER_V2 长度不足")
-			}
-			remotePktID := binary.BigEndian.Uint32(pkt[pos : pos+4])
-			c.nextRecvID = remotePktID + 1
-			return c.sendAck(remotePktID)
+		if i+1 >= ihl+doff {
+			break
 		}
+		optLen := int(out[i+1])
+		if optLen < 2 || i+optLen > ihl+doff {
+			break
+		}
+		if kind == 2 && optLen == 4 {
+			curMSS := binary.BigEndian.Uint16(out[i+2 : i+4])
+			if curMSS > maxMSS {
+				binary.BigEndian.PutUint16(out[i+2:i+4], maxMSS)
+				modified = true
+			}
+			break
+		}
+		i += optLen
 	}
-	return fmt.Errorf("未收到 HARD_RESET_SERVER_V2")
+	if !modified {
+		return ipPkt
+	}
+
+	// 重算 TCP 校验和
+	out[ihl+16] = 0
+	out[ihl+17] = 0
+	tcpLen := len(out) - ihl
+	var sum uint32
+	sum += uint32(binary.BigEndian.Uint16(out[12:14]))
+	sum += uint32(binary.BigEndian.Uint16(out[14:16]))
+	sum += uint32(binary.BigEndian.Uint16(out[16:18]))
+	sum += uint32(binary.BigEndian.Uint16(out[18:20]))
+	sum += 6
+	sum += uint32(tcpLen)
+	for i := ihl; i+1 < len(out); i += 2 {
+		sum += uint32(binary.BigEndian.Uint16(out[i : i+2]))
+	}
+	if tcpLen%2 == 1 {
+		sum += uint32(out[len(out)-1]) << 8
+	}
+	for (sum >> 16) > 0 {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	binary.BigEndian.PutUint16(out[ihl+16:ihl+18], ^uint16(sum))
+	return out
 }
 
-func (c *ovpnControlConn) Write(b []byte) (int, error) {
-	total := len(b)
-	for len(b) > 0 {
-		chunk := len(b)
-		if chunk > 1000 {
-			chunk = 1000
-		}
-		c.outPktID++
-		pkt := make([]byte, 14+chunk)
-		pkt[0] = (4 << 3) // P_CONTROL_V1
-		copy(pkt[1:9], c.localSID[:])
-		pkt[9] = 0
-		binary.BigEndian.PutUint32(pkt[10:14], c.outPktID)
-		copy(pkt[14:], b[:chunk])
-		if err := c.writeRawPacket(pkt); err != nil {
-			return 0, err
-		}
-		b = b[chunk:]
-	}
-	return total, nil
-}
-
-func (c *ovpnControlConn) Read(b []byte) (int, error) {
-	for len(c.readBuf) == 0 {
-		var lenHdr [2]byte
-		if _, err := io.ReadFull(c.br, lenHdr[:]); err != nil {
-			return 0, err
-		}
-		pktLen := int(binary.BigEndian.Uint16(lenHdr[:]))
-		if pktLen < 10 || pktLen > 16384 {
-			return 0, fmt.Errorf("OpenVPN 控制帧长度异常: %d", pktLen)
-		}
-		pkt := make([]byte, pktLen)
-		if _, err := io.ReadFull(c.br, pkt); err != nil {
-			return 0, err
-		}
-		opcode := pkt[0] >> 3
-		if opcode == 6 {
-			continue
-		}
-		copy(c.remoteSID[:], pkt[1:9])
-		c.hasRemote = true
-		ackLen := int(pkt[9])
-		pos := 10 + 4*ackLen
-		if ackLen > 0 {
-			pos += 8
-		}
-		if pos > len(pkt) || opcode == 5 {
-			continue
-		}
-		if opcode == 4 || opcode == 8 {
-			if pos+4 > len(pkt) {
-				continue
-			}
-			remotePktID := binary.BigEndian.Uint32(pkt[pos : pos+4])
-			pos += 4
-			_ = c.sendAck(remotePktID)
-
-			if remotePktID < c.nextRecvID {
-				continue
-			}
-			if opcode == 8 {
-				if remotePktID == c.nextRecvID {
-					c.nextRecvID++
-				}
-				continue
-			}
-			if pos < len(pkt) {
-				payload := append([]byte(nil), pkt[pos:]...)
-				c.outOfOrder[remotePktID] = payload
-			} else if remotePktID == c.nextRecvID {
-				c.nextRecvID++
-			}
-			for {
-				chunk, ok := c.outOfOrder[c.nextRecvID]
-				if !ok {
-					break
-				}
-				c.readBuf = append(c.readBuf, chunk...)
-				delete(c.outOfOrder, c.nextRecvID)
-				c.nextRecvID++
-			}
-		}
-	}
-	n := copy(b, c.readBuf)
-	c.readBuf = c.readBuf[n:]
-	return n, nil
-}
-
-func (c *ovpnControlConn) Close() error                       { return c.raw.Close() }
-func (c *ovpnControlConn) LocalAddr() net.Addr                { return c.raw.LocalAddr() }
-func (c *ovpnControlConn) RemoteAddr() net.Addr               { return c.raw.RemoteAddr() }
-func (c *ovpnControlConn) SetDeadline(t time.Time) error      { return c.raw.SetDeadline(t) }
-func (c *ovpnControlConn) SetReadDeadline(t time.Time) error  { return c.raw.SetReadDeadline(t) }
-func (c *ovpnControlConn) SetWriteDeadline(t time.Time) error { return c.raw.SetWriteDeadline(t) }
-
-func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, baseKey, slotKey string, cfg *parsedOVPNConfig) (*sstpSession, error) {
+// =========================================================================
+// OpenVPN 核心建连函数 (同时支持 TCP 与 UDP)
+// =========================================================================
+func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, baseKey, slotKey string, cfg *parsedOVPNConfig, useUDP bool) (*sstpSession, error) {
 	bgCtx := context.Background()
 	dialCtx, cancel := context.WithTimeout(bgCtx, 12*time.Second)
 	defer cancel()
 
-	targetDest := serverDest
-	if cfg.remotePort > 0 && cfg.remotePort != uint16(serverDest.Port) {
-		targetDest = net.TCPDestination(serverDest.Address, net.Port(cfg.remotePort))
+	var targetDest net.Destination
+	if useUDP {
+		uPort := serverDest.Port
+		if cfg.udpPort > 0 {
+			uPort = net.Port(cfg.udpPort)
+		}
+		targetDest = net.UDPDestination(serverDest.Address, uPort)
+	} else {
+		tPort := serverDest.Port
+		if cfg.tcpPort > 0 {
+			tPort = net.Port(cfg.tcpPort)
+		}
+		targetDest = net.TCPDestination(serverDest.Address, tPort)
 	}
 
 	rawConn, err := dialer.Dial(dialCtx, targetDest)
@@ -2252,29 +2655,23 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 		return nil, err
 	}
 
-	ctrl := &ovpnControlConn{
-		raw:        rawConn,
-		br:         bufio.NewReaderSize(rawConn, 65536),
-		outOfOrder: make(map[uint32][]byte),
+	var pktIO ovpnPacketIO
+	if useUDP {
+		pktIO = &udpPacketIO{raw: rawConn}
+	} else {
+		pktIO = &tcpPacketIO{raw: rawConn}
 	}
-	_, _ = rand.Read(ctrl.localSID[:])
 
-	_ = rawConn.SetDeadline(time.Now().Add(8 * time.Second))
-	// 1. 发送 P_CONTROL_HARD_RESET_CLIENT_V2 (Packet ID = 0)
-	resetPkt := make([]byte, 14)
-	resetPkt[0] = (7 << 3)
-	copy(resetPkt[1:9], ctrl.localSID[:])
-	if err := ctrl.writeRawPacket(resetPkt); err != nil {
-		rawConn.Close()
-		return nil, err
-	}
-	// 2. 等待服务端 HARD_RESET_SERVER_V2 并回复 ACK
-	if err := ctrl.waitServerReset(); err != nil {
-		rawConn.Close()
+	_ = pktIO.SetDeadline(time.Now().Add(10 * time.Second))
+	ctrl := newOVPNControlConn(pktIO, useUDP)
+
+	// 1. 发送 HARD_RESET_CLIENT_V2 并等待服务端 HARD_RESET_SERVER_V2
+	if err := ctrl.sendHardReset(dialCtx); err != nil {
+		ctrl.Close()
 		return nil, err
 	}
 
-	// 3. 限制 TLS 1.2 并关闭后量子大扩展，确保 ClientHello 单包发出
+	// 2. 限制 TLS 1.2 并关闭后量子大扩展，确保 ClientHello 单包发出
 	tlsConn := tls.Client(ctrl, &tls.Config{
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS10,
@@ -2291,7 +2688,7 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 		},
 	})
 	if err := tlsConn.HandshakeContext(dialCtx); err != nil {
-		rawConn.Close()
+		ctrl.Close()
 		return nil, fmt.Errorf("OpenVPN TLS 握手失败: %w", err)
 	}
 
@@ -2325,6 +2722,10 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 	if authName == "SHA256" {
 		hmacBytes = 32
 	}
+	protoOpt := "TCPv4_CLIENT"
+	if useUDP {
+		protoOpt = "UDPv4"
+	}
 	linkMTU := 1500 + 1 + hmacBytes + 16 + 4 + 1 + extraStub
 
 	var kmBuf bytes.Buffer
@@ -2332,21 +2733,20 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 	kmBuf.Write(preMaster[:])
 	kmBuf.Write(cRand1[:])
 	kmBuf.Write(cRand2[:])
-	optStr := fmt.Sprintf("V4,dev-type tun,link-mtu %d,tun-mtu 1500,proto TCPv4_CLIENT,cipher %s,auth %s,keysize %d,key-method 2,tls-client%s", linkMTU, cipherName, authName, keyBits, lzoOpt)
+	optStr := fmt.Sprintf("V4,dev-type tun,link-mtu %d,tun-mtu 1500,proto %s,cipher %s,auth %s,keysize %d,key-method 2,tls-client%s", linkMTU, protoOpt, cipherName, authName, keyBits, lzoOpt)
 	writeStr(&kmBuf, optStr)
 	writeStr(&kmBuf, "vpn")
 	writeStr(&kmBuf, "vpn")
 
 	if _, err := tlsConn.Write(kmBuf.Bytes()); err != nil {
-		rawConn.Close()
+		ctrl.Close()
 		return nil, err
 	}
 
-	// 4. 读取服务端 KM2: 4B(0) + 1B(2) + 32B(sRand1) + 32B(sRand2) + 2B(optLen) + OptionString
-	// SoftEther OvsBuildKeyMethod2 在 OptionString 后直接结束，绝不附带 username/password
+	// 3. SoftEther KM2 响应只有 OptionString 单字段，读完立即结束
 	var srvKMHdr [69]byte
 	if _, err := io.ReadFull(tlsConn, srvKMHdr[:]); err != nil {
-		rawConn.Close()
+		ctrl.Close()
 		return nil, fmt.Errorf("读取 OpenVPN KM2 失败: %w", err)
 	}
 	sRand1 := srvKMHdr[5:37]
@@ -2354,25 +2754,24 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 
 	var optLenHdr [2]byte
 	if _, err := io.ReadFull(tlsConn, optLenHdr[:]); err != nil {
-		rawConn.Close()
+		ctrl.Close()
 		return nil, fmt.Errorf("读取 KM2 OptionString 长度失败: %w", err)
 	}
 	srvOptLen := int(binary.BigEndian.Uint16(optLenHdr[:]))
 	var srvOptStr string
 	if srvOptLen > 0 {
 		if srvOptLen > 8192 {
-			rawConn.Close()
-			return nil, fmt.Errorf("OpenVPN KM2 OptionString 长度异常: %d", srvOptLen)
+			ctrl.Close()
+			return nil, fmt.Errorf("KM2 OptionString 长度异常: %d", srvOptLen)
 		}
 		optBytes := make([]byte, srvOptLen)
 		if _, err := io.ReadFull(tlsConn, optBytes); err != nil {
-			rawConn.Close()
+			ctrl.Close()
 			return nil, fmt.Errorf("读取 KM2 OptionString 内容失败: %w", err)
 		}
 		srvOptStr = strings.TrimRight(string(optBytes), "\x00")
 	}
 
-	// 根据服务端实际回传的 OptionString 自动对齐加密套件、摘要算法与 LZO 帧头
 	if strings.Contains(srvOptStr, "AES-256-CBC") {
 		cipherName = "AES-256-CBC"
 	} else if strings.Contains(srvOptStr, "AES-128-CBC") {
@@ -2383,30 +2782,60 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 	} else if strings.Contains(srvOptStr, "SHA1") {
 		authName = "SHA1"
 	}
-	hasCompLZO := strings.Contains(srvOptStr, "comp-lzo") || strings.Contains(srvOptStr, "compress")
-	if srvOptStr == "" {
-		hasCompLZO = cfg.compLZO
-	}
+	hasCompLZO := cfg.compLZO || strings.Contains(srvOptStr, "comp-lzo") || strings.Contains(srvOptStr, "compress")
 
-	// 5. 立即发送 PUSH_REQUEST\x00 获取虚拟内网 IP（不在 tlsConn 上设置短超时以免触发永久错误锁定）
-	if _, err := tlsConn.Write([]byte("PUSH_REQUEST\x00")); err != nil {
-		rawConn.Close()
+	// 4. 循环每 1s 重发 PUSH_REQUEST\x00，等待 SoftEther 异步 DHCP 分配内网 IP
+	var tlsWriteMu sync.Mutex
+	sendPushReq := func() error {
+		tlsWriteMu.Lock()
+		defer tlsWriteMu.Unlock()
+		_, wErr := tlsConn.Write([]byte("PUSH_REQUEST\x00"))
+		return wErr
+	}
+	if err := sendPushReq(); err != nil {
+		ctrl.Close()
 		return nil, err
 	}
+
+	stopPushCh := make(chan struct{})
+	var stopPushOnce sync.Once
+	stopPush := func() {
+		stopPushOnce.Do(func() {
+			close(stopPushCh)
+		})
+	}
+	defer stopPush()
+
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopPushCh:
+				return
+			case <-dialCtx.Done():
+				return
+			case <-ticker.C:
+				_ = sendPushReq()
+			}
+		}
+	}()
 
 	var assignedIP []byte
 	var pushAcc strings.Builder
 	pushBuf := make([]byte, 2048)
-	for attempts := 0; attempts < 8; attempts++ {
+	for attempts := 0; attempts < 10; attempts++ {
 		n, err := tlsConn.Read(pushBuf)
 		if err != nil {
-			rawConn.Close()
+			stopPush()
+			ctrl.Close()
 			return nil, fmt.Errorf("读取 PUSH_REPLY 失败: %w", err)
 		}
 		pushAcc.Write(pushBuf[:n])
 		reply := pushAcc.String()
 		if strings.Contains(reply, "AUTH_FAILED") {
-			rawConn.Close()
+			stopPush()
+			ctrl.Close()
 			return nil, fmt.Errorf("OpenVPN 认证被拒绝 (AUTH_FAILED)")
 		}
 		if idx := strings.Index(reply, "PUSH_REPLY"); idx != -1 {
@@ -2431,13 +2860,18 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 			}
 		}
 	}
+	stopPush()
+
 	if len(assignedIP) != 4 {
-		rawConn.Close()
+		ctrl.Close()
 		return nil, fmt.Errorf("OpenVPN 未分配有效 IP: %q", strings.Trim(pushAcc.String(), "\x00"))
 	}
-	_ = rawConn.SetDeadline(time.Time{})
 
-	// 6. 派生数据通道密钥
+	ctrl.stopRetransmit()
+	_ = pktIO.SetDeadline(time.Time{})
+	ctrl.handshakeDone.Store(true)
+
+	// 5. 派生数据通道密钥
 	seed1 := append(append([]byte{}, cRand1[:]...), sRand1...)
 	masterSecret := openvpnPRF(preMaster[:], []byte("OpenVPN master secret"), seed1, 48)
 	var seed2 []byte
@@ -2453,12 +2887,12 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 	}
 	sendCipherBlk, err := aes.NewCipher(keyBlock[0:keyLen])
 	if err != nil {
-		rawConn.Close()
+		ctrl.Close()
 		return nil, err
 	}
 	recvCipherBlk, err := aes.NewCipher(keyBlock[128 : 128+keyLen])
 	if err != nil {
-		rawConn.Close()
+		ctrl.Close()
 		return nil, err
 	}
 
@@ -2473,7 +2907,7 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 
 	s, ep, err := newGVisorStack()
 	if err != nil {
-		rawConn.Close()
+		ctrl.Close()
 		return nil, err
 	}
 
@@ -2492,13 +2926,58 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 				delete(sessPool, slotKey)
 			}
 			sessMu.Unlock()
-			rawConn.Close()
+			ctrl.Close()
 			s.Close()
 		})
 	}
 
+	// 绑定下行数据帧回调与连接关闭回调到单读分发器
+	ctrl.cbMu.Lock()
+	ctrl.onConnClosed = sess.markDead
+	ctrl.onDataPacket = func(pkt []byte) {
+		if len(pkt) < 1+hmacSize+16+16 {
+			return
+		}
+		recvMAC := pkt[1 : 1+hmacSize]
+		encBody := pkt[1+hmacSize:]
+		mac := hmac.New(newAuthHash, hmacRecvKey)
+		mac.Write(encBody)
+		if !hmac.Equal(recvMAC, mac.Sum(nil)) {
+			return
+		}
+		iv := encBody[:16]
+		ct := encBody[16:]
+		if len(ct)%16 != 0 {
+			return
+		}
+		pt := make([]byte, len(ct))
+		cipher.NewCBCDecrypter(recvCipherBlk, iv).CryptBlocks(pt, ct)
+		padLen := int(pt[len(pt)-1])
+		if padLen < 1 || padLen > 16 || padLen > len(pt) {
+			return
+		}
+		plain := pt[:len(pt)-padLen]
+		if len(plain) > 4 {
+			ipPkt := plain[4:]
+			if ipPkt[0] == 0xfa && len(ipPkt) > 1 {
+				ipPkt = ipPkt[1:]
+			}
+			if (ipPkt[0] >> 4) == 4 {
+				pBuf := stack.NewPacketBuffer(stack.PacketBufferOptions{
+					Payload: buffer.MakeWithData(ipPkt),
+				})
+				ep.InjectInbound(header.IPv4ProtocolNumber, pBuf)
+				pBuf.DecRef()
+			}
+		}
+	}
+	ctrl.cbMu.Unlock()
+
 	var dataPktID atomic.Uint32
-	sendEncryptedPayload := func(payload []byte) error {
+	sendEncryptedPayload := func(payload []byte, isIPPacket bool) error {
+		if isIPPacket {
+			payload = clampIPv4TCPMSS(payload, 1280)
+		}
 		id := dataPktID.Add(1)
 		lzoByte := 0
 		if hasCompLZO {
@@ -2526,93 +3005,14 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 		mac.Write(ct)
 		tag := mac.Sum(nil)
 
-		wireLen := 1 + len(tag) + 16 + len(ct)
-		out := make([]byte, 2+wireLen)
-		binary.BigEndian.PutUint16(out[0:2], uint16(wireLen))
-		out[2] = (6 << 3)
-		copy(out[3:3+len(tag)], tag)
-		copy(out[3+len(tag):3+len(tag)+16], iv[:])
-		copy(out[3+len(tag)+16:], ct)
+		out := make([]byte, 1+len(tag)+16+len(ct))
+		out[0] = (6 << 3)
+		copy(out[1:1+len(tag)], tag)
+		copy(out[1+len(tag):1+len(tag)+16], iv[:])
+		copy(out[1+len(tag)+16:], ct)
 
-		ctrl.writeMu.Lock()
-		_ = rawConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		_, wErr := rawConn.Write(out)
-		_ = rawConn.SetWriteDeadline(time.Time{})
-		ctrl.writeMu.Unlock()
-		return wErr
+		return pktIO.WritePacket(out)
 	}
-
-	// 下行: P_DATA_V1 解密 -> 注入 gVisor，并为后续控制帧持续回 ACK
-	go func() {
-		defer sess.markDead()
-		var lenHdr [2]byte
-		for {
-			_ = rawConn.SetReadDeadline(time.Now().Add(45 * time.Second))
-			if _, err := io.ReadFull(ctrl.br, lenHdr[:]); err != nil {
-				errors.LogDebug(bgCtx, "[VPNGate] OpenVPN 槽位断开或超时 (", slotKey, "): ", err)
-				return
-			}
-			pktLen := int(binary.BigEndian.Uint16(lenHdr[:]))
-			if pktLen <= 0 || pktLen > 16384 {
-				return
-			}
-			pkt := make([]byte, pktLen)
-			if _, err := io.ReadFull(ctrl.br, pkt); err != nil {
-				return
-			}
-			opcode := pkt[0] >> 3
-			if opcode == 4 || opcode == 8 {
-				ackLen := int(pkt[9])
-				pos := 10 + 4*ackLen
-				if ackLen > 0 {
-					pos += 8
-				}
-				if pos+4 <= len(pkt) {
-					remotePktID := binary.BigEndian.Uint32(pkt[pos : pos+4])
-					_ = ctrl.sendAck(remotePktID)
-				}
-				continue
-			}
-			if opcode != 6 {
-				continue
-			}
-			if len(pkt) < 1+hmacSize+16+16 {
-				continue
-			}
-			recvMAC := pkt[1 : 1+hmacSize]
-			encBody := pkt[1+hmacSize:]
-			mac := hmac.New(newAuthHash, hmacRecvKey)
-			mac.Write(encBody)
-			if !hmac.Equal(recvMAC, mac.Sum(nil)) {
-				continue
-			}
-			iv := encBody[:16]
-			ct := encBody[16:]
-			if len(ct)%16 != 0 {
-				continue
-			}
-			pt := make([]byte, len(ct))
-			cipher.NewCBCDecrypter(recvCipherBlk, iv).CryptBlocks(pt, ct)
-			padLen := int(pt[len(pt)-1])
-			if padLen < 1 || padLen > 16 || padLen > len(pt) {
-				continue
-			}
-			plain := pt[:len(pt)-padLen]
-			if len(plain) > 4 {
-				ipPkt := plain[4:]
-				if ipPkt[0] == 0xfa && len(ipPkt) > 1 {
-					ipPkt = ipPkt[1:]
-				}
-				if (ipPkt[0] >> 4) == 4 {
-					pBuf := stack.NewPacketBuffer(stack.PacketBufferOptions{
-						Payload: buffer.MakeWithData(ipPkt),
-					})
-					ep.InjectInbound(header.IPv4ProtocolNumber, pBuf)
-					pBuf.DecRef()
-				}
-			}
-		}
-	}()
 
 	// 上行: gVisor 读取 IPv4 -> P_DATA_V1 加密发送
 	go func() {
@@ -2623,7 +3023,7 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 				return
 			}
 			v := pkt.ToView()
-			wErr := sendEncryptedPayload(v.AsSlice())
+			wErr := sendEncryptedPayload(v.AsSlice(), true)
 			v.Release()
 			pkt.DecRef()
 			if wErr != nil {
@@ -2632,18 +3032,18 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 		}
 	}()
 
-	// OpenVPN 数据通道心跳保活
+	// 每 3 秒发送 OCC Ping 心跳，对齐 SoftEther ping 3 / ping-restart 10 阈值
 	go func() {
 		defer sess.markDead()
 		ovpnPing := []byte{0x2a, 0x18, 0x7b, 0xf3, 0x64, 0x1e, 0xb4, 0xcb, 0x07, 0xed, 0x2d, 0x0a, 0x98, 0x1f, 0xc7, 0x48}
-		ticker := time.NewTicker(12 * time.Second)
+		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-sess.dead:
 				return
 			case <-ticker.C:
-				if err := sendEncryptedPayload(ovpnPing); err != nil {
+				if err := sendEncryptedPayload(ovpnPing, false); err != nil {
 					return
 				}
 			}
@@ -2659,7 +3059,11 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 
 	time.Sleep(80 * time.Millisecond)
 
-	errors.LogInfo(bgCtx, fmt.Sprintf("[VPNGate] 隧道槽位就绪 (%s) | 协议: OpenVPN-TCP | 端口: %d | IP: %s", slotKey, targetDest.Port, localIP.String()))
+	protoLabel := "OpenVPN-TCP"
+	if useUDP {
+		protoLabel = "OpenVPN-UDP"
+	}
+	errors.LogInfo(bgCtx, fmt.Sprintf("[VPNGate] 隧道槽位就绪 (%s) | 协议: %s | 端口: %d | IP: %s", slotKey, protoLabel, targetDest.Port, localIP.String()))
 
 	slotBackoff.Delete(slotKey)
 	sessMu.Lock()
@@ -2685,18 +3089,30 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
             'if u == "vpn" || u == "vpngate" {\n\t\t\tcacheOVPNFromPassword(server.Destination.String(), acc.Password)\n\t\t\treturn true\n\t\t}\n\t\treturn false',
             1,
         )
+
+        # 入口路由: 纯 UDP 节点跳过 SSTP/SoftEther 直连 OpenVPN-UDP；专用 TCP 端口优先试 OpenVPN-TCP
         ovpn_fast_hook = """
 	{
 		ovpnCfg := getOrDefaultOVPNConfig(baseKey)
 		pCached, _ := ovpnProtoCache.Load(baseKey)
-		isDedicatedOVPNPort := serverDest.Port != 443 && serverDest.Port != 995 && serverDest.Port != 5555
-		if pCached == "openvpn" || (pCached == nil && isDedicatedOVPNPort) {
-			sess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg)
+		if ovpnCfg.mode == "udp" || pCached == "openvpn-udp" {
+			sess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, true)
 			if ovpnErr == nil {
-				ovpnProtoCache.Store(baseKey, "openvpn")
+				ovpnProtoCache.Store(baseKey, "openvpn-udp")
 				return sess, nil
 			}
-			errors.LogDebug(bgCtx, "[VPNGate] OpenVPN 直连未命中，继续尝试 SoftEther/SSTP (", slotKey, "): ", ovpnErr)
+			errors.LogDebug(bgCtx, "[VPNGate] OpenVPN-UDP 拨号失败 (", slotKey, "): ", ovpnErr)
+			recordNodeFailureIfNeeded(baseKey, isBackground, ovpnErr)
+			return nil, ovpnErr
+		}
+		isDedicatedOVPNPort := serverDest.Port != 443 && serverDest.Port != 995 && serverDest.Port != 5555
+		if pCached == "openvpn-tcp" || (pCached == nil && isDedicatedOVPNPort) {
+			sess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, false)
+			if ovpnErr == nil {
+				ovpnProtoCache.Store(baseKey, "openvpn-tcp")
+				return sess, nil
+			}
+			errors.LogDebug(bgCtx, "[VPNGate] OpenVPN-TCP 直连未命中，继续尝试 SoftEther/SSTP (", slotKey, "): ", ovpnErr)
 		}
 	}
 """
@@ -2706,12 +3122,22 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
             1,
         )
 
+        # TCP (SSTP + SoftEther) 均失败后的回退链: 先试 OpenVPN-TCP，若配置含 UDP 端口再兜底 OpenVPN-UDP
         ovpn_fallback_hook = """
-		if sess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, getOrDefaultOVPNConfig(baseKey)); ovpnErr == nil {
-			ovpnProtoCache.Store(baseKey, "openvpn")
+		ovpnCfg := getOrDefaultOVPNConfig(baseKey)
+		if sess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, false); ovpnErr == nil {
+			ovpnProtoCache.Store(baseKey, "openvpn-tcp")
 			return sess, nil
 		} else {
-			errors.LogDebug(bgCtx, "[VPNGate] OpenVPN 回退也失败 (", slotKey, "): ", ovpnErr)
+			errors.LogDebug(bgCtx, "[VPNGate] OpenVPN-TCP 回退未命中 (", slotKey, "): ", ovpnErr)
+		}
+		if ovpnCfg.mode == "both" && ovpnCfg.udpPort > 0 {
+			if sess, udpErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, true); udpErr == nil {
+				ovpnProtoCache.Store(baseKey, "openvpn-udp")
+				return sess, nil
+			} else {
+				errors.LogDebug(bgCtx, "[VPNGate] OpenVPN-UDP 兜底也失败 (", slotKey, "): ", udpErr)
+			}
 		}
 """
         vg_code = vg_code.replace(
@@ -2722,6 +3148,6 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 
         with open(vg_file, "w", encoding="utf-8") as f:
             f.write(vg_code)
-        print("  ✔ [VPNGate OpenVPN] 成功注入三协议免证书自适应 (SSTP + SoftEther + OpenVPN)")
+        print("  ✔ [VPNGate OpenVPN] 成功注入 TCP/UDP 双栈自适应引擎")
 
 print(">>> 全部兼容、提速与安全加固补丁写入完毕！")
