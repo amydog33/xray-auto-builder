@@ -3078,7 +3078,7 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
     with open(vg_file, "r", encoding="utf-8") as f:
         vg_code = f.read()
 
-	if "dialOpenVPNSession" not in vg_code:
+    if "dialOpenVPNSession" not in vg_code:
         vg_code = vg_code.replace(
             "_ = tlsConn.SetDeadline(time.Now().Add(6 * time.Second))",
             "_ = tlsConn.SetDeadline(time.Now().Add(2500 * time.Millisecond))",
@@ -3090,78 +3090,78 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
             1,
         )
 
-        # 修复1: 纯 UDP 直接拨 UDP；非 443/995/5555 专用端口先试 OVPN-TCP，若失败且有 UDP 端口立即切换试 OVPN-UDP，均失败直接冷却退出（绝不再去死端口重拨 SSTP）
-        ovpn_fast_hook = """
-	{
-		ovpnCfg := getOrDefaultOVPNConfig(baseKey)
-		pCached, _ := ovpnProtoCache.Load(baseKey)
-		if ovpnCfg.mode == "udp" || pCached == "openvpn-udp" {
-			sess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, true)
-			if ovpnErr == nil {
-				ovpnProtoCache.Store(baseKey, "openvpn-udp")
-				return sess, nil
-			}
-			errors.LogDebug(bgCtx, "[VPNGate] OpenVPN-UDP 拨号失败 (", slotKey, "): ", ovpnErr)
-			recordNodeFailureIfNeeded(baseKey, isBackground, ovpnErr)
-			return nil, ovpnErr
-		}
-		isDedicatedOVPNPort := serverDest.Port != 443 && serverDest.Port != 995 && serverDest.Port != 5555
-		if pCached == "openvpn-tcp" || (pCached == nil && isDedicatedOVPNPort) {
-			sess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, false)
-			if ovpnErr == nil {
-				ovpnProtoCache.Store(baseKey, "openvpn-tcp")
-				return sess, nil
-			}
-			errors.LogDebug(bgCtx, "[VPNGate] OpenVPN-TCP 未命中 (", slotKey, "): ", ovpnErr)
-			if ovpnCfg.udpPort > 0 {
-				if udpSess, udpErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, true); udpErr == nil {
-					ovpnProtoCache.Store(baseKey, "openvpn-udp")
-					return udpSess, nil
-				} else {
-					errors.LogDebug(bgCtx, "[VPNGate] OpenVPN-UDP 切换也失败 (", slotKey, "): ", udpErr)
-				}
-			}
-			if isDedicatedOVPNPort {
-				recordNodeFailureIfNeeded(baseKey, isBackground, ovpnErr)
-				return nil, ovpnErr
-			}
-		}
-	}
-"""
+        ovpn_fast_hook = (
+            "\n\t{\n"
+            "\t\tovpnCfg := getOrDefaultOVPNConfig(baseKey)\n"
+            "\t\tpCached, _ := ovpnProtoCache.Load(baseKey)\n"
+            '\t\tif ovpnCfg.mode == "udp" || pCached == "openvpn-udp" {\n'
+            "\t\t\tsess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, true)\n"
+            "\t\t\tif ovpnErr == nil {\n"
+            '\t\t\t\tovpnProtoCache.Store(baseKey, "openvpn-udp")\n'
+            "\t\t\t\treturn sess, nil\n"
+            "\t\t\t}\n"
+            '\t\t\terrors.LogDebug(bgCtx, "[VPNGate] OpenVPN-UDP 拨号失败 (", slotKey, "): ", ovpnErr)\n'
+            "\t\t\trecordNodeFailureIfNeeded(baseKey, isBackground, ovpnErr)\n"
+            "\t\t\treturn nil, ovpnErr\n"
+            "\t\t}\n"
+            "\t\tisDedicatedOVPNPort := serverDest.Port != 443 && serverDest.Port != 995 && serverDest.Port != 5555\n"
+            '\t\tif pCached == "openvpn-tcp" || (pCached == nil && isDedicatedOVPNPort) {\n'
+            "\t\t\tsess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, false)\n"
+            "\t\t\tif ovpnErr == nil {\n"
+            '\t\t\t\tovpnProtoCache.Store(baseKey, "openvpn-tcp")\n'
+            "\t\t\t\treturn sess, nil\n"
+            "\t\t\t}\n"
+            '\t\t\terrors.LogDebug(bgCtx, "[VPNGate] OpenVPN-TCP 未命中 (", slotKey, "): ", ovpnErr)\n'
+            "\t\t\tif ovpnCfg.udpPort > 0 {\n"
+            "\t\t\t\tif udpSess, udpErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, true); udpErr == nil {\n"
+            '\t\t\t\t\tovpnProtoCache.Store(baseKey, "openvpn-udp")\n'
+            "\t\t\t\t\treturn udpSess, nil\n"
+            "\t\t\t\t} else {\n"
+            '\t\t\t\t\terrors.LogDebug(bgCtx, "[VPNGate] OpenVPN-UDP 切换也失败 (", slotKey, "): ", udpErr)\n'
+            "\t\t\t\t}\n"
+            "\t\t\t}\n"
+            "\t\t\tif isDedicatedOVPNPort {\n"
+            "\t\t\t\trecordNodeFailureIfNeeded(baseKey, isBackground, ovpnErr)\n"
+            "\t\t\t\treturn nil, ovpnErr\n"
+            "\t\t\t}\n"
+            "\t\t}\n"
+            "\t}\n"
+        )
         vg_code = vg_code.replace(
             "bgCtx := context.Background()",
             "bgCtx := context.Background()" + ovpn_fast_hook,
             1,
         )
 
-        # 修复2: 当 443/995/5555 端口的 TLS 握手直接失败（如 TCP 端口被封）时，若该节点配有 UDP 端口，在退出前自动尝试 OpenVPN-UDP
-        tls_fail_udp_hook = """if err := tlsConn.HandshakeContext(dialCtx); err != nil {
-		rawConn.Close()
-		if ovpnCfg := getOrDefaultOVPNConfig(baseKey); ovpnCfg.udpPort > 0 {
-			if udpSess, udpErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, true); udpErr == nil {
-				ovpnProtoCache.Store(baseKey, "openvpn-udp")
-				return udpSess, nil
-			}
-		}"""
+        tls_fail_udp_hook = (
+            "if err := tlsConn.HandshakeContext(dialCtx); err != nil {\n"
+            "\t\trawConn.Close()\n"
+            "\t\tif ovpnCfg := getOrDefaultOVPNConfig(baseKey); ovpnCfg.udpPort > 0 {\n"
+            "\t\t\tif udpSess, udpErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, true); udpErr == nil {\n"
+            '\t\t\t\tovpnProtoCache.Store(baseKey, "openvpn-udp")\n'
+            "\t\t\t\treturn udpSess, nil\n"
+            "\t\t\t}\n"
+            "\t\t}"
+        )
         vg_code = vg_code.replace(
             "if err := tlsConn.HandshakeContext(dialCtx); err != nil {\n\t\trawConn.Close()",
             tls_fail_udp_hook,
             1,
         )
 
-        ovpn_fallback_hook = """
-		ovpnCfg := getOrDefaultOVPNConfig(baseKey)
-		if sess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, false); ovpnErr == nil {
-			ovpnProtoCache.Store(baseKey, "openvpn-tcp")
-			return sess, nil
-		}
-		if ovpnCfg.udpPort > 0 {
-			if sess, udpErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, true); udpErr == nil {
-				ovpnProtoCache.Store(baseKey, "openvpn-udp")
-				return sess, nil
-			}
-		}
-"""
+        ovpn_fallback_hook = (
+            "\n\t\tovpnCfg := getOrDefaultOVPNConfig(baseKey)\n"
+            "\t\tif sess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, false); ovpnErr == nil {\n"
+            '\t\t\tovpnProtoCache.Store(baseKey, "openvpn-tcp")\n'
+            "\t\t\treturn sess, nil\n"
+            "\t\t}\n"
+            "\t\tif ovpnCfg.udpPort > 0 {\n"
+            "\t\t\tif sess, udpErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, true); udpErr == nil {\n"
+            '\t\t\t\tovpnProtoCache.Store(baseKey, "openvpn-udp")\n'
+            "\t\t\t\treturn sess, nil\n"
+            "\t\t\t}\n"
+            "\t\t}\n"
+        )
         vg_code = vg_code.replace(
             "if nativeErr != nil {",
             "if nativeErr != nil {" + ovpn_fallback_hook,
@@ -3171,5 +3171,3 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
         with open(vg_file, "w", encoding="utf-8") as f:
             f.write(vg_code)
         print("  ✔ [VPNGate OpenVPN] 成功注入 TCP/UDP 双栈自适应引擎")
-
-print(">>> 全部兼容、提速与安全加固补丁写入完毕！")
