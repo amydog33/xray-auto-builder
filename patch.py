@@ -2057,13 +2057,15 @@ func openvpnPRF(secret, label, seed []byte, outLen int) []byte {
 }
 
 type ovpnControlConn struct {
-	raw       net.Conn
-	localSID  [8]byte
-	remoteSID [8]byte
-	hasRemote bool
-	outPktID  uint32
-	writeMu   sync.Mutex
-	readBuf   []byte
+	raw        net.Conn
+	localSID   [8]byte
+	remoteSID  [8]byte
+	hasRemote  bool
+	outPktID   uint32
+	nextRecvID uint32
+	outOfOrder map[uint32][]byte
+	writeMu    sync.Mutex
+	readBuf    []byte
 }
 
 func (c *ovpnControlConn) writeRawPacket(pkt []byte) error {
@@ -2147,8 +2149,31 @@ func (c *ovpnControlConn) Read(b []byte) (int, error) {
 			remotePktID := binary.BigEndian.Uint32(pkt[pos : pos+4])
 			pos += 4
 			_ = c.sendAck(remotePktID)
-			if opcode == 4 && pos < len(pkt) {
-				c.readBuf = append(c.readBuf, pkt[pos:]...)
+
+			// 过滤 OpenVPN 可靠传输层的重复重传帧，防止重复密文破坏 TLS 状态机
+			if remotePktID < c.nextRecvID {
+				continue
+			}
+			if opcode == 8 {
+				if remotePktID == c.nextRecvID {
+					c.nextRecvID++
+				}
+				continue
+			}
+			if pos < len(pkt) {
+				payload := append([]byte(nil), pkt[pos:]...)
+				c.outOfOrder[remotePktID] = payload
+			} else if remotePktID == c.nextRecvID {
+				c.nextRecvID++
+			}
+			for {
+				chunk, ok := c.outOfOrder[c.nextRecvID]
+				if !ok {
+					break
+				}
+				c.readBuf = append(c.readBuf, chunk...)
+				delete(c.outOfOrder, c.nextRecvID)
+				c.nextRecvID++
 			}
 		}
 	}
@@ -2179,7 +2204,10 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 		return nil, err
 	}
 
-	ctrl := &ovpnControlConn{raw: rawConn}
+	ctrl := &ovpnControlConn{
+		raw:        rawConn,
+		outOfOrder: make(map[uint32][]byte),
+	}
 	_, _ = rand.Read(ctrl.localSID[:])
 
 	_ = rawConn.SetDeadline(time.Now().Add(15 * time.Second))
@@ -2245,7 +2273,6 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 		return nil, err
 	}
 
-	// 读取服务端 Key Method 2 头: 4B(0) + 1B(key_method) + 32B(sRand1) + 32B(sRand2) = 69B
 	var srvKMHdr [69]byte
 	if _, err := io.ReadFull(tlsConn, srvKMHdr[:]); err != nil {
 		rawConn.Close()
@@ -2254,7 +2281,6 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 	sRand1 := srvKMHdr[5:37]
 	sRand2 := srvKMHdr[37:69]
 
-	// 排空服务端 KM2 中的 options、username、password 字段，避免残留字节污染后续 PUSH_REPLY
 	drainTLSField := func() error {
 		var lHdr [2]byte
 		if _, err := io.ReadFull(tlsConn, lHdr[:]); err != nil {
@@ -2289,7 +2315,6 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 		return nil, err
 	}
 
-	// 循环读取直到收齐 PUSH_REPLY（兼容分片与前置控制消息）
 	var assignedIP []byte
 	var pushAcc strings.Builder
 	pushBuf := make([]byte, 2048)
@@ -2543,7 +2568,6 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
         vg_code = f.read()
 
     if "dialOpenVPNSession" not in vg_code:
-        # 缩短 SSTP 试探超时为 2.5s，加快回退速度
         vg_code = vg_code.replace(
             "_ = tlsConn.SetDeadline(time.Now().Add(6 * time.Second))",
             "_ = tlsConn.SetDeadline(time.Now().Add(2500 * time.Millisecond))",
@@ -2566,6 +2590,10 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 				return sess, nil
 			}
 			errors.LogDebug(bgCtx, "[VPNGate] OpenVPN 直连未命中 (", slotKey, "): ", ovpnErr)
+			if isDedicatedOVPNPort {
+				recordNodeFailureIfNeeded(baseKey, isBackground, ovpnErr)
+				return nil, ovpnErr
+			}
 		}
 	}
 """
