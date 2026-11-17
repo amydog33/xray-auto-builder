@@ -2517,7 +2517,7 @@ func (c *ovpnControlConn) Read(b []byte) (int, error) {
 }
 
 func (c *ovpnControlConn) Close() error {
-	c.fail(net.ErrClosed)
+	c.fail(io.ErrClosedPipe)
 	return c.pktIO.Close()
 }
 func (c *ovpnControlConn) LocalAddr() net.Addr                { return c.pktIO.LocalAddr() }
