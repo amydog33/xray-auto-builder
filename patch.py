@@ -930,7 +930,7 @@ func dialSlotSession(ctx context.Context, serverDest net.Destination, dialer int
 		errors.LogWarning(bgCtx, fmt.Sprintf("[VPNGate-SSL/SSTP] %s 全候选端口 TLS 均不可达: %v", baseKey, sstpErr))
 	}
 
-	if ovpnCfg.tcpPort > 0 && ovpnCfg.tcpPort != serverDest.Port {
+	if ovpnCfg.tcpPort > 0 && net.Port(ovpnCfg.tcpPort) != serverDest.Port {
 		if ovpnSess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, false, 5000*time.Millisecond); ovpnErr == nil {
 			ovpnProtoCache.Store(baseKey, "openvpn-tcp")
 			return ovpnSess, nil
