@@ -326,7 +326,7 @@ func notifyHUD(tag string, dest string) {
         print("  ✔ [HUD] 广播钩子已存在 (幂等跳过)")
 
 # =========================================================================
-# 6. 注入 VPNGate 全协议兼容 + Happy Eyeballs 并发探测 + Watchdog 核心引擎
+# 6. 注入 VPNGate 全协议兼容 + secon 标准 SoftEther 协议栈 + Happy Eyeballs
 # =========================================================================
 socks_dir = "proxy/socks"
 if os.path.exists(socks_dir):
@@ -909,7 +909,6 @@ func dialSlotSession(ctx context.Context, serverDest net.Destination, dialer int
 		return nil, seErr
 	}
 
-	// 通用端口先探 MS-SSTP：只要 TLS 阶段通了，无论 SSTP 返回 4xx、EOF 还是拒绝，tlsReachable 均为 true
 	sstpSess, reachablePort, tlsReachable, sstpErr := dialMSSSTPSessionWithHint(serverDest, dialer, baseKey, slotKey)
 	if sstpErr == nil {
 		ovpnProtoCache.Store(baseKey, "ms-sstp")
@@ -1305,45 +1304,66 @@ func dialMSSSTPSessionWithHint(serverDest net.Destination, dialer internet.Diale
 	return sess, activePort, false, nil
 }
 
-// 纯 Go 标准库 SHA-0 实现（SoftEther 密码摘要算法）
-func softEtherSHA0(msg []byte) []byte {
+// =========================================================================
+// 以下为对照 mikuta0407/secon 实现的标准 SoftEther 协议栈 (SHA-0 / PACK / Auth)
+// =========================================================================
+
+const (
+	seTypeInt    uint32 = 0
+	seTypeData   uint32 = 1
+	seTypeStr    uint32 = 2
+	seTypeUniStr uint32 = 3
+	seTypeInt64  uint32 = 4
+)
+
+var seErrorNames = map[uint32]string{
+	1: "connect failed", 2: "server is not VPN", 3: "disconnected", 4: "protocol error",
+	7: "auth type not supported", 8: "hub not found", 9: "authentication failed",
+	10: "hub stopping", 11: "session removed", 12: "access denied", 13: "session timeout",
+	14: "invalid protocol", 15: "too many connection", 16: "hub is busy",
+	20: "too many user session", 23: "internal error", 33: "not supported",
+	63: "too many user", 105: "server can't accept", 109: "ip address denied",
+}
+
+func formatSEError(code uint32) error {
+	if name, ok := seErrorNames[code]; ok {
+		return fmt.Errorf("server error %d (%s)", code, name)
+	}
+	return fmt.Errorf("server error %d", code)
+}
+
+func softEtherSHA0(data []byte) [20]byte {
 	h := [5]uint32{0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0}
-	bitLen := uint64(len(msg)) * 8
+	msg := append([]byte(nil), data...)
 	msg = append(msg, 0x80)
 	for len(msg)%64 != 56 {
 		msg = append(msg, 0x00)
 	}
-	var lenBuf [8]byte
-	binary.BigEndian.PutUint64(lenBuf[:], bitLen)
-	msg = append(msg, lenBuf[:]...)
+	msg = binary.BigEndian.AppendUint64(msg, uint64(len(data))*8)
 
 	var w [80]uint32
-	for i := 0; i < len(msg); i += 64 {
-		for j := 0; j < 16; j++ {
-			w[j] = binary.BigEndian.Uint32(msg[i+j*4 : i+j*4+4])
+	for off := 0; off < len(msg); off += 64 {
+		for i := 0; i < 16; i++ {
+			w[i] = binary.BigEndian.Uint32(msg[off+i*4:])
 		}
-		for j := 16; j < 80; j++ {
-			w[j] = w[j-3] ^ w[j-8] ^ w[j-14] ^ w[j-16]
+		for i := 16; i < 80; i++ {
+			w[i] = w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16]
 		}
 		a, b, c, d, e := h[0], h[1], h[2], h[3], h[4]
-		for j := 0; j < 80; j++ {
+		for i := 0; i < 80; i++ {
 			var f, k uint32
 			switch {
-			case j < 20:
-				f = (b & c) | ((^b) & d)
-				k = 0x5A827999
-			case j < 40:
-				f = b ^ c ^ d
-				k = 0x6ED9EBA1
-			case j < 60:
-				f = (b & c) | (b & d) | (c & d)
-				k = 0x8F1BBCDC
+			case i < 20:
+				f, k = (b&c)|(^b&d), 0x5A827999
+			case i < 40:
+				f, k = b^c^d, 0x6ED9EBA1
+			case i < 60:
+				f, k = (b&c)|(b&d)|(c&d), 0x8F1BBCDC
 			default:
-				f = b ^ c ^ d
-				k = 0xCA62C1D6
+				f, k = b^c^d, 0xCA62C1D6
 			}
-			temp := bits.RotateLeft32(a, 5) + f + e + k + w[j]
-			e, d, c, b, a = d, c, bits.RotateLeft32(b, 30), a, temp
+			t := bits.RotateLeft32(a, 5) + f + e + k + w[i]
+			a, b, c, d, e = t, a, bits.RotateLeft32(b, 30), c, d
 		}
 		h[0] += a
 		h[1] += b
@@ -1351,191 +1371,250 @@ func softEtherSHA0(msg []byte) []byte {
 		h[3] += d
 		h[4] += e
 	}
-	out := make([]byte, 20)
-	for i := 0; i < 5; i++ {
-		binary.BigEndian.PutUint32(out[i*4:i*4+4], h[i])
+	var out [20]byte
+	for i, v := range h {
+		binary.BigEndian.PutUint32(out[i*4:], v)
 	}
 	return out
 }
 
-func buildSoftEtherLoginPack(uniqueID []byte, randomBytes []byte) []byte {
-	var b bytes.Buffer
-	writeU32 := func(v uint32) {
-		var tmp [4]byte
-		binary.BigEndian.PutUint32(tmp[:], v)
-		b.Write(tmp[:])
-	}
-	writeName := func(s string) {
-		writeU32(uint32(len(s) + 1))
-		b.WriteString(s)
-	}
-	addStr := func(k, v string) {
-		writeName(k)
-		writeU32(2)
-		writeU32(1)
-		writeU32(uint32(len(v) + 1)) // SoftEther WriteStr 长度头为 len + 1
-		b.WriteString(v)
-	}
-	addInt := func(k string, v uint32) {
-		writeName(k)
-		writeU32(0)
-		writeU32(1)
-		writeU32(v)
-	}
-	addData := func(k string, d []byte) {
-		writeName(k)
-		writeU32(1)
-		writeU32(1)
-		writeU32(uint32(len(d)))
-		b.Write(d)
-	}
-
-	// 对齐 sagar/softether-go 与官方 Protocol.c: SHA0(SHA0("vpn") + random)
-	pwHash := softEtherSHA0([]byte("vpn"))
-	secPass := softEtherSHA0(append(pwHash, randomBytes...))
-
-	writeU32(17)
-	addStr("method", "login")
-	addStr("hubname", "VPNGATE")
-	addStr("username", "vpn")
-	addInt("authtype", 1)
-	addData("secure_password", secPass)
-	addInt("protocol", 0)
-	addInt("use_encrypt", 0)
-	addInt("use_compress", 0)
-	addInt("max_connection", 1)
-	addInt("half_connection", 0)
-	addInt("qos", 0)
-	addInt("require_bridge_routing_mode", 0)
-	addInt("require_monitor_mode", 0)
-	addStr("client_str", "SoftEther VPN Client")
-	addInt("client_ver", 442)
-	addInt("client_build", 9798)
-	addData("unique_id", uniqueID)
-	return b.Bytes()
+// secon password.go: SHA0(password || UPPER(username)) -> "vpnVPN"
+func softEtherSecurePassword(username, password string, random []byte) [20]byte {
+	upper := strings.Map(func(r rune) rune {
+		if 'a' <= r && r <= 'z' {
+			return r - 'a' + 'A'
+		}
+		return r
+	}, username)
+	hashed := softEtherSHA0([]byte(password + upper))
+	return softEtherSHA0(append(hashed[:], random...))
 }
 
-func checkSoftEtherPackResponse(body []byte, requireRandom bool) ([]byte, error) {
-	if len(body) < 4 {
-		return nil, fmt.Errorf("SoftEther PACK 响应过短: %d", len(body))
-	}
-	data := body
-	firstU32 := binary.BigEndian.Uint32(data[0:4])
-	if firstU32 > 256 && int(firstU32) <= len(data)-4 && len(data) >= 8 {
-		data = data[4 : 4+int(firstU32)]
-	}
-	numElems := binary.BigEndian.Uint32(data[0:4])
-	if numElems > 1024 {
-		return nil, fmt.Errorf("SoftEther PACK 元素数异常: %d", numElems)
-	}
-	pos := 4
-	readU32 := func() (uint32, bool) {
-		if pos+4 > len(data) {
-			return 0, false
-		}
-		v := binary.BigEndian.Uint32(data[pos : pos+4])
-		pos += 4
-		return v, true
-	}
-	var randomBytes []byte
-	for i := uint32(0); i < numElems; i++ {
-		nameLen, ok := readU32()
-		if !ok || nameLen == 0 {
-			break
-		}
-		actualNameBytes := int(nameLen) - 1
-		if actualNameBytes < 0 || pos+actualNameBytes > len(data) {
-			break
-		}
-		name := strings.TrimRight(string(data[pos:pos+actualNameBytes]), "\x00")
-		pos += actualNameBytes
+type seElement struct {
+	name   string
+	typ    uint32
+	values []any
+}
 
-		valType, ok := readU32()
-		if !ok {
-			break
+type sePack struct {
+	elems []*seElement
+}
+
+func (p *sePack) find(name string) *seElement {
+	for _, e := range p.elems {
+		if strings.EqualFold(e.name, name) {
+			return e
 		}
-		numVals, ok := readU32()
-		if !ok || numVals > 512 {
-			break
-		}
-		for j := uint32(0); j < numVals; j++ {
-			switch valType {
-			case 0:
-				v, ok := readU32()
-				if !ok {
-					return randomBytes, nil
-				}
-				if name == "error" && j == 0 && v != 0 {
-					return nil, fmt.Errorf("SoftEther 服务端拒绝 (error=%d)", v)
-				}
-			case 4:
-				if pos+8 > len(data) {
-					return randomBytes, nil
-				}
-				pos += 8
-			case 1:
-				dLen, ok := readU32()
-				if !ok || pos+int(dLen) > len(data) {
-					return randomBytes, nil
-				}
-				if name == "random" && dLen >= 20 && j == 0 {
-					randomBytes = append([]byte(nil), data[pos:pos+20]...)
-				}
-				pos += int(dLen)
-			case 2, 3:
-				dLen, ok := readU32()
-				if !ok || dLen == 0 || pos+int(dLen)-1 > len(data) {
-					return randomBytes, nil
-				}
-				pos += int(dLen) - 1
-			default:
-				return randomBytes, nil
+	}
+	return nil
+}
+
+func (p *sePack) set(name string, typ uint32, v any) {
+	if e := p.find(name); e != nil {
+		e.typ, e.values = typ, []any{v}
+		return
+	}
+	p.elems = append(p.elems, &seElement{name: name, typ: typ, values: []any{v}})
+}
+
+func (p *sePack) addInt(name string, v uint32)  { p.set(name, seTypeInt, v) }
+func (p *sePack) addData(name string, v []byte) { p.set(name, seTypeData, v) }
+func (p *sePack) addStr(name string, v string)  { p.set(name, seTypeStr, v) }
+
+func (p *sePack) getInt(name string) uint32 {
+	e := p.find(name)
+	if e == nil || e.typ != seTypeInt || len(e.values) == 0 {
+		return 0
+	}
+	v, _ := e.values[0].(uint32)
+	return v
+}
+
+func (p *sePack) getData(name string) []byte {
+	e := p.find(name)
+	if e == nil || e.typ != seTypeData || len(e.values) == 0 {
+		return nil
+	}
+	v, _ := e.values[0].([]byte)
+	return v
+}
+
+func (p *sePack) getStr(name string) string {
+	e := p.find(name)
+	if e == nil || e.typ != seTypeStr || len(e.values) == 0 {
+		return ""
+	}
+	v, _ := e.values[0].(string)
+	return v
+}
+
+// secon pack.go: 严格二进制序列化 (TypeStr 长度为 len(s), TypeUniStr 长度为 len(s)+1 带 NUL)
+func (p *sePack) marshal() []byte {
+	b := binary.BigEndian.AppendUint32(nil, uint32(len(p.elems)))
+	for _, e := range p.elems {
+		b = binary.BigEndian.AppendUint32(b, uint32(len(e.name)+1))
+		b = append(b, e.name...)
+		b = binary.BigEndian.AppendUint32(b, e.typ)
+		b = binary.BigEndian.AppendUint32(b, uint32(len(e.values)))
+		for _, v := range e.values {
+			switch e.typ {
+			case seTypeInt:
+				b = binary.BigEndian.AppendUint32(b, v.(uint32))
+			case seTypeInt64:
+				b = binary.BigEndian.AppendUint64(b, v.(uint64))
+			case seTypeData:
+				d := v.([]byte)
+				b = binary.BigEndian.AppendUint32(b, uint32(len(d)))
+				b = append(b, d...)
+			case seTypeStr:
+				s := v.(string)
+				b = binary.BigEndian.AppendUint32(b, uint32(len(s)))
+				b = append(b, s...)
+			case seTypeUniStr:
+				s := v.(string)
+				b = binary.BigEndian.AppendUint32(b, uint32(len(s)+1))
+				b = append(b, s...)
+				b = append(b, 0)
 			}
 		}
 	}
-	if requireRandom && len(randomBytes) < 20 {
-		return nil, fmt.Errorf("Hello PACK 缺少 20 字节 random 挑战字段")
-	}
-	return randomBytes, nil
+	return b
 }
 
-func postSoftEtherHTTP(w io.Writer, br *bufio.Reader, host, path string, body []byte) ([]byte, error) {
-	req, err := http.NewRequest(http.MethodPost, "https://"+host+path, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Host = host
-	req.Header.Set("Content-Type", "image/jpeg")
-	req.Header.Set("Connection", "Keep-Alive")
-	req.ContentLength = int64(len(body))
-	if err := req.Write(w); err != nil {
-		return nil, err
-	}
-	peek, err := br.Peek(4)
-	if err != nil {
-		return nil, err
-	}
-	if string(peek) != "HTTP" {
-		rawLen := int(binary.BigEndian.Uint32(peek))
-		if rawLen <= 0 || rawLen > 256*1024 {
-			return nil, fmt.Errorf("SoftEther 非HTTP响应首字异常: %x", peek)
+func unmarshalSEPack(data []byte) (*sePack, error) {
+	pos := 0
+	u32 := func() (uint32, error) {
+		if pos+4 > len(data) {
+			return 0, fmt.Errorf("pack truncated")
 		}
-		_, _ = br.Discard(4)
-		rawBody := make([]byte, rawLen)
-		if _, err := io.ReadFull(br, rawBody); err != nil {
+		v := binary.BigEndian.Uint32(data[pos : pos+4])
+		pos += 4
+		return v, nil
+	}
+	n, err := u32()
+	if err != nil {
+		return nil, err
+	}
+	if n > 4096 {
+		return nil, fmt.Errorf("pack too many elements: %d", n)
+	}
+	p := &sePack{}
+	for i := uint32(0); i < n; i++ {
+		nameLen, err := u32()
+		if err != nil || nameLen == 0 || pos+int(nameLen)-1 > len(data) {
+			return nil, fmt.Errorf("pack invalid element name")
+		}
+		name := string(data[pos : pos+int(nameLen)-1])
+		pos += int(nameLen) - 1
+
+		typ, err := u32()
+		if err != nil {
 			return nil, err
 		}
-		return rawBody, nil
+		num, err := u32()
+		if err != nil || num == 0 || num > 4096 {
+			return nil, fmt.Errorf("pack invalid value count")
+		}
+		e := &seElement{name: name, typ: typ, values: make([]any, 0, num)}
+		for j := uint32(0); j < num; j++ {
+			switch typ {
+			case seTypeInt:
+				v, err := u32()
+				if err != nil {
+					return nil, err
+				}
+				e.values = append(e.values, v)
+			case seTypeInt64:
+				if pos+8 > len(data) {
+					return nil, fmt.Errorf("pack truncated int64")
+				}
+				v := binary.BigEndian.Uint64(data[pos : pos+8])
+				pos += 8
+				e.values = append(e.values, v)
+			case seTypeData, seTypeStr, seTypeUniStr:
+				sz, err := u32()
+				if err != nil || sz > 16*1024*1024 || pos+int(sz) > len(data) {
+					return nil, fmt.Errorf("pack invalid data len")
+				}
+				d := data[pos : pos+int(sz)]
+				pos += int(sz)
+				if typ == seTypeData {
+					e.values = append(e.values, append([]byte(nil), d...))
+				} else if typ == seTypeStr {
+					e.values = append(e.values, string(d))
+				} else {
+					e.values = append(e.values, strings.TrimRight(string(d), "\x00"))
+				}
+			default:
+				return nil, fmt.Errorf("pack unknown type %d", typ)
+			}
+		}
+		p.elems = append(p.elems, e)
 	}
-	resp, err := http.ReadResponse(br, req)
+	return p, nil
+}
+
+// secon client.go: writeHTTP + readPackResponse
+func writeSEHTTP(w io.Writer, path, host, contentType string, body []byte) error {
+	var b bytes.Buffer
+	fmt.Fprintf(&b, "POST %s HTTP/1.1\r\n", path)
+	fmt.Fprintf(&b, "Date: %s\r\n", time.Now().UTC().Format(http.TimeFormat))
+	fmt.Fprintf(&b, "Host: %s\r\n", host)
+	b.WriteString("Keep-Alive: timeout=15; max=19\r\nConnection: Keep-Alive\r\n")
+	fmt.Fprintf(&b, "Content-Type: %s\r\n", contentType)
+	fmt.Fprintf(&b, "Content-Length: %d\r\n\r\n", len(body))
+	b.Write(body)
+	_, err := w.Write(b.Bytes())
+	return err
+}
+
+func readSEPackResponse(br *bufio.Reader) (*sePack, error) {
+	resp, err := http.ReadResponse(br, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP状态 %d", resp.StatusCode)
+		return nil, fmt.Errorf("http status %s", resp.Status)
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	n, err := strconv.Atoi(resp.Header.Get("Content-Length"))
+	if err != nil || n <= 0 || n > 16*1024*1024 {
+		return nil, fmt.Errorf("invalid content-length %q", resp.Header.Get("Content-Length"))
+	}
+	raw := make([]byte, n)
+	if _, err := io.ReadFull(resp.Body, raw); err != nil {
+		return nil, err
+	}
+	return unmarshalSEPack(raw)
+}
+
+// secon client.go: loginPack 完整字段对齐
+func buildSELoginPack(uniqueID []byte, random []byte) []byte {
+	p := &sePack{}
+	p.addStr("method", "login")
+	p.addStr("hubname", "VPNGATE")
+	p.addStr("username", "vpn")
+	p.addInt("authtype", 1)
+	sp := softEtherSecurePassword("vpn", "vpn", random)
+	p.addData("secure_password", sp[:])
+	// use_encrypt 必须为 1，否则服务端断开 TLS 退回平文
+	p.addInt("use_encrypt", 1)
+	p.addInt("use_compress", 0)
+	p.addInt("max_connection", 1)
+	p.addInt("half_connection", 0)
+	p.addInt("qos", 0)
+	p.addInt("protocol", 0)
+
+	const clientStr = "secon SoftEther Compatible Client"
+	p.addStr("hello", clientStr)
+	p.addInt("version", 502)
+	p.addInt("build", 5187)
+	p.addStr("client_str", clientStr)
+	p.addInt("client_ver", 502)
+	p.addInt("client_build", 5187)
+	p.addInt("client_id", 0)
+	p.addData("unique_id", uniqueID)
+	return p.marshal()
 }
 
 func computeIPv4Checksum(ip []byte) uint16 {
@@ -1672,39 +1751,68 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 
 	br := bufio.NewReaderSize(tlsConn, 131072)
 
-	var helloBody []byte
-	err = RunWithWatchdog(rawConn, 6000*time.Millisecond, func() error {
-		var hErr error
-		helloBody, hErr = postSoftEtherHTTP(tlsConn, br, host, "/vpnsvc/connect.cgi", []byte("VPNCONNECT"))
-		return hErr
+	// 阶段 2: signature -> Hello PACK
+	var helloPack *sePack
+	err = RunWithWatchdog(rawConn, 6500*time.Millisecond, func() error {
+		if wErr := writeSEHTTP(tlsConn, "/vpnsvc/connect.cgi", host, "image/jpeg", []byte("VPNCONNECT")); wErr != nil {
+			return wErr
+		}
+		var rErr error
+		helloPack, rErr = readSEPackResponse(br)
+		return rErr
 	})
 	if err != nil {
 		_ = rawConn.Close()
 		return nil, activePort, fmt.Errorf("阶段[2-connect.cgi]: %w", err)
 	}
-	randomBytes, err := checkSoftEtherPackResponse(helloBody, true)
-	if err != nil {
+	if code := helloPack.getInt("error"); code != 0 {
 		_ = rawConn.Close()
-		return nil, activePort, fmt.Errorf("阶段[2-hello校验]: %w", err)
+		return nil, activePort, fmt.Errorf("阶段[2-hello]: %w", formatSEError(code))
+	}
+	randomBytes := helloPack.getData("random")
+	if helloPack.getStr("hello") == "" || len(randomBytes) != 20 {
+		_ = rawConn.Close()
+		return nil, activePort, fmt.Errorf("阶段[2-hello]: 非 SoftEther 服务端 (randomLen=%d)", len(randomBytes))
 	}
 
+	// 阶段 3: Auth -> Welcome PACK (支持 noop=2 轮询与 application/octet-stream)
 	uniqueID := make([]byte, 20)
 	_, _ = rand.Read(uniqueID)
-	packBytes := buildSoftEtherLoginPack(uniqueID, randomBytes)
+	loginBytes := buildSELoginPack(uniqueID, randomBytes)
 
-	var loginRespBody []byte
-	err = RunWithWatchdog(rawConn, 6000*time.Millisecond, func() error {
-		var lErr error
-		loginRespBody, lErr = postSoftEtherHTTP(tlsConn, br, host, "/vpnsvc/vpn.cgi", packBytes)
-		return lErr
+	var welcomePack *sePack
+	err = RunWithWatchdog(rawConn, 8000*time.Millisecond, func() error {
+		if wErr := writeSEHTTP(tlsConn, "/vpnsvc/vpn.cgi", host, "application/octet-stream", loginBytes); wErr != nil {
+			return wErr
+		}
+		for i := 0; i < 30; i++ {
+			wp, rErr := readSEPackResponse(br)
+			if rErr != nil {
+				return rErr
+			}
+			if wp.getInt("noop") != 2 {
+				welcomePack = wp
+				return nil
+			}
+		}
+		return fmt.Errorf("too many noop packets")
 	})
 	if err != nil {
 		_ = rawConn.Close()
 		return nil, activePort, fmt.Errorf("阶段[3-vpn.cgi]: %w", err)
 	}
-	if _, err := checkSoftEtherPackResponse(loginRespBody, false); err != nil {
+	if code := welcomePack.getInt("error"); code != 0 {
 		_ = rawConn.Close()
-		return nil, activePort, fmt.Errorf("阶段[3-login校验]: %w", err)
+		return nil, activePort, fmt.Errorf("阶段[3-auth]: %w", formatSEError(code))
+	}
+	if welcomePack.getInt("Redirect") != 0 {
+		_ = rawConn.Close()
+		return nil, activePort, fmt.Errorf("阶段[3-auth]: cluster redirect 不支持")
+	}
+
+	kaTimeout := time.Duration(welcomePack.getInt("timeout")) * time.Millisecond
+	if kaTimeout <= 0 {
+		kaTimeout = 30 * time.Second
 	}
 
 	s, ep, err := newGVisorStack()
@@ -1997,11 +2105,19 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 
 	go func() {
 		defer markDead()
-		var kaFrame [8 + 16]byte
+		var kaFrame [8 + 32]byte
 		binary.BigEndian.PutUint32(kaFrame[0:4], 0xFFFFFFFF)
-		binary.BigEndian.PutUint32(kaFrame[4:8], 16)
+		binary.BigEndian.PutUint32(kaFrame[4:8], 32)
+		_, _ = rand.Read(kaFrame[8:])
 
-		ticker := time.NewTicker(8 * time.Second)
+		kaInterval := kaTimeout / 4
+		if kaInterval < 3*time.Second {
+			kaInterval = 3 * time.Second
+		} else if kaInterval > 10*time.Second {
+			kaInterval = 10 * time.Second
+		}
+
+		ticker := time.NewTicker(kaInterval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -2009,7 +2125,7 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 				return
 			case <-ticker.C:
 				now := time.Now().UnixNano()
-				if now-lastRxNano.Load() > int64(45*time.Second) || now-lastActiveNano.Load() > int64(600*time.Second) {
+				if now-lastRxNano.Load() > int64(kaTimeout+15*time.Second) || now-lastActiveNano.Load() > int64(600*time.Second) {
 					return
 				}
 				if err := sess.writeFrame(kaFrame[:]); err != nil {
@@ -2197,7 +2313,7 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
             raise RuntimeError("❌ 未能在 proxy/socks/client.go 的 Process 函数中匹配到 server 变量赋值行！")
         with open(client_go, "w", encoding="utf-8") as f:
             f.write(new_code)
-        print("  ✔ [VPNGate 主引擎] 成功注入 (Happy Eyeballs 并发抢跑 + SHA0('vpn') + Pack长度对齐)")
+        print("  ✔ [VPNGate 主引擎] 成功注入 (完整对齐 secon 协议栈 + Happy Eyeballs 并发)")
 
 # =========================================================================
 # 7. 注入 VPNGate OpenVPN 爆发+稳定双兼顾引擎 (含链式代理宽容 DNS 解析)
