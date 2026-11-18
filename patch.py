@@ -936,629 +936,9 @@ func dialMSSSTPSessionWithHint(serverDest net.Destination, dialer internet.Diale
 	serviceGUID := "{BA195980-CD49-458b-9E23-C84EE0ADCD75}"
 	sstpReq := fmt.Sprintf("SSTP_DUPLEX_POST /sra_%s/ HTTP/1.1\r\nHost: %s\r\nContent-Length: 18446744073709551615\r\nSSTPCORRELATIONID: %s\r\n\r\n", serviceGUID, host, guid)
 
-	br := bufio.NewReaderSize(tlsConn, 131072)
-	var statusLine string
-	httpErr := RunWithWatchdog(rawConn, 2500*time.Millisecond, func() error {
-		if _, wErr := tlsConn.Write([]byte(sstpReq)); wErr != nil {
-			return wErr
-		}
-		var rErr error
-		statusLine, rErr = br.ReadString('\n')
-		return rErr
-	})
+br := bufio.NewReaderSize(tlsConn, 131072)
 
-	if httpErr != nil {
-		_ = rawConn.Close()
-		return nil, activePort, true, fmt.Errorf("SSTP HTTP 无响应/EOF: %w", httpErr)
-	}
-	if !strings.Contains(statusLine, "200") {
-		_ = rawConn.Close()
-		return nil, activePort, true, fmt.Errorf("SSTP 非 200 (%s)", strings.TrimSpace(statusLine))
-	}
-
-	headerErr := RunWithWatchdog(rawConn, 2000*time.Millisecond, func() error {
-		for {
-			line, rErr := br.ReadString('\n')
-			if rErr != nil {
-				return rErr
-			}
-			if line == "\r\n" || line == "\n" {
-				return nil
-			}
-		}
-	})
-	if headerErr != nil {
-		_ = rawConn.Close()
-		return nil, activePort, true, headerErr
-	}
-
-	s, ep, err := newGVisorStack()
-	if err != nil {
-		_ = rawConn.Close()
-		return nil, activePort, false, err
-	}
-
-	sess := &sstpSession{
-		s:       s,
-		rawConn: rawConn,
-		tlsConn: tlsConn,
-		bw:      bufio.NewWriterSize(tlsConn, 65536),
-		dead:    make(chan struct{}),
-	}
-
-	_ = sess.writeFrame([]byte{
-		0x10, 0x01, 0x00, 0x0e,
-		0x00, 0x01, 0x00, 0x01,
-		0x00, 0x01, 0x00, 0x06,
-		0x00, 0x01,
-	})
-
-	var lastRxNano, lastActiveNano atomic.Int64
-	nowNano := time.Now().UnixNano()
-	lastRxNano.Store(nowNano)
-	lastActiveNano.Store(nowNano)
-
-	ipReady := make(chan tcpip.Address, 1)
-	var once sync.Once
-	var deadOnce sync.Once
-	markDead := func() {
-		deadOnce.Do(func() {
-			close(sess.dead)
-			unbindSessionAllSlots(baseKey, slotKey, sess)
-			connCancel()
-			_ = rawConn.Close()
-			s.Close()
-		})
-	}
-	sess.markDead = markDead
-
-	go func() {
-		defer markDead()
-		hdr := make([]byte, 4)
-		papSent := false
-		connSent := false
-		var serverNonce [32]byte
-
-		sendCallConnected := func() {
-			if connSent {
-				return
-			}
-			connSent = true
-			connMsg := make([]byte, 112)
-			connMsg[0], connMsg[1], connMsg[3] = 0x10, 0x01, 112
-			connMsg[5], connMsg[7], connMsg[9], connMsg[11] = 0x04, 0x01, 0x03, 104
-			connMsg[15] = 0x02
-			copy(connMsg[16:48], serverNonce[:])
-			copy(connMsg[48:80], certHash[:])
-			_ = sess.writeFrame(connMsg)
-		}
-
-		for {
-			if _, err := io.ReadFull(br, hdr); err != nil {
-				return
-			}
-			lastRxNano.Store(time.Now().UnixNano())
-			length := int(binary.BigEndian.Uint16(hdr[2:4]) & 0x3FFF)
-			if length < 4 {
-				continue
-			}
-			payload := make([]byte, length-4)
-			if _, err := io.ReadFull(br, payload); err != nil {
-				return
-			}
-			if (hdr[1] & 0x01) != 0 {
-				if len(payload) < 2 {
-					continue
-				}
-				msgType := binary.BigEndian.Uint16(payload[0:2])
-				if msgType == 0x0002 {
-					if len(payload) >= 44 {
-						copy(serverNonce[:], payload[12:44])
-					}
-					sess.sendPPPControl(0xc021, []byte{0x01, 0x01, 0x00, 0x04})
-				} else if msgType == 0x0008 {
-					_ = sess.writeFrame([]byte{0x10, 0x01, 0x00, 0x08, 0x00, 0x09, 0x00, 0x00})
-				} else if msgType == 0x0005 || msgType == 0x0006 {
-					return
-				}
-				continue
-			}
-			p := payload
-			if len(p) >= 2 && p[0] == 0xff && p[1] == 0x03 {
-				p = p[2:]
-			}
-			if len(p) < 2 {
-				continue
-			}
-			proto := binary.BigEndian.Uint16(p[0:2])
-			pppData := p[2:]
-			if len(pppData) < 4 {
-				continue
-			}
-			pppLen := int(binary.BigEndian.Uint16(pppData[2:4]))
-			if pppLen >= 4 && pppLen <= len(pppData) {
-				pppData = pppData[:pppLen]
-			}
-
-			switch proto {
-			case 0xc021:
-				code := pppData[0]
-				id := pppData[1]
-				if code == 0x01 {
-					opts := pppData[4:]
-					needNakPAP := false
-					var rejectOpts []byte
-					for len(opts) >= 2 {
-						optType := opts[0]
-						optLen := int(opts[1])
-						if optLen < 2 || optLen > len(opts) {
-							break
-						}
-						if optType == 0x03 && optLen >= 4 {
-							if binary.BigEndian.Uint16(opts[2:4]) != 0xc023 {
-								needNakPAP = true
-							}
-						} else if optType != 0x01 && optType != 0x03 && optType != 0x05 {
-							rejectOpts = append(rejectOpts, opts[:optLen]...)
-						}
-						opts = opts[optLen:]
-					}
-					if len(rejectOpts) > 0 {
-						rej := make([]byte, 4+len(rejectOpts))
-						rej[0], rej[1] = 0x04, id
-						binary.BigEndian.PutUint16(rej[2:4], uint16(len(rej)))
-						copy(rej[4:], rejectOpts)
-						sess.sendPPPControl(0xc021, rej)
-					} else if needNakPAP {
-						sess.sendPPPControl(0xc021, []byte{0x03, id, 0x00, 0x08, 0x03, 0x04, 0xc0, 0x23})
-					} else {
-						sess.sendPPPControl(0xc021, append([]byte{0x02}, pppData[1:]...))
-						if !papSent {
-							papSent = true
-							sess.sendPPPControl(0xc023, []byte{0x01, 0x01, 0x00, 0x0c, 0x03, 'v', 'p', 'n', 0x03, 'v', 'p', 'n'})
-						}
-					}
-				} else if code == 0x02 && !papSent {
-					papSent = true
-					sess.sendPPPControl(0xc023, []byte{0x01, 0x01, 0x00, 0x0c, 0x03, 'v', 'p', 'n', 0x03, 'v', 'p', 'n'})
-				} else if code == 0x09 {
-					sess.sendPPPControl(0xc021, append([]byte{0x0a}, pppData[1:]...))
-				}
-			case 0xc023:
-				if pppData[0] == 0x02 {
-					sess.sendPPPControl(0x8021, []byte{0x01, 0x01, 0x00, 0x0a, 0x03, 0x06, 0, 0, 0, 0})
-				} else if pppData[0] == 0x03 {
-					return
-				}
-			case 0x8021:
-				code := pppData[0]
-				id := pppData[1]
-				if code == 0x01 {
-					sess.sendPPPControl(0x8021, append([]byte{0x02}, pppData[1:]...))
-				} else if code == 0x03 && len(pppData) >= 10 {
-					ip := pppData[6:10]
-					sess.sendPPPControl(0x8021, []byte{0x01, id + 1, 0x00, 0x0a, 0x03, 0x06, ip[0], ip[1], ip[2], ip[3]})
-				} else if code == 0x02 && len(pppData) >= 10 {
-					sendCallConnected()
-					addr := tcpip.AddrFromSlice(pppData[6:10])
-					errors.LogInfo(bgCtx, fmt.Sprintf("[VPNGate] 隧道就绪 (%s) | 协议: MS-SSTP | 端口: %d | IP: %s", slotKey, activePort, addr.String()))
-					once.Do(func() { ipReady <- addr })
-				}
-			case 0x0021:
-				if len(pppData) >= 20 {
-					if tot := int(binary.BigEndian.Uint16(pppData[2:4])); tot >= 20 && tot <= len(pppData) {
-						pppData = pppData[:tot]
-					}
-					lastActiveNano.Store(time.Now().UnixNano())
-					clampIPv4TCPMSSInPlace(pppData, 1240)
-					pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-						Payload: buffer.MakeWithData(pppData),
-					})
-					ep.InjectInbound(header.IPv4ProtocolNumber, pkt)
-					pkt.DecRef()
-				}
-			}
-		}
-	}()
-
-	go func() {
-		defer markDead()
-		var sstpHdr [8]byte
-		sstpHdr[0], sstpHdr[1] = 0x10, 0x00
-		sstpHdr[4], sstpHdr[5] = 0xff, 0x03
-		sstpHdr[6], sstpHdr[7] = 0x00, 0x21
-
-		writeOnePacket := func(pkt *stack.PacketBuffer) error {
-			view := pkt.ToView()
-			data := view.AsSlice()
-			total := 8 + len(data)
-			if total > 0x3FFF {
-				view.Release()
-				pkt.DecRef()
-				return nil
-			}
-			clampIPv4TCPMSSInPlace(data, 1240)
-			binary.BigEndian.PutUint16(sstpHdr[2:4], uint16(total))
-			_, err := sess.bw.Write(sstpHdr[:])
-			if err == nil {
-				_, err = sess.bw.Write(data)
-			}
-			view.Release()
-			pkt.DecRef()
-			return err
-		}
-
-		for {
-			pkt := ep.ReadContext(bgCtx)
-			if pkt == nil {
-				return
-			}
-			lastActiveNano.Store(time.Now().UnixNano())
-			sess.writeMu.Lock()
-			err := writeOnePacket(pkt)
-			for i := 0; i < 64 && err == nil; i++ {
-				nextPkt := ep.Read()
-				if nextPkt == nil {
-					break
-				}
-				err = writeOnePacket(nextPkt)
-			}
-			if err == nil {
-				err = sess.bw.Flush()
-			}
-			sess.writeMu.Unlock()
-			if err != nil {
-				return
-			}
-		}
-	}()
-
-	go func() {
-		defer markDead()
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-sess.dead:
-				return
-			case <-ticker.C:
-				now := time.Now().UnixNano()
-				if now-lastRxNano.Load() > int64(45*time.Second) || now-lastActiveNano.Load() > int64(600*time.Second) {
-					return
-				}
-				if err := sess.writeFrame([]byte{0x10, 0x01, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00}); err != nil {
-					return
-				}
-			}
-		}
-	}()
-
-	var localIP tcpip.Address
-	select {
-	case localIP = <-ipReady:
-	case <-sess.dead:
-		markDead()
-		return nil, activePort, false, fmt.Errorf("SSTP 握手中被服务端断开")
-	case <-time.After(3500 * time.Millisecond):
-		markDead()
-		return nil, activePort, false, fmt.Errorf("SSTP PPP/IPCP 协商超时")
-	}
-
-	_ = s.AddProtocolAddress(1, tcpip.ProtocolAddress{
-		Protocol:          ipv4.ProtocolNumber,
-		AddressWithPrefix: tcpip.AddressWithPrefix{Address: localIP, PrefixLen: 8},
-	}, stack.AddressProperties{})
-	s.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: 1}})
-
-	handshakeSucceeded.Store(true)
-	slotBackoff.Delete(slotKey)
-	bindSessionAllSlots(baseKey, slotKey, sess)
-	return sess, activePort, false, nil
-}
-
-func buildSoftEtherLoginPack(uniqueID []byte) []byte {
-	var b bytes.Buffer
-	writeU32 := func(v uint32) {
-		var tmp [4]byte
-		binary.BigEndian.PutUint32(tmp[:], v)
-		b.Write(tmp[:])
-	}
-	writeName := func(s string) {
-		writeU32(uint32(len(s) + 1))
-		b.WriteString(s)
-	}
-	addStr := func(k, v string) {
-		writeName(k)
-		writeU32(2)
-		writeU32(1)
-		writeU32(uint32(len(v)))
-		b.WriteString(v)
-	}
-	addInt := func(k string, v uint32) {
-		writeName(k)
-		writeU32(0)
-		writeU32(1)
-		writeU32(v)
-	}
-	addData := func(k string, d []byte) {
-		writeName(k)
-		writeU32(1)
-		writeU32(1)
-		writeU32(uint32(len(d)))
-		b.Write(d)
-	}
-
-	writeU32(16)
-	addStr("method", "login")
-	addStr("hubname", "VPNGATE")
-	addStr("username", "vpn")
-	addInt("authtype", 0)
-	addInt("protocol", 0)
-	addInt("use_encrypt", 1)
-	addInt("use_compress", 0)
-	addInt("max_connection", 1)
-	addInt("half_connection", 0)
-	addInt("qos", 0)
-	addInt("require_bridge_routing_mode", 0)
-	addInt("require_monitor_mode", 0)
-	addStr("client_str", "SoftEther VPN Client")
-	addInt("client_ver", 442)
-	addInt("client_build", 9798)
-	addData("unique_id", uniqueID)
-	return b.Bytes()
-}
-
-func checkSoftEtherPackResponse(body []byte, requireRandom bool) error {
-	if len(body) < 4 {
-		return fmt.Errorf("SoftEther PACK 响应过短: %d", len(body))
-	}
-	data := body
-	firstU32 := binary.BigEndian.Uint32(data[0:4])
-	if firstU32 > 256 && int(firstU32) <= len(data)-4 && len(data) >= 8 {
-		data = data[4 : 4+int(firstU32)]
-	}
-	numElems := binary.BigEndian.Uint32(data[0:4])
-	if numElems > 1024 {
-		return fmt.Errorf("SoftEther PACK 元素数异常: %d", numElems)
-	}
-	pos := 4
-	readU32 := func() (uint32, bool) {
-		if pos+4 > len(data) {
-			return 0, false
-		}
-		v := binary.BigEndian.Uint32(data[pos : pos+4])
-		pos += 4
-		return v, true
-	}
-	hasRandom := false
-	for i := uint32(0); i < numElems; i++ {
-		nameLen, ok := readU32()
-		if !ok || nameLen == 0 {
-			break
-		}
-		actualNameBytes := int(nameLen) - 1
-		if actualNameBytes < 0 || pos+actualNameBytes > len(data) {
-			break
-		}
-		name := strings.TrimRight(string(data[pos:pos+actualNameBytes]), "\x00")
-		pos += actualNameBytes
-
-		valType, ok := readU32()
-		if !ok {
-			break
-		}
-		numVals, ok := readU32()
-		if !ok || numVals > 512 {
-			break
-		}
-		for j := uint32(0); j < numVals; j++ {
-			switch valType {
-			case 0:
-				v, ok := readU32()
-				if !ok {
-					return nil
-				}
-				if name == "error" && j == 0 && v != 0 {
-					return fmt.Errorf("SoftEther 服务端拒绝 (error=%d)", v)
-				}
-			case 4:
-				if pos+8 > len(data) {
-					return nil
-				}
-				pos += 8
-			case 1, 2, 3:
-				dLen, ok := readU32()
-				if !ok || pos+int(dLen) > len(data) {
-					return nil
-				}
-				if name == "random" && valType == 1 && dLen >= 16 {
-					hasRandom = true
-				}
-				pos += int(dLen)
-			default:
-				return nil
-			}
-		}
-	}
-	if requireRandom && !hasRandom {
-		return fmt.Errorf("Hello PACK 缺少 random 挑战字段")
-	}
-	return nil
-}
-
-func postSoftEtherHTTP(w io.Writer, br *bufio.Reader, host, path string, body []byte) ([]byte, error) {
-	req, err := http.NewRequest(http.MethodPost, "https://"+host+path, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Host = host
-	req.Header.Set("Content-Type", "image/jpeg")
-	req.Header.Set("Connection", "Keep-Alive")
-	req.ContentLength = int64(len(body))
-	if err := req.Write(w); err != nil {
-		return nil, err
-	}
-	peek, err := br.Peek(4)
-	if err != nil {
-		return nil, err
-	}
-	if string(peek) != "HTTP" {
-		rawLen := int(binary.BigEndian.Uint32(peek))
-		if rawLen <= 0 || rawLen > 256*1024 {
-			return nil, fmt.Errorf("SoftEther 非HTTP响应首字异常: %x", peek)
-		}
-		_, _ = br.Discard(4)
-		rawBody := make([]byte, rawLen)
-		if _, err := io.ReadFull(br, rawBody); err != nil {
-			return nil, err
-		}
-		return rawBody, nil
-	}
-	resp, err := http.ReadResponse(br, req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP状态 %d", resp.StatusCode)
-	}
-	return io.ReadAll(io.LimitReader(resp.Body, 512*1024))
-}
-
-func computeIPv4Checksum(ip []byte) uint16 {
-	var sum uint32
-	for i := 0; i < len(ip); i += 2 {
-		sum += uint32(binary.BigEndian.Uint16(ip[i : i+2]))
-	}
-	for (sum >> 16) > 0 {
-		sum = (sum & 0xffff) + (sum >> 16)
-	}
-	return ^uint16(sum)
-}
-
-func computeUDPChecksum(srcIP, dstIP, udp []byte) uint16 {
-	var sum uint32
-	sum += uint32(binary.BigEndian.Uint16(srcIP[0:2])) + uint32(binary.BigEndian.Uint16(srcIP[2:4]))
-	sum += uint32(binary.BigEndian.Uint16(dstIP[0:2])) + uint32(binary.BigEndian.Uint16(dstIP[2:4]))
-	sum += 17 + uint32(len(udp))
-	for i := 0; i+1 < len(udp); i += 2 {
-		sum += uint32(binary.BigEndian.Uint16(udp[i : i+2]))
-	}
-	if len(udp)%2 == 1 {
-		sum += uint32(udp[len(udp)-1]) << 8
-	}
-	for (sum >> 16) > 0 {
-		sum = (sum & 0xffff) + (sum >> 16)
-	}
-	cs := ^uint16(sum)
-	if cs == 0 {
-		return 0xFFFF
-	}
-	return cs
-}
-
-func buildDHCPFrame(msgType byte, xid uint32, myMAC [6]byte, reqIP, serverIP []byte) []byte {
-	bootp := make([]byte, 300)
-	bootp[0], bootp[1], bootp[2] = 1, 1, 6
-	binary.BigEndian.PutUint32(bootp[4:8], xid)
-	binary.BigEndian.PutUint16(bootp[10:12], 0x8000)
-	copy(bootp[28:34], myMAC[:])
-	bootp[236], bootp[237], bootp[238], bootp[239] = 99, 130, 83, 99
-	idx := 240
-	bootp[idx], bootp[idx+1], bootp[idx+2] = 53, 1, msgType
-	idx += 3
-	if len(reqIP) == 4 {
-		bootp[idx], bootp[idx+1] = 50, 4
-		copy(bootp[idx+2:idx+6], reqIP)
-		idx += 6
-	}
-	if len(serverIP) == 4 {
-		bootp[idx], bootp[idx+1] = 54, 4
-		copy(bootp[idx+2:idx+6], serverIP)
-		idx += 6
-	}
-	bootp[idx], bootp[idx+1], bootp[idx+2], bootp[idx+3], bootp[idx+4] = 55, 3, 1, 3, 6
-	bootp[idx+5] = 255
-	bootp = bootp[:idx+6]
-
-	udpLen := 8 + len(bootp)
-	ipLen := 20 + udpLen
-	eth := make([]byte, 14+ipLen)
-	for i := 0; i < 6; i++ {
-		eth[i] = 0xff
-	}
-	copy(eth[6:12], myMAC[:])
-	eth[12], eth[13] = 0x08, 0x00
-
-	ip := eth[14 : 14+20]
-	ip[0] = 0x45
-	binary.BigEndian.PutUint16(ip[2:4], uint16(ipLen))
-	ip[8], ip[9] = 64, 17
-	ip[16], ip[17], ip[18], ip[19] = 255, 255, 255, 255
-	binary.BigEndian.PutUint16(ip[10:12], computeIPv4Checksum(ip))
-
-	udpSeg := eth[34:]
-	binary.BigEndian.PutUint16(udpSeg[0:2], 68)
-	binary.BigEndian.PutUint16(udpSeg[2:4], 67)
-	binary.BigEndian.PutUint16(udpSeg[4:6], uint16(udpLen))
-	copy(udpSeg[8:], bootp)
-	binary.BigEndian.PutUint16(udpSeg[6:8], computeUDPChecksum(ip[12:16], ip[16:20], udpSeg))
-	return eth
-}
-
-func buildARPFrame(op uint16, srcMAC [6]byte, srcIP [4]byte, dstMAC [6]byte, dstIP [4]byte) []byte {
-	var f [42]byte
-	if op == 1 {
-		copy(f[0:6], []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff})
-	} else {
-		copy(f[0:6], dstMAC[:])
-	}
-	copy(f[6:12], srcMAC[:])
-	f[12], f[13] = 0x08, 0x06
-	binary.BigEndian.PutUint16(f[14:16], 1)
-	binary.BigEndian.PutUint16(f[16:18], 0x0800)
-	f[18], f[19] = 6, 4
-	binary.BigEndian.PutUint16(f[20:22], op)
-	copy(f[22:28], srcMAC[:])
-	copy(f[28:32], srcIP[:])
-	copy(f[32:38], dstMAC[:])
-	copy(f[38:42], dstIP[:])
-	return f[:]
-}
-
-func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dialer, baseKey, slotKey string, knownPort net.Port) (*sstpSession, net.Port, error) {
-	bgCtx := context.Background()
-	connCtx, connCancel := context.WithCancel(bgCtx)
-	var handshakeSucceeded atomic.Bool
-	defer func() {
-		if !handshakeSucceeded.Load() {
-			connCancel()
-		}
-	}()
-
-	host := serverDest.Address.String()
-	sniHost := host
-	if serverDest.Address.Family().IsIP() {
-		sniHost = "" // 纯 IP 不发送伪造 SNI，忠实还原 SoftEther 客户端行为
-	}
-
-	var rawConn net.Conn
-	var tlsConn *tls.Conn
-	var activePort net.Port
-	var err error
-
-	if knownPort != 0 {
-		activePort = knownPort
-		rawConn, tlsConn, err = dialTLSWatchdog(connCtx, dialer, net.TCPDestination(serverDest.Address, knownPort), sniHost, 3000*time.Millisecond)
-	} else {
-		rawConn, tlsConn, activePort, err = dialTLSSerialCandidate(connCtx, dialer, serverDest, sniHost)
-	}
-	if err != nil {
-		return nil, activePort, fmt.Errorf("阶段[1-TLS]: %w", err)
-	}
-
-	br := bufio.NewReaderSize(tlsConn, 131072)
-
+	// 阶段 2: POST /vpnsvc/connect.cgi 获取 Hello PACK 与 20 字节 random 挑战
 	var helloBody []byte
 	err = RunWithWatchdog(rawConn, 3200*time.Millisecond, func() error {
 		var hErr error
@@ -1569,29 +949,64 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 		_ = rawConn.Close()
 		return nil, activePort, fmt.Errorf("阶段[2-connect.cgi]: %w", err)
 	}
-	if err := checkSoftEtherPackResponse(helloBody, true); err != nil {
+	randomBytes, err := parseSoftEtherPackResponse(helloBody)
+	if err != nil || len(randomBytes) < 20 {
 		_ = rawConn.Close()
-		return nil, activePort, fmt.Errorf("阶段[2-hello校验]: %w", err)
+		return nil, activePort, fmt.Errorf("阶段[2-hello校验]: %v (randomLen=%d)", err, len(randomBytes))
 	}
 
 	uniqueID := make([]byte, 20)
 	_, _ = rand.Read(uniqueID)
-	packBytes := buildSoftEtherLoginPack(uniqueID)
+	packBytes := buildSoftEtherLoginPack(uniqueID, randomBytes, macStr)
 
+	// 阶段 3: POST /vpnsvc/vpn.cgi 升级为长连接二进制流（声明超大 Content-Length + 4字节包长 + Login PACK）
 	var loginRespBody []byte
 	err = RunWithWatchdog(rawConn, 3200*time.Millisecond, func() error {
-		var lErr error
-		loginRespBody, lErr = postSoftEtherHTTP(tlsConn, br, host, "/vpnsvc/vpn.cgi", packBytes)
-		return lErr
+		var reqBuf bytes.Buffer
+		fmt.Fprintf(&reqBuf,
+			"POST /vpnsvc/vpn.cgi HTTP/1.1\r\n"+
+				"Host: %s\r\n"+
+				"Content-Type: image/jpeg\r\n"+
+				"Connection: Keep-Alive\r\n"+
+				"Content-Length: 1000000000\r\n\r\n", host)
+		var lenHdr [4]byte
+		binary.BigEndian.PutUint32(lenHdr[:], uint32(len(packBytes)))
+		reqBuf.Write(lenHdr[:])
+		reqBuf.Write(packBytes)
+
+		if _, wErr := tlsConn.Write(reqBuf.Bytes()); wErr != nil {
+			return wErr
+		}
+
+		// 读取 200 OK HTTP 响应头（不关闭 Body，流保持开启）
+		resp, rErr := http.ReadResponse(br, nil)
+		if rErr != nil {
+			return rErr
+		}
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("HTTP状态 %d", resp.StatusCode)
+		}
+
+		// 读取登录结果 PACK：[4字节长度] + [PACK载荷]
+		var respLen uint32
+		if rErr := binary.Read(br, binary.BigEndian, &respLen); rErr != nil {
+			return rErr
+		}
+		if respLen == 0 || respLen > 256*1024 {
+			return fmt.Errorf("Login 响应 PACK 长度异常: %d", respLen)
+		}
+		loginRespBody = make([]byte, respLen)
+		_, rErr = io.ReadFull(br, loginRespBody)
+		return rErr
 	})
 	if err != nil {
 		_ = rawConn.Close()
 		return nil, activePort, fmt.Errorf("阶段[3-vpn.cgi]: %w", err)
 	}
-	if err := checkSoftEtherPackResponse(loginRespBody, false); err != nil {
+	if _, err := parseSoftEtherPackResponse(loginRespBody); err != nil {
 		_ = rawConn.Close()
 		return nil, activePort, fmt.Errorf("阶段[3-login校验]: %w", err)
-	}
+	}	
 
 	s, ep, err := newGVisorStack()
 	if err != nil {
