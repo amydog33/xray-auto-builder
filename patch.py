@@ -321,7 +321,7 @@ import os
 import re
 
 # =========================================================================
-# 6. 注入 VPNGate 核心主引擎 (无锁单槽 + 零定时器锁 + SoftEther/SSTP零拷贝批量写 + 多路DNS抢答)
+# 6. 注入 VPNGate 核心主引擎 (禁用Go1.27后量子巨型包 + 全路径SSL回退 + 双模式PACK兼容 + 实时诊断日志)
 # =========================================================================
 socks_dir = "proxy/socks"
 if os.path.exists(socks_dir):
@@ -340,6 +340,7 @@ import (
 	"fmt"
 	"io"
 	"math/bits"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -385,7 +386,7 @@ var (
 	sessMu          sync.Mutex
 	slotLocks       sync.Map
 	sessPool        = make(map[string]*sstpSession)
-	fastSessMap     sync.Map // 原子级无锁会话镜像表
+	fastSessMap     sync.Map
 	dnsCache        sync.Map
 	failCache       sync.Map
 	slotBackoff     sync.Map
@@ -437,21 +438,28 @@ func init() {
 	}()
 }
 
+// 修复 1：显式锁死经典椭圆曲线与 TLS 1.2，彻底禁用 Go 1.27 默认开启的 X25519MLKEM768 后量子巨型分片包
 func buildCompatTLSConfig(host string) *tls.Config {
-	var suites []uint16
-	for _, cs := range tls.CipherSuites() {
-		suites = append(suites, cs.ID)
-	}
-	for _, cs := range tls.InsecureCipherSuites() {
-		suites = append(suites, cs.ID)
-	}
 	return &tls.Config{
 		ServerName:         host,
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS10,
-		MaxVersion:         tls.VersionTLS13,
-		CipherSuites:       suites,
+		MaxVersion:         tls.VersionTLS12,
 		ClientSessionCache: tlsSessionCache,
+		CurvePreferences:   []tls.CurveID{tls.X25519, tls.CurveP256, tls.CurveP384},
+		CipherSuites: []uint16{
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+			tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_RSA_WITH_AES_128_CBC_SHA,
+			tls.TLS_RSA_WITH_AES_256_CBC_SHA,
+			tls.TLS_RSA_WITH_3DES_EDE_CBC_SHA,
+		},
 	}
 }
 
@@ -533,7 +541,13 @@ func isVPNGateServer(server *protocol.ServerSpec) bool {
 	if acc, ok := server.User.Account.(*Account); ok {
 		u := strings.ToLower(strings.TrimSpace(acc.Username))
 		if u == "vpn" || u == "vpngate" {
-			cacheOVPNFromPassword(server.Destination.String(), acc.Password)
+			pw := strings.ToLower(strings.TrimSpace(acc.Password))
+			baseKey := server.Destination.String()
+			if pw == "ssl" || pw == "softether" || strings.HasPrefix(pw, "ssl:") {
+				ovpnProtoCache.Store(baseKey, "softether-ssl")
+			} else {
+				cacheOVPNFromPassword(baseKey, acc.Password)
+			}
 			return true
 		}
 	}
@@ -621,7 +635,6 @@ func getSlotMutex(slotKey string) *sync.Mutex {
 	return val.(*sync.Mutex)
 }
 
-// 突破口 3：彻底移除 SetWriteDeadline 定时器锁争用
 func (sess *sstpSession) writeFrame(data []byte) error {
 	sess.writeMu.Lock()
 	defer sess.writeMu.Unlock()
@@ -699,8 +712,8 @@ func newGVisorStack() (*stack.Stack, *channel.Endpoint, error) {
 	minRTO := tcpip.TCPMinRTOOption(250 * time.Millisecond)
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &minRTO)
 
-	rcvBuf := tcpip.TCPReceiveBufferSizeRangeOption{Min: 4096, Default: 4 * 1024 * 1024, Max: 16 * 1024 * 1024}
-	sndBuf := tcpip.TCPSendBufferSizeRangeOption{Min: 4096, Default: 4 * 1024 * 1024, Max: 16 * 1024 * 1024}
+	rcvBuf := tcpip.TCPReceiveBufferSizeRangeOption{Min: 4096, Default: 2 * 1024 * 1024, Max: 3584 * 1024}
+	sndBuf := tcpip.TCPSendBufferSizeRangeOption{Min: 4096, Default: 2 * 1024 * 1024, Max: 3584 * 1024}
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &rcvBuf)
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sndBuf)
 	modOpt := tcpip.TCPModerateReceiveBufferOption(true)
@@ -713,6 +726,7 @@ func newGVisorStack() (*stack.Stack, *channel.Endpoint, error) {
 	}
 	return s, ep, nil
 }
+
 func recordNodeFailureIfNeeded(baseKey string, isBackground bool, err error) {
 	if isBackground || stderrors.Is(err, context.Canceled) || errors.Cause(err) == context.Canceled {
 		return
@@ -737,7 +751,7 @@ func dialSlotSession(ctx context.Context, serverDest net.Destination, dialer int
 
 	if !isBackground {
 		if failTime, ok := failCache.Load(baseKey); ok {
-			if time.Since(failTime.(time.Time)) < 8*time.Second {
+			if time.Since(failTime.(time.Time)) < 6*time.Second {
 				return nil, fmt.Errorf("节点 %s 处于失败冷却中", baseKey)
 			}
 			failCache.Delete(baseKey)
@@ -787,7 +801,33 @@ func dialSlotSession(ctx context.Context, serverDest net.Destination, dialer int
 		}
 	}
 
-	dialCtx, cancel := context.WithTimeout(bgCtx, 20*time.Second)
+	// 统一全路径回退器：无论 SSTP 在 HTTP 层还是 PPP 阶段断开，一律自动回退 SoftEther-SSL 与 OpenVPN
+	fallbackToSSLOrOVPN := func(activePort net.Port, sstpReason string) (*sstpSession, error) {
+		nativeDest := net.TCPDestination(serverDest.Address, activePort)
+		errors.LogInfo(bgCtx, fmt.Sprintf("[VPNGate] SSTP 未就绪 (%s)，切换 SoftEther-SSL -> %s", sstpReason, nativeDest.String()))
+		if sess, nativeErr := dialSoftEtherNativeSession(nativeDest, dialer, baseKey, slotKey, isBackground, nil, nil); nativeErr == nil {
+			ovpnProtoCache.Store(baseKey, "softether-ssl")
+			return sess, nil
+		} else {
+			errors.LogInfo(bgCtx, fmt.Sprintf("[VPNGate] SoftEther-SSL 未命中 (%v)，尝试 OpenVPN 兜底 -> %s", nativeErr, serverDest.String()))
+		}
+		ovpnCfg := getOrDefaultOVPNConfig(baseKey)
+		if ovpnSess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, false); ovpnErr == nil {
+			ovpnProtoCache.Store(baseKey, "openvpn-tcp")
+			return ovpnSess, nil
+		}
+		if ovpnCfg.udpPort > 0 {
+			if udpSess, udpErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, true); udpErr == nil {
+				ovpnProtoCache.Store(baseKey, "openvpn-udp")
+				return udpSess, nil
+			}
+		}
+		err := fmt.Errorf("全协议握手均未就绪 (%s)", sstpReason)
+		recordNodeFailureIfNeeded(baseKey, isBackground, err)
+		return nil, err
+	}
+
+	dialCtx, cancel := context.WithTimeout(bgCtx, 12*time.Second)
 	defer cancel()
 
 	rawConn, activePort, err := dialWithPortFallback(dialCtx, dialer, serverDest)
@@ -798,7 +838,10 @@ func dialSlotSession(ctx context.Context, serverDest net.Destination, dialer int
 
 	host := serverDest.Address.String()
 	tlsConn := tls.Client(rawConn, buildCompatTLSConfig(host))
-	if err := tlsConn.HandshakeContext(dialCtx); err != nil {
+	tlsCtx, tlsCancel := context.WithTimeout(dialCtx, 6*time.Second)
+	tlsErr := tlsConn.HandshakeContext(tlsCtx)
+	tlsCancel()
+	if tlsErr != nil {
 		rawConn.Close()
 		if ovpnCfg := getOrDefaultOVPNConfig(baseKey); ovpnCfg.udpPort > 0 {
 			if udpSess, udpErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, true); udpErr == nil {
@@ -806,13 +849,11 @@ func dialSlotSession(ctx context.Context, serverDest net.Destination, dialer int
 				return udpSess, nil
 			}
 		}
-		recordNodeFailureIfNeeded(baseKey, isBackground, err)
-		return nil, err
+		recordNodeFailureIfNeeded(baseKey, isBackground, tlsErr)
+		return nil, tlsErr
 	}
 
 	nativeDest := net.TCPDestination(serverDest.Address, activePort)
-
-	// 若已记忆为 SoftEther-SSL 节点，直接跳过 SSTP 探测复用当前 TLS 连接秒连
 	if pCached == "softether-ssl" {
 		if sess, seErr := dialSoftEtherNativeSession(nativeDest, dialer, baseKey, slotKey, isBackground, rawConn, tlsConn); seErr == nil {
 			return sess, nil
@@ -847,24 +888,7 @@ func dialSlotSession(ctx context.Context, serverDest net.Destination, dialer int
 
 	if writeErr != nil || readErr != nil || !strings.Contains(statusLine, "200") {
 		rawConn.Close()
-		sess, nativeErr := dialSoftEtherNativeSession(nativeDest, dialer, baseKey, slotKey, isBackground, nil, nil)
-		if nativeErr == nil {
-			ovpnProtoCache.Store(baseKey, "softether-ssl")
-			return sess, nil
-		}
-		ovpnCfg := getOrDefaultOVPNConfig(baseKey)
-		if ovpnSess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, false); ovpnErr == nil {
-			ovpnProtoCache.Store(baseKey, "openvpn-tcp")
-			return ovpnSess, nil
-		}
-		if ovpnCfg.udpPort > 0 {
-			if udpSess, udpErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, true); udpErr == nil {
-				ovpnProtoCache.Store(baseKey, "openvpn-udp")
-				return udpSess, nil
-			}
-		}
-		recordNodeFailureIfNeeded(baseKey, isBackground, nativeErr)
-		return nil, nativeErr
+		return fallbackToSSLOrOVPN(activePort, "HTTP非200")
 	}
 
 	for {
@@ -1124,7 +1148,7 @@ func dialSlotSession(ctx context.Context, serverDest net.Destination, dialer int
 				return
 			case <-ticker.C:
 				now := time.Now().UnixNano()
-				if now-lastRxNano.Load() > int64(45*time.Second) || now-lastActiveNano.Load() > int64(90*time.Second) {
+				if now-lastRxNano.Load() > int64(45*time.Second) || now-lastActiveNano.Load() > int64(600*time.Second) {
 					return
 				}
 				if err := sess.writeFrame([]byte{0x10, 0x01, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00}); err != nil {
@@ -1138,14 +1162,11 @@ func dialSlotSession(ctx context.Context, serverDest net.Destination, dialer int
 	select {
 	case localIP = <-ipReady:
 	case <-sess.dead:
-		err := fmt.Errorf("VPNGate 隧道在握手中提前断开")
-		recordNodeFailureIfNeeded(baseKey, isBackground, err)
-		return nil, err
-	case <-time.After(15 * time.Second):
 		markDead()
-		err := fmt.Errorf("VPNGate PPP/IPCP 协商超时")
-		recordNodeFailureIfNeeded(baseKey, isBackground, err)
-		return nil, err
+		return fallbackToSSLOrOVPN(activePort, "SSTP被服务端拒绝")
+	case <-time.After(4500 * time.Millisecond):
+		markDead()
+		return fallbackToSSLOrOVPN(activePort, "SSTP协商超时")
 	}
 
 	_ = s.AddProtocolAddress(1, tcpip.ProtocolAddress{
@@ -1158,6 +1179,7 @@ func dialSlotSession(ctx context.Context, serverDest net.Destination, dialer int
 	bindSessionAllSlots(baseKey, slotKey, sess)
 	return sess, nil
 }
+
 func buildSoftEtherLoginPack() []byte {
 	var b bytes.Buffer
 	writeU32 := func(v uint32) {
@@ -1169,17 +1191,16 @@ func buildSoftEtherLoginPack() []byte {
 		writeU32(uint32(len(s) + 1))
 		b.WriteString(s)
 	}
-	// 严格对齐 SoftEther Mayaqua/Pack.c 规范：VALUE_STR 长度即为 len(v)，严禁 +1
 	addStr := func(k, v string) {
 		writeName(k)
-		writeU32(2) // VALUE_STR
-		writeU32(1) // num_values
+		writeU32(2)
+		writeU32(1)
 		writeU32(uint32(len(v)))
 		b.WriteString(v)
 	}
 	addInt := func(k string, v uint32) {
 		writeName(k)
-		writeU32(0) // VALUE_INT
+		writeU32(0)
 		writeU32(1)
 		writeU32(v)
 	}
@@ -1205,7 +1226,6 @@ func checkSoftEtherLoginResponse(body []byte) error {
 	}
 	data := body
 	firstU32 := binary.BigEndian.Uint32(data[0:4])
-	// 兼容纯 PACK 流与带 4 字节长度前缀的响应体
 	if firstU32 > 256 && int(firstU32) <= len(data)-4 && len(data) >= 8 {
 		data = data[4 : 4+int(firstU32)]
 	}
@@ -1224,7 +1244,6 @@ func checkSoftEtherLoginResponse(body []byte) error {
 		if !ok || nameLen == 0 {
 			break
 		}
-		// PackToBuf 写入的 nameLen 为 strlen+1，实际字节数为 nameLen-1
 		actualNameBytes := int(nameLen) - 1
 		if actualNameBytes < 0 || pos+actualNameBytes > len(data) {
 			break
@@ -1255,13 +1274,7 @@ func checkSoftEtherLoginResponse(body []byte) error {
 					return nil
 				}
 				pos += 8
-			case 1, 2:
-				dLen, ok := readU32()
-				if !ok || pos+int(dLen) > len(data) {
-					return nil
-				}
-				pos += int(dLen)
-			case 3:
+			case 1, 2, 3:
 				dLen, ok := readU32()
 				if !ok || pos+int(dLen) > len(data) {
 					return nil
@@ -1372,21 +1385,23 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 		rawConn = existingRawConn
 		tlsConn = existingTLSConn
 	} else {
-		dialCtx, cancel := context.WithTimeout(bgCtx, 15*time.Second)
+		dialCtx, cancel := context.WithTimeout(bgCtx, 10*time.Second)
 		defer cancel()
 		rawConn, err = dialer.Dial(dialCtx, serverDest)
 		if err != nil {
 			return nil, err
 		}
 		tlsConn = tls.Client(rawConn, buildCompatTLSConfig(host))
-		if err := tlsConn.HandshakeContext(dialCtx); err != nil {
+		tlsCtx, tlsCancel := context.WithTimeout(dialCtx, 6*time.Second)
+		err = tlsConn.HandshakeContext(tlsCtx)
+		tlsCancel()
+		if err != nil {
 			rawConn.Close()
 			return nil, err
 		}
 	}
 
-	_ = tlsConn.SetDeadline(time.Now().Add(8 * time.Second))
-	// 第一阶段：发送官方标准 10 字节 VPNCONNECT 握手签名
+	_ = tlsConn.SetDeadline(time.Now().Add(7 * time.Second))
 	sigReq := fmt.Sprintf("POST /vpnsvc/connect.cgi HTTP/1.1\r\nHost: %s\r\nContent-Type: image/jpeg\r\nConnection: Keep-Alive\r\nContent-Length: 10\r\n\r\nVPNCONNECT", host)
 	if _, err := tlsConn.Write([]byte(sigReq)); err != nil {
 		rawConn.Close()
@@ -1398,7 +1413,6 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 		return nil, err
 	}
 
-	// 第二阶段：直接发送标准 PackToBuf 字节流（无额外 4B 长度前缀）
 	packBytes := buildSoftEtherLoginPack()
 	var loginBuf bytes.Buffer
 	fmt.Fprintf(&loginBuf, "POST /vpnsvc/vpn.cgi HTTP/1.1\r\nHost: %s\r\nContent-Type: image/jpeg\r\nConnection: Keep-Alive\r\nContent-Length: %d\r\n\r\n", host, len(packBytes))
@@ -1475,7 +1489,6 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 	discoverFrame := buildDHCPFrame(1, dhcpXid, myMAC, nil, nil)
 	_ = sess.writeSoftEtherFrames([][]byte{discoverFrame})
 
-	// DHCP Discover 350ms 快重传：防止虚拟交换机刚初始化时丢弃首帧广播包
 	go func() {
 		ticker := time.NewTicker(350 * time.Millisecond)
 		defer ticker.Stop()
@@ -1632,7 +1645,6 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 		}
 	}()
 
-	// SoftEther 原生协议零内存分配批量直写协程
 	go func() {
 		defer markDead()
 		var batch [64]*stack.PacketBuffer
@@ -1700,7 +1712,7 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 				return
 			case <-ticker.C:
 				now := time.Now().UnixNano()
-				if now-lastRxNano.Load() > int64(45*time.Second) || now-lastActiveNano.Load() > int64(90*time.Second) {
+				if now-lastRxNano.Load() > int64(45*time.Second) || now-lastActiveNano.Load() > int64(600*time.Second) {
 					return
 				}
 				if err := sess.writeFrame([]byte{0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0}); err != nil {
@@ -1714,14 +1726,10 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 	select {
 	case lease = <-ipReady:
 	case <-sess.dead:
-		err := fmt.Errorf("SoftEther 隧道在握手中提前断开")
-		recordNodeFailureIfNeeded(baseKey, isBackground, err)
-		return nil, err
-	case <-time.After(12 * time.Second):
+		return nil, fmt.Errorf("SoftEther 隧道在握手中提前断开")
+	case <-time.After(8 * time.Second):
 		markDead()
-		err := fmt.Errorf("SoftEther Virtual DHCP 分配 IP 超时")
-		recordNodeFailureIfNeeded(baseKey, isBackground, err)
-		return nil, err
+		return nil, fmt.Errorf("SoftEther Virtual DHCP 分配 IP 超时")
 	}
 
 	_ = s.AddProtocolAddress(1, tcpip.ProtocolAddress{
@@ -1784,8 +1792,15 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
 		bp := readBufPool.Get().(*[]byte)
 		defer readBufPool.Put(bp)
 		b := *bp
+		var totalDown int64
 		for {
-			n, rErr := gConn.Read(b)
+			rSlice := b
+			if totalDown > 1536*1024 {
+				rSlice = b[:16384]
+				runtime.Gosched()
+			}
+			n, rErr := gConn.Read(rSlice)
+			totalDown += int64(n)
 			if n > 0 {
 				var mb buf.MultiBuffer
 				offset := 0
