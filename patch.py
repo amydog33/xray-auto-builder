@@ -326,7 +326,7 @@ func notifyHUD(tag string, dest string) {
         print("  ✔ [HUD] 广播钩子已存在 (幂等跳过)")
 
 # =========================================================================
-# 6. 注入 VPNGate 全协议兼容 + 防 CF 限流 Watchdog 核心引擎
+# 6. 注入 VPNGate 全协议兼容 + Happy Eyeballs 并发探测 + Watchdog 核心引擎
 # =========================================================================
 socks_dir = "proxy/socks"
 if os.path.exists(socks_dir):
@@ -400,7 +400,7 @@ var (
 	slotBackoff      sync.Map
 	sslHintPortCache sync.Map
 	tlsSessionCache  = tls.NewLRUClientSessionCache(512)
-	vgProbeSem       = make(chan struct{}, 4)
+	vgProbeSem       = make(chan struct{}, 6)
 
 	readBufPool = sync.Pool{
 		New: func() any { b := make([]byte, 65536); return &b },
@@ -628,7 +628,9 @@ func dialTLSWatchdog(tunnelCtx context.Context, dialer internet.Dialer, dest net
 
 	rawConn, err := dialer.Dial(tunnelCtx, dest)
 	if err != nil {
-		markDeadPort(addrStr)
+		if tunnelCtx.Err() == nil {
+			markDeadPort(addrStr)
+		}
 		return nil, nil, err
 	}
 
@@ -637,13 +639,15 @@ func dialTLSWatchdog(tunnelCtx context.Context, dialer internet.Dialer, dest net
 		return tlsConn.Handshake()
 	}); err != nil {
 		_ = rawConn.Close()
-		markDeadPort(addrStr)
+		if tunnelCtx.Err() == nil {
+			markDeadPort(addrStr)
+		}
 		return nil, nil, err
 	}
 	return rawConn, tlsConn, nil
 }
 
-// 串行探测：若 443 死掉，串行按 5555 -> 995 -> 992 顺序探测（单节点同时只占 1 条 CF 连接，绝不触发限流）
+// Happy Eyeballs 错峰并发探测：主端口 6.5s 超时（兼容链式代理延迟），1.2s 未胜出则并发抢跑 5555/995/992
 func dialTLSSerialCandidate(tunnelCtx context.Context, dialer internet.Dialer, serverDest net.Destination, sniHost string) (net.Conn, *tls.Conn, net.Port, error) {
 	var candidates []net.Port
 	if hint, ok := sslHintPortCache.Load(serverDest.String()); ok {
@@ -656,21 +660,65 @@ func dialTLSSerialCandidate(tunnelCtx context.Context, dialer internet.Dialer, s
 		candidates = append(candidates, 5555, 995, 992)
 	}
 
-	var lastErr error
-	for idx, p := range candidates {
-		if tunnelCtx.Err() != nil {
-			return nil, nil, serverDest.Port, tunnelCtx.Err()
-		}
+	if len(candidates) == 1 {
+		raw, tc, err := dialTLSWatchdog(tunnelCtx, dialer, net.TCPDestination(serverDest.Address, candidates[0]), sniHost, 6500*time.Millisecond)
+		return raw, tc, candidates[0], err
+	}
+
+	raceCtx, raceCancel := context.WithCancel(tunnelCtx)
+	defer raceCancel()
+
+	type dialRes struct {
+		raw  net.Conn
+		tc   *tls.Conn
+		port net.Port
+		err  error
+	}
+	resCh := make(chan dialRes, len(candidates))
+	var winOnce sync.Once
+
+	launch := func(p net.Port, timeout time.Duration) {
 		dest := net.TCPDestination(serverDest.Address, p)
-		to := 3000 * time.Millisecond
-		if idx > 0 {
-			to = 2200 * time.Millisecond
+		raw, tc, err := dialTLSWatchdog(raceCtx, dialer, dest, sniHost, timeout)
+		if err != nil {
+			resCh <- dialRes{port: p, err: err}
+			return
 		}
-		raw, tc, err := dialTLSWatchdog(tunnelCtx, dialer, dest, sniHost, to)
-		if err == nil {
-			return raw, tc, p, nil
+		won := false
+		winOnce.Do(func() {
+			won = true
+			raceCancel()
+			resCh <- dialRes{raw: raw, tc: tc, port: p}
+		})
+		if !won {
+			_ = raw.Close()
+			resCh <- dialRes{port: p, err: context.Canceled}
 		}
-		lastErr = err
+	}
+
+	go launch(candidates[0], 6500*time.Millisecond)
+
+	go func() {
+		select {
+		case <-time.After(1200 * time.Millisecond):
+			for _, p := range candidates[1:] {
+				go launch(p, 5500*time.Millisecond)
+			}
+		case <-raceCtx.Done():
+		}
+	}()
+
+	var lastErr error
+	for i := 0; i < len(candidates); i++ {
+		select {
+		case <-tunnelCtx.Done():
+			return nil, nil, serverDest.Port, tunnelCtx.Err()
+		case r := <-resCh:
+			if r.err == nil && r.tc != nil {
+				return r.raw, r.tc, r.port, nil
+			}
+			lastErr = r.err
+		}
 	}
 	return nil, nil, serverDest.Port, lastErr
 }
@@ -861,7 +909,7 @@ func dialSlotSession(ctx context.Context, serverDest net.Destination, dialer int
 		return nil, seErr
 	}
 
-	// 通用端口先探 MS-SSTP：只要 TLS 阶段通了，无论 SSTP 返回 4xx、EOF 还是拒绝，tlsReachable 均为 true！
+	// 通用端口先探 MS-SSTP：只要 TLS 阶段通了，无论 SSTP 返回 4xx、EOF 还是拒绝，tlsReachable 均为 true
 	sstpSess, reachablePort, tlsReachable, sstpErr := dialMSSSTPSessionWithHint(serverDest, dialer, baseKey, slotKey)
 	if sstpErr == nil {
 		ovpnProtoCache.Store(baseKey, "ms-sstp")
@@ -882,9 +930,11 @@ func dialSlotSession(ctx context.Context, serverDest net.Destination, dialer int
 		errors.LogWarning(bgCtx, fmt.Sprintf("[VPNGate-SSL/SSTP] %s 全候选端口 TLS 均不可达: %v", baseKey, sstpErr))
 	}
 
-	if ovpnSess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, false, 4200*time.Millisecond); ovpnErr == nil {
-		ovpnProtoCache.Store(baseKey, "openvpn-tcp")
-		return ovpnSess, nil
+	if ovpnCfg.tcpPort > 0 && ovpnCfg.tcpPort != serverDest.Port {
+		if ovpnSess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, false, 5000*time.Millisecond); ovpnErr == nil {
+			ovpnProtoCache.Store(baseKey, "openvpn-tcp")
+			return ovpnSess, nil
+		}
 	}
 
 	err := fmt.Errorf("节点 %s 全协议 (SSTP/SSL/OVPN) 握手均未就绪", baseKey)
@@ -917,7 +967,6 @@ func dialMSSSTPSessionWithHint(serverDest net.Destination, dialer internet.Diale
 	if err != nil {
 		return nil, 0, false, err
 	}
-	// 到这里说明 TLS 已经握手成功！后续只要不是 SSTP 200 OK，tlsReachable 一律为 true
 
 	var certHash [32]byte
 	if peers := tlsConn.ConnectionState().PeerCertificates; len(peers) > 0 {
@@ -938,7 +987,7 @@ func dialMSSSTPSessionWithHint(serverDest net.Destination, dialer internet.Diale
 
 	br := bufio.NewReaderSize(tlsConn, 131072)
 	var statusLine string
-	httpErr := RunWithWatchdog(rawConn, 2500*time.Millisecond, func() error {
+	httpErr := RunWithWatchdog(rawConn, 4500*time.Millisecond, func() error {
 		if _, wErr := tlsConn.Write([]byte(sstpReq)); wErr != nil {
 			return wErr
 		}
@@ -956,7 +1005,7 @@ func dialMSSSTPSessionWithHint(serverDest net.Destination, dialer internet.Diale
 		return nil, activePort, true, fmt.Errorf("SSTP 非 200 (%s)", strings.TrimSpace(statusLine))
 	}
 
-	headerErr := RunWithWatchdog(rawConn, 2000*time.Millisecond, func() error {
+	headerErr := RunWithWatchdog(rawConn, 3500*time.Millisecond, func() error {
 		for {
 			line, rErr := br.ReadString('\n')
 			if rErr != nil {
@@ -1239,7 +1288,7 @@ func dialMSSSTPSessionWithHint(serverDest net.Destination, dialer internet.Diale
 	case <-sess.dead:
 		markDead()
 		return nil, activePort, false, fmt.Errorf("SSTP 握手中被服务端断开")
-	case <-time.After(3500 * time.Millisecond):
+	case <-time.After(5500 * time.Millisecond):
 		markDead()
 		return nil, activePort, false, fmt.Errorf("SSTP PPP/IPCP 协商超时")
 	}
@@ -1256,6 +1305,7 @@ func dialMSSSTPSessionWithHint(serverDest net.Destination, dialer internet.Diale
 	return sess, activePort, false, nil
 }
 
+// 纯 Go 标准库 SHA-0 实现（SoftEther 密码摘要算法）
 func softEtherSHA0(msg []byte) []byte {
 	h := [5]uint32{0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0}
 	bitLen := uint64(len(msg)) * 8
@@ -1323,7 +1373,7 @@ func buildSoftEtherLoginPack(uniqueID []byte, randomBytes []byte) []byte {
 		writeName(k)
 		writeU32(2)
 		writeU32(1)
-		writeU32(uint32(len(v) + 1))
+		writeU32(uint32(len(v) + 1)) // SoftEther WriteStr 长度头为 len + 1
 		b.WriteString(v)
 	}
 	addInt := func(k string, v uint32) {
@@ -1340,11 +1390,12 @@ func buildSoftEtherLoginPack(uniqueID []byte, randomBytes []byte) []byte {
 		b.Write(d)
 	}
 
-	pwHash := softEtherSHA0([]byte("VPNVPN"))
+	// 对齐 sagar/softether-go 与官方 Protocol.c: SHA0(SHA0("vpn") + random)
+	pwHash := softEtherSHA0([]byte("vpn"))
 	secPass := softEtherSHA0(append(pwHash, randomBytes...))
 
 	writeU32(17)
-	addStr("method", "password")
+	addStr("method", "login")
 	addStr("hubname", "VPNGATE")
 	addStr("username", "vpn")
 	addInt("authtype", 1)
@@ -1611,7 +1662,7 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 
 	if knownPort != 0 {
 		activePort = knownPort
-		rawConn, tlsConn, err = dialTLSWatchdog(connCtx, dialer, net.TCPDestination(serverDest.Address, knownPort), sniHost, 3000*time.Millisecond)
+		rawConn, tlsConn, err = dialTLSWatchdog(connCtx, dialer, net.TCPDestination(serverDest.Address, knownPort), sniHost, 6500*time.Millisecond)
 	} else {
 		rawConn, tlsConn, activePort, err = dialTLSSerialCandidate(connCtx, dialer, serverDest, sniHost)
 	}
@@ -1622,7 +1673,7 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 	br := bufio.NewReaderSize(tlsConn, 131072)
 
 	var helloBody []byte
-	err = RunWithWatchdog(rawConn, 3200*time.Millisecond, func() error {
+	err = RunWithWatchdog(rawConn, 6000*time.Millisecond, func() error {
 		var hErr error
 		helloBody, hErr = postSoftEtherHTTP(tlsConn, br, host, "/vpnsvc/connect.cgi", []byte("VPNCONNECT"))
 		return hErr
@@ -1642,7 +1693,7 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 	packBytes := buildSoftEtherLoginPack(uniqueID, randomBytes)
 
 	var loginRespBody []byte
-	err = RunWithWatchdog(rawConn, 3200*time.Millisecond, func() error {
+	err = RunWithWatchdog(rawConn, 6000*time.Millisecond, func() error {
 		var lErr error
 		loginRespBody, lErr = postSoftEtherHTTP(tlsConn, br, host, "/vpnsvc/vpn.cgi", packBytes)
 		return lErr
@@ -1714,9 +1765,9 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 	_ = sess.writeSoftEtherFrames([][]byte{discoverFrame})
 
 	go func() {
-		ticker := time.NewTicker(250 * time.Millisecond)
+		ticker := time.NewTicker(300 * time.Millisecond)
 		defer ticker.Stop()
-		for i := 0; i < 12; i++ {
+		for i := 0; i < 16; i++ {
 			select {
 			case <-sess.dead:
 				return
@@ -1974,7 +2025,7 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 	case <-sess.dead:
 		markDead()
 		return nil, activePort, fmt.Errorf("阶段[4-DHCP]: SoftEther 隧道在握手中提前断开")
-	case <-time.After(3500 * time.Millisecond):
+	case <-time.After(6000 * time.Millisecond):
 		markDead()
 		return nil, activePort, fmt.Errorf("阶段[4-DHCP]: SoftEther Virtual DHCP 分配 IP 超时")
 	}
@@ -2021,7 +2072,7 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
 		return fmt.Errorf("仅支持 IPv4 目标地址")
 	}
 
-	dialCtx, cancel := context.WithTimeout(ctx, 6000*time.Millisecond)
+	dialCtx, cancel := context.WithTimeout(ctx, 6500*time.Millisecond)
 	gConn, err := gonet.DialContextTCP(dialCtx, sess.s, tcpip.FullAddress{
 		NIC:  1,
 		Addr: tcpip.AddrFromSlice(targetIP),
@@ -2146,10 +2197,10 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
             raise RuntimeError("❌ 未能在 proxy/socks/client.go 的 Process 函数中匹配到 server 变量赋值行！")
         with open(client_go, "w", encoding="utf-8") as f:
             f.write(new_code)
-        print("  ✔ [VPNGate 主引擎] 成功注入 (已修正 tlsReachable + 5555/995/992串行 + 阶段日志)")
+        print("  ✔ [VPNGate 主引擎] 成功注入 (Happy Eyeballs 并发抢跑 + SHA0('vpn') + Pack长度对齐)")
 
 # =========================================================================
-# 7. 注入 VPNGate OpenVPN 爆发+稳定双兼顾引擎
+# 7. 注入 VPNGate OpenVPN 爆发+稳定双兼顾引擎 (含链式代理宽容 DNS 解析)
 # =========================================================================
 if os.path.exists(socks_dir):
     ovpn_file = os.path.join(socks_dir, "vpngate_openvpn.go")
@@ -2360,7 +2411,7 @@ func queryUDP53OnStack(ctx context.Context, s *stack.Stack, dnsIP [4]byte, query
 		return nil, 0, err
 	}
 	defer conn.Close()
-	dl := time.Now().Add(1500 * time.Millisecond)
+	dl := time.Now().Add(4000 * time.Millisecond)
 	if ctxDL, ok := ctx.Deadline(); ok && ctxDL.Before(dl) {
 		dl = ctxDL
 	}
@@ -2377,14 +2428,14 @@ func queryUDP53OnStack(ctx context.Context, s *stack.Stack, dnsIP [4]byte, query
 }
 
 func queryTCP53OnStack(ctx context.Context, s *stack.Stack, dnsIP [4]byte, query []byte, txID uint16) ([]byte, uint32, error) {
-	dCtx, cancel := context.WithTimeout(ctx, 1600*time.Millisecond)
+	dCtx, cancel := context.WithTimeout(ctx, 4000*time.Millisecond)
 	defer cancel()
 	conn, err := gonet.DialContextTCP(dCtx, s, tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFrom4(dnsIP), Port: 53}, ipv4.ProtocolNumber)
 	if err != nil {
 		return nil, 0, err
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(1600 * time.Millisecond))
+	_ = conn.SetDeadline(time.Now().Add(4000 * time.Millisecond))
 	tcpReq := make([]byte, 2+len(query))
 	binary.BigEndian.PutUint16(tcpReq[0:2], uint16(len(query)))
 	copy(tcpReq[2:], query)
@@ -2423,7 +2474,7 @@ func queryOuterDoT(ctx context.Context, dialer internet.Dialer, dnsIP, sni strin
 	})
 
 	var resp []byte
-	err = RunWithWatchdog(rawConn, 1800*time.Millisecond, func() error {
+	err = RunWithWatchdog(rawConn, 4500*time.Millisecond, func() error {
 		if hErr := tlsConn.Handshake(); hErr != nil {
 			return hErr
 		}
@@ -2470,54 +2521,35 @@ func ovpnFastResolveIPv4(ctx context.Context, dialer internet.Dialer, sess *sstp
 			return nil, err
 		}
 		type dnsRes struct {
-			ip      []byte
-			ttl     uint32
-			isOuter bool
-			err     error
+			ip  []byte
+			ttl uint32
+			err error
 		}
 		resCh := make(chan dnsRes, 6)
-		innerAliveCh := make(chan struct{}, 5)
-		probeCtx, probeCancel := context.WithTimeout(context.Background(), 1600*time.Millisecond)
+		probeCtx, probeCancel := context.WithTimeout(context.Background(), 5000*time.Millisecond)
+		defer probeCancel()
 
 		for _, srv := range [][4]byte{{8, 8, 8, 8}, {1, 1, 1, 1}, {9, 9, 9, 9}} {
 			go func(ip [4]byte) {
 				resIP, ttl, qErr := queryUDP53OnStack(probeCtx, activeSess.s, ip, query, txID)
-				if qErr == nil && len(resIP) == 4 {
-					select {
-					case innerAliveCh <- struct{}{}:
-					default:
-					}
-				}
-				resCh <- dnsRes{ip: resIP, ttl: ttl, isOuter: false, err: qErr}
+				resCh <- dnsRes{ip: resIP, ttl: ttl, err: qErr}
 			}(srv)
 		}
 
 		go func() {
 			select {
-			case <-time.After(180 * time.Millisecond):
+			case <-time.After(200 * time.Millisecond):
 				go func() {
 					resIP, ttl, qErr := queryTCP53OnStack(probeCtx, activeSess.s, [4]byte{8, 8, 8, 8}, query, txID)
-					if qErr == nil && len(resIP) == 4 {
-						select {
-						case innerAliveCh <- struct{}{}:
-						default:
-						}
-					}
-					resCh <- dnsRes{ip: resIP, ttl: ttl, isOuter: false, err: qErr}
+					resCh <- dnsRes{ip: resIP, ttl: ttl, err: qErr}
 				}()
 				go func() {
 					resIP, ttl, qErr := queryTCP53OnStack(probeCtx, activeSess.s, [4]byte{1, 1, 1, 1}, query, txID)
-					if qErr == nil && len(resIP) == 4 {
-						select {
-						case innerAliveCh <- struct{}{}:
-						default:
-						}
-					}
-					resCh <- dnsRes{ip: resIP, ttl: ttl, isOuter: false, err: qErr}
+					resCh <- dnsRes{ip: resIP, ttl: ttl, err: qErr}
 				}()
 				go func() {
 					resIP, ttl, qErr := queryOuterDoT(probeCtx, dialer, "8.8.8.8", "dns.google", query, txID)
-					resCh <- dnsRes{ip: resIP, ttl: ttl, isOuter: true, err: qErr}
+					resCh <- dnsRes{ip: resIP, ttl: ttl, err: qErr}
 				}()
 			case <-probeCtx.Done():
 			}
@@ -2527,39 +2559,16 @@ func ovpnFastResolveIPv4(ctx context.Context, dialer internet.Dialer, sess *sstp
 		for i := 0; i < 6; i++ {
 			select {
 			case <-ctx.Done():
-				probeCancel()
 				return nil, ctx.Err()
 			case <-probeCtx.Done():
-				probeCancel()
-				if activeSess.markDead != nil {
-					activeSess.markDead()
-				}
-				return nil, fmt.Errorf("tunnel dns timeout, zombie session purged")
+				return nil, fmt.Errorf("tunnel dns timeout for %s", host)
 			case r := <-resCh:
 				if r.err == nil && len(r.ip) == 4 {
 					dnsCache.Store(host, dnsEntry{ip: r.ip, expire: time.Now().Add(30 * time.Minute)})
-					if r.isOuter {
-						go func(s *sstpSession) {
-							defer probeCancel()
-							select {
-							case <-innerAliveCh:
-							case <-time.After(1200 * time.Millisecond):
-								if s.markDead != nil {
-									s.markDead()
-								}
-							}
-						}(activeSess)
-					} else {
-						probeCancel()
-					}
 					return r.ip, nil
 				}
 				lastErr = r.err
 			}
-		}
-		probeCancel()
-		if activeSess.markDead != nil {
-			activeSess.markDead()
 		}
 		return nil, lastErr
 	})
@@ -3896,7 +3905,7 @@ func dialOpenVPNSessionCore(serverDest net.Destination, dialer internet.Dialer, 
     with open(ovpn_file, "w", encoding="utf-8") as f:
         f.write(ovpn_src)
 
-    print("  ✔ [VPNGate OpenVPN 引擎] 成功注入 (QoS小包插队 + DoT Watchdog + 10分钟保活)")
+    print("  ✔ [VPNGate OpenVPN 引擎] 成功注入 (链式代理宽容 DNS + QoS小包插队 + 10分钟保活)")
 
     if os.system("go mod tidy") != 0:
         raise RuntimeError("❌ go mod tidy 执行失败！")
