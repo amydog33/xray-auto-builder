@@ -1464,6 +1464,344 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 	}
 	_ = tlsConn.SetDeadline(time.Time{})
 
+func inspectSoftEtherHelloPack(body []byte) (strPlusOne bool) {
+	data := body
+	if len(data) >= 8 {
+		first := binary.BigEndian.Uint32(data[0:4])
+		if first > 256 && int(first) <= len(data)-4 {
+			data = data[4 : 4+int(first)]
+		}
+	}
+	if len(data) < 20 {
+		return false
+	}
+	pos := 4
+	nameLen := int(binary.BigEndian.Uint32(data[pos : pos+4]))
+	pos += 4
+	if nameLen <= 1 || pos+nameLen-1+12 > len(data) {
+		return false
+	}
+	pos += nameLen - 1
+	valType := binary.BigEndian.Uint32(data[pos : pos+4])
+	pos += 8 // skip type + num_values
+	if valType == 2 && pos+4 <= len(data) {
+		sLen := int(binary.BigEndian.Uint32(data[pos : pos+4]))
+		pos += 4
+		if sLen > 0 && pos+sLen-1 < len(data) && data[pos+sLen-1] == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func buildSoftEtherLoginPack(strPlusOne bool) []byte {
+	var b bytes.Buffer
+	writeU32 := func(v uint32) {
+		var tmp [4]byte
+		binary.BigEndian.PutUint32(tmp[:], v)
+		b.Write(tmp[:])
+	}
+	writeName := func(s string) {
+		writeU32(uint32(len(s) + 1))
+		b.WriteString(s)
+	}
+	addStr := func(k, v string) {
+		writeName(k)
+		writeU32(2)
+		writeU32(1)
+		if strPlusOne {
+			writeU32(uint32(len(v) + 1))
+		} else {
+			writeU32(uint32(len(v)))
+		}
+		b.WriteString(v)
+	}
+	addInt := func(k string, v uint32) {
+		writeName(k)
+		writeU32(0)
+		writeU32(1)
+		writeU32(v)
+	}
+	writeU32(12)
+	addStr("method", "login")
+	addStr("hubname", "VPNGATE")
+	addStr("username", "vpn")
+	addInt("authtype", 0)
+	addInt("protocol", 0)
+	addInt("use_encrypt", 0)
+	addInt("use_compress", 0)
+	addInt("max_connection", 1)
+	addInt("half_connection", 0)
+	addStr("client_str", "SoftEther VPN Client")
+	addInt("client_ver", 442)
+	addInt("client_build", 9798)
+	return b.Bytes()
+}
+
+func checkSoftEtherLoginResponse(body []byte, strPlusOne bool) error {
+	if len(body) < 4 {
+		return fmt.Errorf("SoftEther 登录响应过短: %d", len(body))
+	}
+	data := body
+	firstU32 := binary.BigEndian.Uint32(data[0:4])
+	if firstU32 > 256 && int(firstU32) <= len(data)-4 && len(data) >= 8 {
+		data = data[4 : 4+int(firstU32)]
+	}
+	numElems := binary.BigEndian.Uint32(data[0:4])
+	pos := 4
+	readU32 := func() (uint32, bool) {
+		if pos+4 > len(data) {
+			return 0, false
+		}
+		v := binary.BigEndian.Uint32(data[pos : pos+4])
+		pos += 4
+		return v, true
+	}
+	for i := uint32(0); i < numElems && i < 128; i++ {
+		nameLen, ok := readU32()
+		if !ok || nameLen == 0 {
+			break
+		}
+		actualNameBytes := int(nameLen) - 1
+		if actualNameBytes < 0 || pos+actualNameBytes > len(data) {
+			break
+		}
+		name := strings.TrimRight(string(data[pos:pos+actualNameBytes]), "\x00")
+		pos += actualNameBytes
+
+		valType, ok := readU32()
+		if !ok {
+			break
+		}
+		numVals, ok := readU32()
+		if !ok || numVals > 256 {
+			break
+		}
+		for j := uint32(0); j < numVals; j++ {
+			switch valType {
+			case 0:
+				v, ok := readU32()
+				if !ok {
+					return nil
+				}
+				if name == "error" && j == 0 && v != 0 {
+					return fmt.Errorf("SoftEther 拒绝登录 (error=%d)", v)
+				}
+			case 4:
+				if pos+8 > len(data) {
+					return nil
+				}
+				pos += 8
+			case 2:
+				dLen, ok := readU32()
+				if !ok {
+					return nil
+				}
+				adv := int(dLen)
+				if strPlusOne && adv > 0 {
+					adv--
+				}
+				if adv < 0 || pos+adv > len(data) {
+					return nil
+				}
+				pos += adv
+			case 1, 3:
+				dLen, ok := readU32()
+				if !ok || pos+int(dLen) > len(data) {
+					return nil
+				}
+				pos += int(dLen)
+			default:
+				return nil
+			}
+		}
+	}
+	return nil
+}
+
+// 自适应读取：同时兼容 HTTP/1.1 200 OK 封装与纯二进制 RecvPack 流
+func readSoftEtherPackOrHTTP(br *bufio.Reader) ([]byte, error) {
+	peek, err := br.Peek(4)
+	if err != nil {
+		return nil, err
+	}
+	if string(peek) != "HTTP" {
+		rawLen := int(binary.BigEndian.Uint32(peek))
+		if rawLen <= 0 || rawLen > 65536 {
+			return nil, fmt.Errorf("SoftEther 非HTTP响应首字异常: %x", peek)
+		}
+		_, _ = br.Discard(4)
+		body := make([]byte, rawLen)
+		if _, err := io.ReadFull(br, body); err != nil {
+			return nil, err
+		}
+		return body, nil
+	}
+
+	statusLine, err := br.ReadString('\n')
+	if err != nil {
+		return nil, err
+	}
+	if !strings.Contains(statusLine, "200") {
+		return nil, fmt.Errorf("HTTP状态异常: %s", strings.TrimSpace(statusLine))
+	}
+	contentLen := 0
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			return nil, err
+		}
+		if line == "\r\n" || line == "\n" {
+			break
+		}
+		lower := strings.ToLower(strings.TrimSpace(line))
+		if strings.HasPrefix(lower, "content-length:") {
+			_, _ = fmt.Sscanf(strings.TrimSpace(lower[len("content-length:"):]), "%d", &contentLen)
+		}
+	}
+	if contentLen <= 0 || contentLen > 65536 {
+		return nil, fmt.Errorf("HTTP响应体长度无效: %d", contentLen)
+	}
+	body := make([]byte, contentLen)
+	if _, err := io.ReadFull(br, body); err != nil {
+		return nil, err
+	}
+	return body, nil
+}
+
+func buildDHCPFrame(msgType byte, xid uint32, myMAC [6]byte, reqIP, serverIP []byte) []byte {
+	bootp := make([]byte, 300)
+	bootp[0], bootp[1], bootp[2] = 1, 1, 6
+	binary.BigEndian.PutUint32(bootp[4:8], xid)
+	binary.BigEndian.PutUint16(bootp[10:12], 0x8000)
+	copy(bootp[28:34], myMAC[:])
+	bootp[236], bootp[237], bootp[238], bootp[239] = 99, 130, 83, 99
+	idx := 240
+	bootp[idx], bootp[idx+1], bootp[idx+2] = 53, 1, msgType
+	idx += 3
+	if len(reqIP) == 4 {
+		bootp[idx], bootp[idx+1] = 50, 4
+		copy(bootp[idx+2:idx+6], reqIP)
+		idx += 6
+	}
+	if len(serverIP) == 4 {
+		bootp[idx], bootp[idx+1] = 54, 4
+		copy(bootp[idx+2:idx+6], serverIP)
+		idx += 6
+	}
+	bootp[idx], bootp[idx+1], bootp[idx+2], bootp[idx+3], bootp[idx+4] = 55, 3, 1, 3, 6
+	bootp[idx+5] = 255
+
+	udpLen := 8 + len(bootp)
+	ipLen := 20 + udpLen
+	eth := make([]byte, 14+ipLen)
+	for i := 0; i < 6; i++ {
+		eth[i] = 0xff
+	}
+	copy(eth[6:12], myMAC[:])
+	eth[12], eth[13] = 0x08, 0x00
+
+	ip := eth[14 : 14+20]
+	ip[0] = 0x45
+	binary.BigEndian.PutUint16(ip[2:4], uint16(ipLen))
+	ip[8], ip[9] = 64, 17
+	ip[16], ip[17], ip[18], ip[19] = 255, 255, 255, 255
+	var csum uint32
+	for i := 0; i < 20; i += 2 {
+		csum += uint32(binary.BigEndian.Uint16(ip[i : i+2]))
+	}
+	for (csum >> 16) > 0 {
+		csum = (csum & 0xffff) + (csum >> 16)
+	}
+	binary.BigEndian.PutUint16(ip[10:12], ^uint16(csum))
+
+	udpHdr := eth[34 : 34+8]
+	binary.BigEndian.PutUint16(udpHdr[0:2], 68)
+	binary.BigEndian.PutUint16(udpHdr[2:4], 67)
+	binary.BigEndian.PutUint16(udpHdr[4:6], uint16(udpLen))
+	copy(eth[42:], bootp)
+	return eth
+}
+
+func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dialer, baseKey, slotKey string, isBackground bool) (*sstpSession, error) {
+	bgCtx := context.Background()
+	connCtx, connCancel := context.WithCancel(bgCtx)
+	var handshakeSucceeded atomic.Bool
+	var rawConn net.Conn
+	var stage atomic.Value
+	stage.Store("0-前置拨号")
+
+	// 用真实定时器关闭管道，解决 Xray 链式代理 cnc.Connection 下 SetDeadline 空函数失效问题
+	abortTimer := time.AfterFunc(6500*time.Millisecond, func() {
+		if !handshakeSucceeded.Load() {
+			connCancel()
+			if rawConn != nil {
+				_ = rawConn.Close()
+			}
+		}
+	})
+	defer func() {
+		abortTimer.Stop()
+		if !handshakeSucceeded.Load() {
+			connCancel()
+		}
+	}()
+
+	var activePort net.Port
+	var err error
+	rawConn, activePort, err = dialWithPortFallback(connCtx, dialer, serverDest)
+	if err != nil {
+		return nil, fmt.Errorf("阶段[%s]: %w", stage.Load().(string), err)
+	}
+
+	stage.Store("1-TLS握手")
+	host := serverDest.Address.String()
+	sniHost := host
+	if serverDest.Address.Family().IsIP() {
+		sniHost = "www.microsoft.com"
+	}
+	tlsConn := tls.Client(rawConn, buildCompatTLSConfig(sniHost))
+	if err := tlsConn.HandshakeContext(connCtx); err != nil {
+		rawConn.Close()
+		return nil, fmt.Errorf("阶段[%s]: %w", stage.Load().(string), err)
+	}
+
+	// TLS 握手已通，重置定时器给 HTTP/PACK 握手与 DHCP 留足 5 秒
+	abortTimer.Reset(5000 * time.Millisecond)
+	stage.Store("2-connect.cgi签名")
+	sigReq := fmt.Sprintf("POST /vpnsvc/connect.cgi HTTP/1.1\r\nHost: %s\r\nContent-Type: image/jpeg\r\nConnection: Keep-Alive\r\nContent-Length: 10\r\n\r\nVPNCONNECT", host)
+	if _, err := tlsConn.Write([]byte(sigReq)); err != nil {
+		rawConn.Close()
+		return nil, fmt.Errorf("阶段[%s写]: %w", stage.Load().(string), err)
+	}
+	br := bufio.NewReaderSize(tlsConn, 131072)
+	helloBody, err := readSoftEtherPackOrHTTP(br)
+	if err != nil {
+		rawConn.Close()
+		return nil, fmt.Errorf("阶段[%s读]: %w", stage.Load().(string), err)
+	}
+
+	stage.Store("3-vpn.cgi登录")
+	strPlusOne := inspectSoftEtherHelloPack(helloBody)
+	packBytes := buildSoftEtherLoginPack(strPlusOne)
+	var loginBuf bytes.Buffer
+	fmt.Fprintf(&loginBuf, "POST /vpnsvc/vpn.cgi HTTP/1.1\r\nHost: %s\r\nContent-Type: image/jpeg\r\nConnection: Keep-Alive\r\nContent-Length: %d\r\n\r\n", host, len(packBytes))
+	loginBuf.Write(packBytes)
+
+	if _, err := tlsConn.Write(loginBuf.Bytes()); err != nil {
+		rawConn.Close()
+		return nil, fmt.Errorf("阶段[%s写]: %w", stage.Load().(string), err)
+	}
+	loginRespBody, err := readSoftEtherPackOrHTTP(br)
+	if err != nil {
+		rawConn.Close()
+		return nil, fmt.Errorf("阶段[%s读]: %w", stage.Load().(string), err)
+	}
+	if err := checkSoftEtherLoginResponse(loginRespBody, strPlusOne); err != nil {
+		rawConn.Close()
+		return nil, fmt.Errorf("阶段[%s验]: %w", stage.Load().(string), err)
+	}
+
 	s, ep, err := newGVisorStack()
 	if err != nil {
 		rawConn.Close()
