@@ -1826,7 +1826,7 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
             f.write(new_code)
         print("  ✔ [VPNGate 主引擎] 成功注入无锁单槽直通与内层 UDP53 秒解补丁")
 # =========================================================================
-# 7. 注入 VPNGate OpenVPN 终极零拷贝引擎 (无锁Singleflight + 原地零拷贝解密 + 零定时器风暴 + 32KB写合并)
+# 7. 注入 VPNGate OpenVPN 终极修复引擎 (清除了失效预热IP + 内层UDP/TCP53双栈解析 + 完整PUSH_REPLY + IPv4精确截断)
 # =========================================================================
 if os.path.exists(socks_dir):
     ovpn_file = os.path.join(socks_dir, "vpngate_openvpn.go")
@@ -2053,6 +2053,36 @@ func queryUDP53OnStack(ctx context.Context, s *stack.Stack, dnsIP [4]byte, query
 	return parseDNSResponseIPv4(resp[:n], txID)
 }
 
+func queryTCP53OnStack(ctx context.Context, s *stack.Stack, dnsIP [4]byte, query []byte, txID uint16) ([]byte, uint32, error) {
+	dCtx, cancel := context.WithTimeout(ctx, 2200*time.Millisecond)
+	defer cancel()
+	conn, err := gonet.DialContextTCP(dCtx, s, tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFrom4(dnsIP), Port: 53}, ipv4.ProtocolNumber)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2200 * time.Millisecond))
+	tcpReq := make([]byte, 2+len(query))
+	binary.BigEndian.PutUint16(tcpReq[0:2], uint16(len(query)))
+	copy(tcpReq[2:], query)
+	if _, err := conn.Write(tcpReq); err != nil {
+		return nil, 0, err
+	}
+	var lenHdr [2]byte
+	if _, err := io.ReadFull(conn, lenHdr[:]); err != nil {
+		return nil, 0, err
+	}
+	msgLen := int(binary.BigEndian.Uint16(lenHdr[:]))
+	if msgLen < 12 || msgLen > 4096 {
+		return nil, 0, fmt.Errorf("bad tcp53 len")
+	}
+	resp := make([]byte, msgLen)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		return nil, 0, err
+	}
+	return parseDNSResponseIPv4(resp, txID)
+}
+
 func ovpnFastResolveIPv4(ctx context.Context, sess *sstpSession, host string) ([]byte, error) {
 	return ovpnDNSSF.Do(host, func() ([]byte, error) {
 		if cached, ok := dnsCache.Load(host); ok {
@@ -2076,8 +2106,8 @@ func ovpnFastResolveIPv4(ctx context.Context, sess *sstpSession, host string) ([
 			ttl uint32
 			err error
 		}
-		resCh := make(chan dnsRes, 2)
-		qCtx, cancel := context.WithTimeout(ctx, 2000*time.Millisecond)
+		resCh := make(chan dnsRes, 4)
+		qCtx, cancel := context.WithTimeout(ctx, 2500*time.Millisecond)
 		defer cancel()
 		for _, srv := range [][4]byte{{8, 8, 8, 8}, {1, 1, 1, 1}} {
 			go func(ip [4]byte) {
@@ -2085,8 +2115,22 @@ func ovpnFastResolveIPv4(ctx context.Context, sess *sstpSession, host string) ([
 				resCh <- dnsRes{ip: resIP, ttl: ttl, err: qErr}
 			}(srv)
 		}
+		// 若节点封禁内层 UDP 53，350ms 后自动并发追加内层 TCP 53 兜底
+		go func() {
+			select {
+			case <-time.After(350 * time.Millisecond):
+				for _, srv := range [][4]byte{{8, 8, 8, 8}, {1, 1, 1, 1}} {
+					go func(ip [4]byte) {
+						resIP, ttl, qErr := queryTCP53OnStack(qCtx, activeSess.s, ip, query, txID)
+						resCh <- dnsRes{ip: resIP, ttl: ttl, err: qErr}
+					}(srv)
+				}
+			case <-qCtx.Done():
+			}
+		}()
+
 		var lastErr error
-		for i := 0; i < 2; i++ {
+		for i := 0; i < 4; i++ {
 			select {
 			case <-qCtx.Done():
 				return nil, qCtx.Err()
@@ -2317,7 +2361,6 @@ func (u *udpPacketIO) RemoteAddr() net.Addr               { return u.raw.RemoteA
 func (u *udpPacketIO) SetDeadline(tm time.Time) error     { return u.raw.SetDeadline(tm) }
 func (u *udpPacketIO) SetReadDeadline(tm time.Time) error { return u.raw.SetReadDeadline(tm) }
 func (u *udpPacketIO) SetWriteDeadline(tm time.Time) error { return u.raw.SetWriteDeadline(tm) }
-
 type unackedCtrlPkt struct {
 	pkt      []byte
 	lastSent time.Time
@@ -2654,16 +2697,22 @@ func openvpnPRF(secret, label, seed []byte, outLen int) []byte {
 	return res
 }
 
+// 严格按 IPv4 Header TotalLength 截断尾部填充并重算 TCP 校验和，防止以太网 60B 零填充破坏校验和
 func clampIPv4TCPMSSInPlace(ipPkt []byte, maxMSS uint16) {
 	if len(ipPkt) < 40 || (ipPkt[0]>>4) != 4 || ipPkt[9] != 6 {
 		return
 	}
+	totLen := int(binary.BigEndian.Uint16(ipPkt[2:4]))
+	if totLen < 40 || totLen > len(ipPkt) {
+		return
+	}
+	ipPkt = ipPkt[:totLen]
 	ihl := int(ipPkt[0]&0x0f) * 4
-	if ihl < 20 || len(ipPkt) < ihl+20 || (ipPkt[ihl+13]&0x02) == 0 {
+	if ihl < 20 || totLen < ihl+20 || (ipPkt[ihl+13]&0x02) == 0 {
 		return
 	}
 	doff := int(ipPkt[ihl+12]>>4) * 4
-	if doff <= 20 || len(ipPkt) < ihl+doff {
+	if doff <= 20 || totLen < ihl+doff {
 		return
 	}
 	modified := false
@@ -2696,17 +2745,17 @@ func clampIPv4TCPMSSInPlace(ipPkt []byte, maxMSS uint16) {
 		return
 	}
 	ipPkt[ihl+16], ipPkt[ihl+17] = 0, 0
-	tcpLen := len(ipPkt) - ihl
+	tcpLen := totLen - ihl
 	var sum uint32
 	for i := 12; i < 20; i += 2 {
 		sum += uint32(binary.BigEndian.Uint16(ipPkt[i : i+2]))
 	}
 	sum += 6 + uint32(tcpLen)
-	for i := ihl; i+1 < len(ipPkt); i += 2 {
+	for i := ihl; i+1 < totLen; i += 2 {
 		sum += uint32(binary.BigEndian.Uint16(ipPkt[i : i+2]))
 	}
 	if tcpLen%2 == 1 {
-		sum += uint32(ipPkt[len(ipPkt)-1]) << 8
+		sum += uint32(ipPkt[totLen-1]) << 8
 	}
 	for (sum >> 16) > 0 {
 		sum = (sum & 0xffff) + (sum >> 16)
@@ -2924,7 +2973,7 @@ func dialOpenVPNSessionCore(serverDest net.Destination, dialer internet.Dialer, 
 	defer stopPush()
 
 	go func() {
-		ticker := time.NewTicker(200 * time.Millisecond)
+		ticker := time.NewTicker(250 * time.Millisecond)
 		defer ticker.Stop()
 		for {
 			select {
@@ -2943,7 +2992,8 @@ func dialOpenVPNSessionCore(serverDest net.Destination, dialer internet.Dialer, 
 	var peerID uint32
 	var pushAcc strings.Builder
 	pushBuf := make([]byte, 2048)
-	for attempts := 0; attempts < 25; attempts++ {
+	// 严格等待 \x00 结尾，防止 PUSH_REPLY 末尾的 cipher AES-128-GCM,peer-id 0 被提前截断
+	for attempts := 0; attempts < 30; attempts++ {
 		n, err := tlsConn.Read(pushBuf)
 		if err != nil {
 			stopPush()
@@ -2959,7 +3009,7 @@ func dialOpenVPNSessionCore(serverDest net.Destination, dialer internet.Dialer, 
 		}
 		if idx := strings.Index(reply, "PUSH_REPLY"); idx != -1 {
 			sub := reply[idx:]
-			if strings.Contains(sub, "ifconfig ") && (strings.IndexByte(sub, 0) != -1 || len(sub) > 30) {
+			if strings.IndexByte(sub, 0) != -1 {
 				cleanReply := strings.SplitN(sub, "\x00", 2)[0]
 				for _, token := range strings.Split(cleanReply, ",") {
 					parts := strings.Fields(strings.TrimSpace(token))
@@ -3090,6 +3140,11 @@ func dialOpenVPNSessionCore(serverDest net.Destination, dialer internet.Dialer, 
 			ipPkt = ipPkt[1:]
 		}
 		if len(ipPkt) >= 20 && (ipPkt[0]>>4) == 4 {
+			totLen := int(binary.BigEndian.Uint16(ipPkt[2:4]))
+			if totLen < 20 || totLen > len(ipPkt) {
+				return
+			}
+			ipPkt = ipPkt[:totLen]
 			lastActiveNano.Store(time.Now().UnixNano())
 			clampIPv4TCPMSSInPlace(ipPkt, 1240)
 			pBuf := stack.NewPacketBuffer(stack.PacketBufferOptions{
@@ -3390,7 +3445,19 @@ func dialOpenVPNSessionCore(serverDest net.Destination, dialer internet.Dialer, 
 """
     with open(ovpn_file, "w", encoding="utf-8") as f:
         f.write(ovpn_src)
-    print("  ✔ [VPNGate OpenVPN] 成功注入终极零拷贝引擎 (AEAD P_DATA_V2 + 原地零拷贝解密 + 32KB写合并)")
+
+    # 自动移除第 6 部分中失效的 Akamai 预热 IP，并修复 SoftEther 二层帧尾部填充截断
+    with open(vg_file, "r", encoding="utf-8") as f:
+        vg_code = f.read()
+    vg_code = vg_code.replace('"www.msftconnecttest.com":       {23, 216, 147, 76},\n', "")
+    vg_code = vg_code.replace(
+        "clampIPv4TCPMSSInPlace(ipPkt, 1240)",
+        "if tot := int(binary.BigEndian.Uint16(ipPkt[2:4])); tot >= 20 && tot <= len(ipPkt) {\n\t\t\t\t\tipPkt = ipPkt[:tot]\n\t\t\t\t}\n\t\t\t\tclampIPv4TCPMSSInPlace(ipPkt, 1240)",
+    )
+    with open(vg_file, "w", encoding="utf-8") as f:
+        f.write(vg_code)
+
+    print("  ✔ [VPNGate OpenVPN] 成功注入终极修复引擎 (清除死IP + 内层UDP/TCP53双栈解析 + 完整PUSH_REPLY + 精确帧截断)")
 
     if os.system("go mod tidy") != 0:
         raise RuntimeError("❌ go mod tidy 执行失败！")
