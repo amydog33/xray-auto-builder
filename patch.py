@@ -533,6 +533,8 @@ func hasAnyAliveSlot(baseKey string) bool {
 	return tryReuseExistingSession(baseKey, baseKey+"#0") != nil
 }
 
+var sslHintPortCache sync.Map
+
 func isVPNGateServer(server *protocol.ServerSpec) bool {
 	if server == nil || server.User == nil || server.User.Account == nil {
 		return false
@@ -542,8 +544,13 @@ func isVPNGateServer(server *protocol.ServerSpec) bool {
 		if u == "vpn" || u == "vpngate" {
 			pw := strings.ToLower(strings.TrimSpace(acc.Password))
 			baseKey := server.Destination.String()
-			if pw == "ssl" || pw == "softether" || strings.HasPrefix(pw, "ssl:") {
+			if pw == "ssl" || pw == "softether" {
 				ovpnProtoCache.Store(baseKey, "softether-ssl")
+			} else if strings.HasPrefix(pw, "ssl:") {
+				ovpnProtoCache.Store(baseKey, "softether-ssl")
+				if p, err := strconv.Atoi(strings.TrimPrefix(pw, "ssl:")); err == nil && p > 0 && p <= 65535 {
+					sslHintPortCache.Store(baseKey, uint16(p))
+				}
 			} else {
 				cacheOVPNFromPassword(baseKey, acc.Password)
 			}
@@ -553,55 +560,82 @@ func isVPNGateServer(server *protocol.ServerSpec) bool {
 	return false
 }
 
-func dialWithPortFallback(ctx context.Context, dialer internet.Dialer, serverDest net.Destination) (net.Conn, net.Port, error) {
+// 并发竞速完整 Dial + TLS 握手（同时穿透 443 端口封锁与 Xray 链式代理 0-RTT 假连接）
+func dialAndTLSWithPortRace(connCtx context.Context, dialer internet.Dialer, serverDest net.Destination, sniHost string) (net.Conn, *tls.Conn, net.Port, error) {
 	origPort := serverDest.Port
 	ports := []net.Port{origPort}
-	if origPort != 443 && origPort != 995 {
-		for _, fp := range []net.Port{443, 995, 5555} {
-			if fp != origPort {
-				ports = append(ports, fp)
-			}
+	if hint, ok := sslHintPortCache.Load(serverDest.String()); ok {
+		if hp := net.Port(hint.(uint16)); hp != origPort {
+			ports = append(ports, hp)
 		}
 	}
-	if len(ports) == 1 {
-		c, err := dialer.Dial(ctx, serverDest)
-		return c, origPort, err
+	for _, fp := range []net.Port{995, 5555, 992, 1194, 443} {
+		exists := false
+		for _, p := range ports {
+			if p == fp {
+				exists = true
+				break
+			}
+		}
+		if !exists {
+			ports = append(ports, fp)
+		}
 	}
 
-	type dialRes struct {
-		conn net.Conn
-		port net.Port
-		err  error
+	type raceRes struct {
+		conn    net.Conn
+		tlsConn *tls.Conn
+		port    net.Port
+		err     error
 	}
-	ch := make(chan dialRes, len(ports))
-	dCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	ch := make(chan raceRes, len(ports))
+	raceCtx, raceCancel := context.WithTimeout(connCtx, 3800*time.Millisecond)
+	defer raceCancel()
 
 	var won atomic.Bool
 	for i, p := range ports {
 		go func(idx int, port net.Port) {
 			if idx > 0 {
 				select {
-				case <-time.After(time.Duration(1100+(idx-1)*150) * time.Millisecond):
-				case <-dCtx.Done():
+				case <-time.After(time.Duration(idx*120) * time.Millisecond):
+				case <-raceCtx.Done():
 					return
 				}
 			}
 			dest := net.TCPDestination(serverDest.Address, port)
-			c, err := dialer.Dial(dCtx, dest)
-			if err == nil {
-				if !won.CompareAndSwap(false, true) {
-					c.Close()
-					return
+			// 必须传入长生命周期的 connCtx，防止 raceCancel() 误杀胜出者的底层 VLESS 管道
+			c, err := dialer.Dial(connCtx, dest)
+			if err != nil {
+				select {
+				case ch <- raceRes{port: port, err: err}:
+				case <-raceCtx.Done():
 				}
-				cancel()
+				return
 			}
-			select {
-			case ch <- dialRes{conn: c, port: port, err: err}:
-			case <-dCtx.Done():
-				if c != nil {
-					c.Close()
+			if raceCtx.Err() != nil {
+				c.Close()
+				return
+			}
+			tc := tls.Client(c, buildCompatTLSConfig(sniHost))
+			if err := tc.HandshakeContext(raceCtx); err != nil {
+				c.Close()
+				select {
+				case ch <- raceRes{port: port, err: err}:
+				case <-raceCtx.Done():
 				}
+				return
+			}
+			if !won.CompareAndSwap(false, true) {
+				tc.Close()
+				c.Close()
+				return
+			}
+			raceCancel()
+			select {
+			case ch <- raceRes{conn: c, tlsConn: tc, port: port}:
+			default:
+				tc.Close()
+				c.Close()
 			}
 		}(i, p)
 	}
@@ -610,23 +644,26 @@ func dialWithPortFallback(ctx context.Context, dialer internet.Dialer, serverDes
 	for range ports {
 		select {
 		case r := <-ch:
-			if r.err == nil && r.conn != nil {
-				return r.conn, r.port, nil
+			if r.err == nil && r.conn != nil && r.tlsConn != nil {
+				if r.port != origPort {
+					errors.LogInfo(context.Background(), fmt.Sprintf("[VPNGate] 端口竞速绕过命中 -> %s:%d (原端口 %d 无响应)", serverDest.Address.String(), r.port, origPort))
+				}
+				return r.conn, r.tlsConn, r.port, nil
 			}
 			if r.err != nil {
 				lastErr = r.err
 			}
-		case <-dCtx.Done():
+		case <-raceCtx.Done():
 			if lastErr == nil {
-				lastErr = dCtx.Err()
+				lastErr = raceCtx.Err()
 			}
-			return nil, origPort, lastErr
+			return nil, nil, origPort, lastErr
 		}
 	}
 	if lastErr == nil {
-		lastErr = fmt.Errorf("所有回退端口拨号均失败")
+		lastErr = fmt.Errorf("所有端口 TLS 握手竞速均无响应")
 	}
-	return nil, origPort, lastErr
+	return nil, nil, origPort, lastErr
 }
 
 func getSlotMutex(slotKey string) *sync.Mutex {
@@ -750,7 +787,7 @@ func dialSlotSession(ctx context.Context, serverDest net.Destination, dialer int
 
 	if !isBackground {
 		if failTime, ok := failCache.Load(baseKey); ok {
-			if time.Since(failTime.(time.Time)) < 6*time.Second {
+			if time.Since(failTime.(time.Time)) < 5*time.Second {
 				return nil, fmt.Errorf("节点 %s 处于失败冷却中", baseKey)
 			}
 			failCache.Delete(baseKey)
@@ -800,27 +837,31 @@ func dialSlotSession(ctx context.Context, serverDest net.Destination, dialer int
 		}
 	}
 
+	effectiveDest := serverDest
 	if pCached != "ms-sstp" {
-		sess, seErr := dialSoftEtherNativeSession(serverDest, dialer, baseKey, slotKey, isBackground)
+		sess, hitPort, seErr := dialSoftEtherNativeSession(serverDest, dialer, baseKey, slotKey, isBackground)
 		if seErr == nil {
 			ovpnProtoCache.Store(baseKey, "softether-ssl")
 			return sess, nil
 		}
-		errors.LogInfo(bgCtx, fmt.Sprintf("[VPNGate] SoftEther-SSL 未命中 (%v)，回退尝试 MS-SSTP -> %s", seErr, serverDest.String()))
+		if hitPort != 0 {
+			effectiveDest = net.TCPDestination(serverDest.Address, hitPort)
+		}
+		errors.LogInfo(bgCtx, fmt.Sprintf("[VPNGate] SoftEther-SSL 未命中 (%v)，回退尝试 MS-SSTP -> %s", seErr, effectiveDest.String()))
 	}
 
-	if sstpSess, sstpErr := dialMSSSTPSession(serverDest, dialer, baseKey, slotKey, isBackground); sstpErr == nil {
+	if sstpSess, sstpErr := dialMSSSTPSession(effectiveDest, dialer, baseKey, slotKey, isBackground); sstpErr == nil {
 		ovpnProtoCache.Store(baseKey, "ms-sstp")
 		return sstpSess, nil
 	} else if pCached == "ms-sstp" {
-		if sess, seErr := dialSoftEtherNativeSession(serverDest, dialer, baseKey, slotKey, isBackground); seErr == nil {
+		if sess, _, seErr := dialSoftEtherNativeSession(serverDest, dialer, baseKey, slotKey, isBackground); seErr == nil {
 			ovpnProtoCache.Store(baseKey, "softether-ssl")
 			return sess, nil
 		}
 	}
 
 	ovpnCfg := getOrDefaultOVPNConfig(baseKey)
-	if ovpnSess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, false); ovpnErr == nil {
+	if ovpnSess, ovpnErr := dialOpenVPNSession(effectiveDest, dialer, baseKey, slotKey, ovpnCfg, false); ovpnErr == nil {
 		ovpnProtoCache.Store(baseKey, "openvpn-tcp")
 		return ovpnSess, nil
 	}
@@ -841,7 +882,7 @@ func dialMSSSTPSession(serverDest net.Destination, dialer internet.Dialer, baseK
 	connCtx, connCancel := context.WithCancel(bgCtx)
 	var handshakeSucceeded atomic.Bool
 	var rawConn net.Conn
-	abortTimer := time.AfterFunc(8*time.Second, func() {
+	abortTimer := time.AfterFunc(6500*time.Millisecond, func() {
 		if !handshakeSucceeded.Load() {
 			connCancel()
 			if rawConn != nil {
@@ -856,21 +897,16 @@ func dialMSSSTPSession(serverDest net.Destination, dialer internet.Dialer, baseK
 		}
 	}()
 
-	var activePort net.Port
-	var err error
-	rawConn, activePort, err = dialWithPortFallback(connCtx, dialer, serverDest)
-	if err != nil {
-		return nil, err
-	}
-
 	host := serverDest.Address.String()
 	sniHost := host
 	if serverDest.Address.Family().IsIP() {
 		sniHost = "www.microsoft.com"
 	}
-	tlsConn := tls.Client(rawConn, buildCompatTLSConfig(sniHost))
-	if err := tlsConn.HandshakeContext(connCtx); err != nil {
-		rawConn.Close()
+	var tlsConn *tls.Conn
+	var activePort net.Port
+	var err error
+	rawConn, tlsConn, activePort, err = dialAndTLSWithPortRace(connCtx, dialer, serverDest, sniHost)
+	if err != nil {
 		return nil, err
 	}
 
@@ -1176,7 +1212,7 @@ func dialMSSSTPSession(serverDest net.Destination, dialer internet.Dialer, baseK
 	case <-sess.dead:
 		markDead()
 		return nil, fmt.Errorf("SSTP 握手中被服务端断开")
-	case <-time.After(3500 * time.Millisecond):
+	case <-time.After(3000 * time.Millisecond):
 		markDead()
 		return nil, fmt.Errorf("SSTP PPP/IPCP 协商超时")
 	}
@@ -1451,15 +1487,15 @@ func buildDHCPFrame(msgType byte, xid uint32, myMAC [6]byte, reqIP, serverIP []b
 	return eth
 }
 
-func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dialer, baseKey, slotKey string, isBackground bool) (*sstpSession, error) {
+func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dialer, baseKey, slotKey string, isBackground bool) (*sstpSession, net.Port, error) {
 	bgCtx := context.Background()
 	connCtx, connCancel := context.WithCancel(bgCtx)
 	var handshakeSucceeded atomic.Bool
 	var rawConn net.Conn
 	var stage atomic.Value
-	stage.Store("0-前置拨号")
+	stage.Store("1-多端口TLS竞速")
 
-	abortTimer := time.AfterFunc(6500*time.Millisecond, func() {
+	abortTimer := time.AfterFunc(8000*time.Millisecond, func() {
 		if !handshakeSucceeded.Load() {
 			connCancel()
 			if rawConn != nil {
@@ -1474,37 +1510,32 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 		}
 	}()
 
-	var activePort net.Port
-	var err error
-	rawConn, activePort, err = dialWithPortFallback(connCtx, dialer, serverDest)
-	if err != nil {
-		return nil, fmt.Errorf("阶段[%s]: %w", stage.Load().(string), err)
-	}
-
-	stage.Store("1-TLS握手")
 	host := serverDest.Address.String()
 	sniHost := host
 	if serverDest.Address.Family().IsIP() {
 		sniHost = "www.microsoft.com"
 	}
-	tlsConn := tls.Client(rawConn, buildCompatTLSConfig(sniHost))
-	if err := tlsConn.HandshakeContext(connCtx); err != nil {
-		rawConn.Close()
-		return nil, fmt.Errorf("阶段[%s]: %w", stage.Load().(string), err)
+
+	var tlsConn *tls.Conn
+	var activePort net.Port
+	var err error
+	rawConn, tlsConn, activePort, err = dialAndTLSWithPortRace(connCtx, dialer, serverDest, sniHost)
+	if err != nil {
+		return nil, 0, fmt.Errorf("阶段[%s]: %w", stage.Load().(string), err)
 	}
 
-	abortTimer.Reset(5000 * time.Millisecond)
+	abortTimer.Reset(4500 * time.Millisecond)
 	stage.Store("2-connect.cgi签名")
 	sigReq := fmt.Sprintf("POST /vpnsvc/connect.cgi HTTP/1.1\r\nHost: %s\r\nContent-Type: image/jpeg\r\nConnection: Keep-Alive\r\nContent-Length: 10\r\n\r\nVPNCONNECT", host)
 	if _, err := tlsConn.Write([]byte(sigReq)); err != nil {
 		rawConn.Close()
-		return nil, fmt.Errorf("阶段[%s写]: %w", stage.Load().(string), err)
+		return nil, activePort, fmt.Errorf("阶段[%s写]: %w", stage.Load().(string), err)
 	}
 	br := bufio.NewReaderSize(tlsConn, 131072)
 	helloBody, err := readSoftEtherPackOrHTTP(br)
 	if err != nil {
 		rawConn.Close()
-		return nil, fmt.Errorf("阶段[%s读]: %w", stage.Load().(string), err)
+		return nil, activePort, fmt.Errorf("阶段[%s读]: %w", stage.Load().(string), err)
 	}
 
 	stage.Store("3-vpn.cgi登录")
@@ -1516,22 +1547,22 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 
 	if _, err := tlsConn.Write(loginBuf.Bytes()); err != nil {
 		rawConn.Close()
-		return nil, fmt.Errorf("阶段[%s写]: %w", stage.Load().(string), err)
+		return nil, activePort, fmt.Errorf("阶段[%s写]: %w", stage.Load().(string), err)
 	}
 	loginRespBody, err := readSoftEtherPackOrHTTP(br)
 	if err != nil {
 		rawConn.Close()
-		return nil, fmt.Errorf("阶段[%s读]: %w", stage.Load().(string), err)
+		return nil, activePort, fmt.Errorf("阶段[%s读]: %w", stage.Load().(string), err)
 	}
 	if err := checkSoftEtherLoginResponse(loginRespBody, strPlusOne); err != nil {
 		rawConn.Close()
-		return nil, fmt.Errorf("阶段[%s验]: %w", stage.Load().(string), err)
+		return nil, activePort, fmt.Errorf("阶段[%s验]: %w", stage.Load().(string), err)
 	}
 
 	s, ep, err := newGVisorStack()
 	if err != nil {
 		rawConn.Close()
-		return nil, err
+		return nil, activePort, err
 	}
 
 	var myMAC [6]byte
@@ -1823,10 +1854,10 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 	case lease = <-ipReady:
 	case <-sess.dead:
 		markDead()
-		return nil, fmt.Errorf("阶段[4-DHCP]: SoftEther 隧道在握手中提前断开")
-	case <-time.After(4500 * time.Millisecond):
+		return nil, activePort, fmt.Errorf("阶段[4-DHCP]: SoftEther 隧道在握手中提前断开")
+	case <-time.After(3500 * time.Millisecond):
 		markDead()
-		return nil, fmt.Errorf("阶段[4-DHCP]: SoftEther Virtual DHCP 分配 IP 超时")
+		return nil, activePort, fmt.Errorf("阶段[4-DHCP]: SoftEther Virtual DHCP 分配 IP 超时")
 	}
 
 	_ = s.AddProtocolAddress(1, tcpip.ProtocolAddress{
@@ -1838,7 +1869,7 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 	handshakeSucceeded.Store(true)
 	slotBackoff.Delete(slotKey)
 	bindSessionAllSlots(baseKey, slotKey, sess)
-	return sess, nil
+	return sess, activePort, nil
 }
 
 func resolveFast(ctx context.Context, dialer internet.Dialer, sess *sstpSession, domain string) ([]byte, error) {
