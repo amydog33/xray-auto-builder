@@ -326,7 +326,7 @@ func notifyHUD(tag string, dest string) {
         print("  ✔ [HUD] 广播钩子已存在 (幂等跳过)")
 
 # =========================================================================
-# 6. 注入 VPNGate 全协议兼容 + secon 标准 SoftEther 协议栈 + Happy Eyeballs
+# 6. 注入 VPNGate 全协议兼容 + secon 标准 SoftEther 协议栈 + gVisor BBR
 # =========================================================================
 socks_dir = "proxy/socks"
 if os.path.exists(socks_dir):
@@ -346,7 +346,6 @@ import (
 	"io"
 	"math/bits"
 	"net/http"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -382,6 +381,8 @@ type sstpSession struct {
 	isSoftEther bool
 	myMAC       [6]byte
 	gwMAC       atomic.Value
+	dhcpDNS     [4]byte
+	hasDHCPDNS  atomic.Bool
 }
 
 type dnsEntry struct {
@@ -499,22 +500,7 @@ func buildCompatTLSConfig(host string) *tls.Config {
 		ServerName:         host,
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS10,
-		MaxVersion:         tls.VersionTLS12,
 		ClientSessionCache: tlsSessionCache,
-		CurvePreferences:   []tls.CurveID{tls.X25519, tls.CurveP256, tls.CurveP384},
-		CipherSuites: []uint16{
-			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-			tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
-			tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
-			tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
-			tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
-			tls.TLS_RSA_WITH_AES_128_CBC_SHA,
-			tls.TLS_RSA_WITH_AES_256_CBC_SHA,
-			tls.TLS_RSA_WITH_3DES_EDE_CBC_SHA,
-		},
 	}
 }
 
@@ -647,7 +633,7 @@ func dialTLSWatchdog(tunnelCtx context.Context, dialer internet.Dialer, dest net
 	return rawConn, tlsConn, nil
 }
 
-// Happy Eyeballs 错峰并发探测：主端口 6.5s 超时（兼容链式代理延迟），1.2s 未胜出则并发抢跑 5555/995/992
+// Happy Eyeballs 错峰并发探测：主端口 6.5s 超时（兼容链式代理延迟），1.2s 未胜出则并发抢跑 5555/992/1194
 func dialTLSSerialCandidate(tunnelCtx context.Context, dialer internet.Dialer, serverDest net.Destination, sniHost string) (net.Conn, *tls.Conn, net.Port, error) {
 	var candidates []net.Port
 	if hint, ok := sslHintPortCache.Load(serverDest.String()); ok {
@@ -657,7 +643,7 @@ func dialTLSSerialCandidate(tunnelCtx context.Context, dialer internet.Dialer, s
 		candidates = append(candidates, serverDest.Port)
 	}
 	if serverDest.Port == 443 && len(candidates) == 1 {
-		candidates = append(candidates, 5555, 995, 992)
+		candidates = append(candidates, 5555, 992, 1194)
 	}
 
 	if len(candidates) == 1 {
@@ -798,21 +784,23 @@ func newGVisorStack() (*stack.Stack, *channel.Endpoint, error) {
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sackEnabled)
 	delayEnabled := tcpip.TCPDelayEnabled(false)
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &delayEnabled)
-	ccOpt := tcpip.CongestionControlOption("cubic")
-	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &ccOpt)
+	ccOpt := tcpip.CongestionControlOption("bbr")
+	if ccErr := s.SetTransportProtocolOption(tcp.ProtocolNumber, &ccOpt); ccErr != nil {
+		errors.LogWarning(context.Background(), fmt.Sprintf("[gVisor] 启用 BBR 失败: %v", ccErr))
+	}
 	rackOpt := tcpip.TCPRecovery(tcpip.TCPRACKLossDetection)
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &rackOpt)
 	minRTO := tcpip.TCPMinRTOOption(250 * time.Millisecond)
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &minRTO)
 
-	rcvBuf := tcpip.TCPReceiveBufferSizeRangeOption{Min: 4096, Default: 2 * 1024 * 1024, Max: 3584 * 1024}
-	sndBuf := tcpip.TCPSendBufferSizeRangeOption{Min: 4096, Default: 2 * 1024 * 1024, Max: 3584 * 1024}
+	rcvBuf := tcpip.TCPReceiveBufferSizeRangeOption{Min: 4096, Default: 3 * 1024 * 1024, Max: 4 * 1024 * 1024}
+	sndBuf := tcpip.TCPSendBufferSizeRangeOption{Min: 4096, Default: 3 * 1024 * 1024, Max: 4 * 1024 * 1024}
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &rcvBuf)
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sndBuf)
 	modOpt := tcpip.TCPModerateReceiveBufferOption(true)
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &modOpt)
 
-	ep := channel.New(4096, 1360, "")
+	ep := channel.New(8192, 1400, "")
 	if tcpipErr := s.CreateNIC(1, ep); tcpipErr != nil {
 		s.Close()
 		return nil, nil, fmt.Errorf("gVisor NIC 创建失败: %v", tcpipErr)
@@ -904,6 +892,10 @@ func dialSlotSession(ctx context.Context, serverDest net.Destination, dialer int
 				ovpnProtoCache.Store(baseKey, "ms-sstp")
 				return sstpSess, nil
 			}
+		}
+		if ovpnSess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, false, 5000*time.Millisecond); ovpnErr == nil {
+			ovpnProtoCache.Store(baseKey, "openvpn-tcp")
+			return ovpnSess, nil
 		}
 		recordNodeFailureIfNeeded(baseKey, isBackground, seErr)
 		return nil, seErr
@@ -1198,7 +1190,7 @@ func dialMSSSTPSessionWithHint(serverDest net.Destination, dialer internet.Diale
 						pppData = pppData[:tot]
 					}
 					lastActiveNano.Store(time.Now().UnixNano())
-					clampIPv4TCPMSSInPlace(pppData, 1240)
+					clampIPv4TCPMSSInPlace(pppData, 1280)
 					pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 						Payload: buffer.MakeWithData(pppData),
 					})
@@ -1225,7 +1217,7 @@ func dialMSSSTPSessionWithHint(serverDest net.Destination, dialer internet.Diale
 				pkt.DecRef()
 				return nil
 			}
-			clampIPv4TCPMSSInPlace(data, 1240)
+			clampIPv4TCPMSSInPlace(data, 1280)
 			binary.BigEndian.PutUint16(sstpHdr[2:4], uint16(total))
 			_, err := sess.bw.Write(sstpHdr[:])
 			if err == nil {
@@ -1378,7 +1370,6 @@ func softEtherSHA0(data []byte) [20]byte {
 	return out
 }
 
-// secon password.go: SHA0(password || UPPER(username)) -> "vpnVPN"
 func softEtherSecurePassword(username, password string, random []byte) [20]byte {
 	upper := strings.Map(func(r rune) rune {
 		if 'a' <= r && r <= 'z' {
@@ -1448,7 +1439,6 @@ func (p *sePack) getStr(name string) string {
 	return v
 }
 
-// secon pack.go: 严格二进制序列化 (TypeStr 长度为 len(s), TypeUniStr 长度为 len(s)+1 带 NUL)
 func (p *sePack) marshal() []byte {
 	b := binary.BigEndian.AppendUint32(nil, uint32(len(p.elems)))
 	for _, e := range p.elems {
@@ -1554,7 +1544,6 @@ func unmarshalSEPack(data []byte) (*sePack, error) {
 	return p, nil
 }
 
-// secon client.go: writeHTTP + readPackResponse
 func writeSEHTTP(w io.Writer, path, host, contentType string, body []byte) error {
 	var b bytes.Buffer
 	fmt.Fprintf(&b, "POST %s HTTP/1.1\r\n", path)
@@ -1588,7 +1577,6 @@ func readSEPackResponse(br *bufio.Reader) (*sePack, error) {
 	return unmarshalSEPack(raw)
 }
 
-// secon client.go: loginPack 完整字段对齐
 func buildSELoginPack(uniqueID []byte, random []byte) []byte {
 	p := &sePack{}
 	p.addStr("method", "login")
@@ -1597,7 +1585,6 @@ func buildSELoginPack(uniqueID []byte, random []byte) []byte {
 	p.addInt("authtype", 1)
 	sp := softEtherSecurePassword("vpn", "vpn", random)
 	p.addData("secure_password", sp[:])
-	// use_encrypt 必须为 1，否则服务端断开 TLS 退回平文
 	p.addInt("use_encrypt", 1)
 	p.addInt("use_compress", 0)
 	p.addInt("max_connection", 1)
@@ -1751,7 +1738,6 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 
 	br := bufio.NewReaderSize(tlsConn, 131072)
 
-	// 阶段 2: signature -> Hello PACK
 	var helloPack *sePack
 	err = RunWithWatchdog(rawConn, 6500*time.Millisecond, func() error {
 		if wErr := writeSEHTTP(tlsConn, "/vpnsvc/connect.cgi", host, "image/jpeg", []byte("VPNCONNECT")); wErr != nil {
@@ -1775,7 +1761,6 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 		return nil, activePort, fmt.Errorf("阶段[2-hello]: 非 SoftEther 服务端 (randomLen=%d)", len(randomBytes))
 	}
 
-	// 阶段 3: Auth -> Welcome PACK (支持 noop=2 轮询与 application/octet-stream)
 	uniqueID := make([]byte, 20)
 	_, _ = rand.Read(uniqueID)
 	loginBytes := buildSELoginPack(uniqueID, randomBytes)
@@ -1972,7 +1957,7 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 							if binary.BigEndian.Uint32(bootp[4:8]) == dhcpXid && len(bootp) > 240 {
 								yiaddr := bootp[16:20]
 								var msgType byte
-								var srvID, subnetMask, routerOpt []byte
+								var srvID, subnetMask, routerOpt, dnsOpt []byte
 								opts := bootp[240:]
 								for k := 0; k < len(opts); {
 									code := opts[k]
@@ -1994,6 +1979,8 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 										subnetMask = opts[k+2 : k+6]
 									} else if code == 3 && olen >= 4 {
 										routerOpt = opts[k+2 : k+6]
+									} else if code == 6 && olen >= 4 {
+										dnsOpt = opts[k+2 : k+6]
 									} else if code == 53 && olen >= 1 {
 										msgType = opts[k+2]
 									} else if code == 54 && olen == 4 {
@@ -2013,6 +2000,10 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 									copy(assignedIP[:], yiaddr)
 									if len(routerOpt) == 4 {
 										copy(gatewayIP[:], routerOpt)
+									}
+									if len(dnsOpt) == 4 {
+										copy(sess.dhcpDNS[:], dnsOpt)
+										sess.hasDHCPDNS.Store(true)
 									}
 									hasIP.Store(true)
 									if gatewayIP != ([4]byte{}) {
@@ -2036,7 +2027,7 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 				}
 
 				lastActiveNano.Store(time.Now().UnixNano())
-				clampIPv4TCPMSSInPlace(ipPkt, 1240)
+				clampIPv4TCPMSSInPlace(ipPkt, 1280)
 				pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 					Payload: buffer.MakeWithData(ipPkt),
 				})
@@ -2082,7 +2073,7 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 				batch[i] = nil
 				v := p.ToView()
 				ipData := v.AsSlice()
-				clampIPv4TCPMSSInPlace(ipData, 1240)
+				clampIPv4TCPMSSInPlace(ipData, 1280)
 				binary.BigEndian.PutUint32(frameHdr[0:4], uint32(14+len(ipData)))
 				if wErr == nil {
 					_, wErr = sess.bw.Write(frameHdr[:])
@@ -2207,15 +2198,8 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
 		bp := readBufPool.Get().(*[]byte)
 		defer readBufPool.Put(bp)
 		b := *bp
-		var totalDown int64
 		for {
-			rSlice := b
-			if totalDown > 1536*1024 {
-				rSlice = b[:32768]
-				runtime.Gosched()
-			}
-			n, rErr := gConn.Read(rSlice)
-			totalDown += int64(n)
+			n, rErr := gConn.Read(b)
 			if n > 0 {
 				var mb buf.MultiBuffer
 				offset := 0
@@ -2313,10 +2297,10 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
             raise RuntimeError("❌ 未能在 proxy/socks/client.go 的 Process 函数中匹配到 server 变量赋值行！")
         with open(client_go, "w", encoding="utf-8") as f:
             f.write(new_code)
-        print("  ✔ [VPNGate 主引擎] 成功注入 (完整对齐 secon 协议栈 + Happy Eyeballs 并发)")
+        print("  ✔ [VPNGate 主引擎] 成功注入 (secon 标准协议栈 + gVisor BBR + DHCP DNS 优先)")
 
 # =========================================================================
-# 7. 注入 VPNGate OpenVPN 爆发+稳定双兼顾引擎 (含链式代理宽容 DNS 解析)
+# 7. 注入 VPNGate OpenVPN 爆发+稳定双兼顾引擎 (含 0ms DoT + DHCP DNS 优先解析)
 # =========================================================================
 if os.path.exists(socks_dir):
     ovpn_file = os.path.join(socks_dir, "vpngate_openvpn.go")
@@ -2641,38 +2625,40 @@ func ovpnFastResolveIPv4(ctx context.Context, dialer internet.Dialer, sess *sstp
 			ttl uint32
 			err error
 		}
-		resCh := make(chan dnsRes, 6)
+
+		dnsServers := [][4]byte{{8, 8, 8, 8}, {1, 1, 1, 1}}
+		if activeSess.hasDHCPDNS.Load() {
+			dnsServers = append([][4]byte{activeSess.dhcpDNS}, dnsServers...)
+		}
+
+		totalProbes := len(dnsServers) + 3
+		resCh := make(chan dnsRes, totalProbes)
 		probeCtx, probeCancel := context.WithTimeout(context.Background(), 5000*time.Millisecond)
 		defer probeCancel()
 
-		for _, srv := range [][4]byte{{8, 8, 8, 8}, {1, 1, 1, 1}, {9, 9, 9, 9}} {
+		for _, srv := range dnsServers {
 			go func(ip [4]byte) {
 				resIP, ttl, qErr := queryUDP53OnStack(probeCtx, activeSess.s, ip, query, txID)
 				resCh <- dnsRes{ip: resIP, ttl: ttl, err: qErr}
 			}(srv)
 		}
 
+		// 0ms 立即并发外层 DoT 与隧道内 TCP DNS
 		go func() {
-			select {
-			case <-time.After(200 * time.Millisecond):
-				go func() {
-					resIP, ttl, qErr := queryTCP53OnStack(probeCtx, activeSess.s, [4]byte{8, 8, 8, 8}, query, txID)
-					resCh <- dnsRes{ip: resIP, ttl: ttl, err: qErr}
-				}()
-				go func() {
-					resIP, ttl, qErr := queryTCP53OnStack(probeCtx, activeSess.s, [4]byte{1, 1, 1, 1}, query, txID)
-					resCh <- dnsRes{ip: resIP, ttl: ttl, err: qErr}
-				}()
-				go func() {
-					resIP, ttl, qErr := queryOuterDoT(probeCtx, dialer, "8.8.8.8", "dns.google", query, txID)
-					resCh <- dnsRes{ip: resIP, ttl: ttl, err: qErr}
-				}()
-			case <-probeCtx.Done():
-			}
+			resIP, ttl, qErr := queryOuterDoT(probeCtx, dialer, "8.8.8.8", "dns.google", query, txID)
+			resCh <- dnsRes{ip: resIP, ttl: ttl, err: qErr}
+		}()
+		go func() {
+			resIP, ttl, qErr := queryTCP53OnStack(probeCtx, activeSess.s, [4]byte{8, 8, 8, 8}, query, txID)
+			resCh <- dnsRes{ip: resIP, ttl: ttl, err: qErr}
+		}()
+		go func() {
+			resIP, ttl, qErr := queryTCP53OnStack(probeCtx, activeSess.s, [4]byte{1, 1, 1, 1}, query, txID)
+			resCh <- dnsRes{ip: resIP, ttl: ttl, err: qErr}
 		}()
 
 		var lastErr error
-		for i := 0; i < 6; i++ {
+		for i := 0; i < totalProbes; i++ {
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
@@ -3686,7 +3672,7 @@ func dialOpenVPNSessionCore(serverDest net.Destination, dialer internet.Dialer, 
 			}
 			ipPkt = ipPkt[:totLen]
 			lastActiveNano.Store(time.Now().UnixNano())
-			clampIPv4TCPMSSInPlace(ipPkt, 1240)
+			clampIPv4TCPMSSInPlace(ipPkt, 1280)
 			pBuf := stack.NewPacketBuffer(stack.PacketBufferOptions{
 				Payload: buffer.MakeWithData(ipPkt),
 			})
@@ -3804,7 +3790,7 @@ func dialOpenVPNSessionCore(serverDest net.Destination, dialer internet.Dialer, 
 			ipSlice := out[plainStart+lzoByte : totalLen]
 			copy(ipSlice, payload)
 			if isIPPacket {
-				clampIPv4TCPMSSInPlace(ipSlice, 1240)
+				clampIPv4TCPMSSInPlace(ipSlice, 1280)
 			}
 			sealed := sendAEAD.Seal(out[plainStart:plainStart], nonce[:], out[plainStart:totalLen], out[0:hdrLen])
 			copy(out[hdrLen:hdrLen+16], sealed[plainLen:plainLen+16])
@@ -3831,7 +3817,7 @@ func dialOpenVPNSessionCore(serverDest net.Destination, dialer internet.Dialer, 
 		ipSlice := plainSlice[4+lzoByte : rawPlainLen]
 		copy(ipSlice, payload)
 		if isIPPacket {
-			clampIPv4TCPMSSInPlace(ipSlice, 1240)
+			clampIPv4TCPMSSInPlace(ipSlice, 1280)
 		}
 		for i := rawPlainLen; i < ctLen; i++ {
 			plainSlice[i] = byte(padLen)
@@ -4021,7 +4007,7 @@ func dialOpenVPNSessionCore(serverDest net.Destination, dialer internet.Dialer, 
     with open(ovpn_file, "w", encoding="utf-8") as f:
         f.write(ovpn_src)
 
-    print("  ✔ [VPNGate OpenVPN 引擎] 成功注入 (链式代理宽容 DNS + QoS小包插队 + 10分钟保活)")
+    print("  ✔ [VPNGate OpenVPN 引擎] 成功注入 (0ms 并发 DoT + DHCP DNS 优先 + gVisor BBR)")
 
     if os.system("go mod tidy") != 0:
         raise RuntimeError("❌ go mod tidy 执行失败！")
