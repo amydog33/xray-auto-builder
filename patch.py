@@ -1887,7 +1887,7 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
 
 
 # =========================================================================
-# 7. 注入 VPNGate OpenVPN 终极零拷贝引擎 (AEAD P_DATA_V2 + 原地解密 + 32KB写合并 + 多路DNS抢答)
+# 7. 注入 VPNGate 爆发+稳定双兼顾引擎 (QoS小包插队 + 3.5MB黄金BDP + 僵尸隧道秒级熔断 + Google DoT)
 # =========================================================================
 if os.path.exists(socks_dir):
     ovpn_file = os.path.join(socks_dir, "vpngate_openvpn.go")
@@ -2098,7 +2098,7 @@ func queryUDP53OnStack(ctx context.Context, s *stack.Stack, dnsIP [4]byte, query
 		return nil, 0, err
 	}
 	defer conn.Close()
-	dl := time.Now().Add(1800 * time.Millisecond)
+	dl := time.Now().Add(1500 * time.Millisecond)
 	if ctxDL, ok := ctx.Deadline(); ok && ctxDL.Before(dl) {
 		dl = ctxDL
 	}
@@ -2115,14 +2115,14 @@ func queryUDP53OnStack(ctx context.Context, s *stack.Stack, dnsIP [4]byte, query
 }
 
 func queryTCP53OnStack(ctx context.Context, s *stack.Stack, dnsIP [4]byte, query []byte, txID uint16) ([]byte, uint32, error) {
-	dCtx, cancel := context.WithTimeout(ctx, 2000*time.Millisecond)
+	dCtx, cancel := context.WithTimeout(ctx, 1600*time.Millisecond)
 	defer cancel()
 	conn, err := gonet.DialContextTCP(dCtx, s, tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFrom4(dnsIP), Port: 53}, ipv4.ProtocolNumber)
 	if err != nil {
 		return nil, 0, err
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(2000 * time.Millisecond))
+	_ = conn.SetDeadline(time.Now().Add(1600 * time.Millisecond))
 	tcpReq := make([]byte, 2+len(query))
 	binary.BigEndian.PutUint16(tcpReq[0:2], uint16(len(query)))
 	copy(tcpReq[2:], query)
@@ -2148,7 +2148,7 @@ func queryOuterDoT(ctx context.Context, dialer internet.Dialer, dnsIP, sni strin
 	if dialer == nil {
 		return nil, 0, fmt.Errorf("nil dialer")
 	}
-	dCtx, cancel := context.WithTimeout(ctx, 2000*time.Millisecond)
+	dCtx, cancel := context.WithTimeout(ctx, 1800*time.Millisecond)
 	defer cancel()
 	rawConn, err := dialer.Dial(dCtx, net.TCPDestination(net.ParseAddress(dnsIP), 853))
 	if err != nil {
@@ -2160,7 +2160,7 @@ func queryOuterDoT(ctx context.Context, dialer internet.Dialer, dnsIP, sni strin
 		InsecureSkipVerify: true,
 		ClientSessionCache: tlsSessionCache,
 	})
-	_ = tlsConn.SetDeadline(time.Now().Add(2000 * time.Millisecond))
+	_ = tlsConn.SetDeadline(time.Now().Add(1800 * time.Millisecond))
 	if err := tlsConn.HandshakeContext(dCtx); err != nil {
 		return nil, 0, err
 	}
@@ -2185,7 +2185,7 @@ func queryOuterDoT(ctx context.Context, dialer internet.Dialer, dnsIP, sni strin
 	return parseDNSResponseIPv4(resp, txID)
 }
 
-// 突破口 2：内层三路 UDP53 极速并发 + 180ms 延迟触发 TCP53/DoT 保底抢答 + 30分钟缓存
+// 内层三路 UDP53 + 180ms 触发 TCP53 与 Google DoT (8.8.8.8:853) + 僵尸隧道秒级熔断器
 func ovpnFastResolveIPv4(ctx context.Context, dialer internet.Dialer, sess *sstpSession, host string) ([]byte, error) {
 	return ovpnDNSSF.Do(host, func() ([]byte, error) {
 		if cached, ok := dnsCache.Load(host); ok {
@@ -2205,18 +2205,25 @@ func ovpnFastResolveIPv4(ctx context.Context, dialer internet.Dialer, sess *sstp
 			return nil, err
 		}
 		type dnsRes struct {
-			ip  []byte
-			ttl uint32
-			err error
+			ip      []byte
+			ttl     uint32
+			isOuter bool
+			err     error
 		}
 		resCh := make(chan dnsRes, 6)
-		qCtx, cancel := context.WithTimeout(ctx, 2400*time.Millisecond)
-		defer cancel()
+		innerAliveCh := make(chan struct{}, 5)
+		probeCtx, probeCancel := context.WithTimeout(context.Background(), 1600*time.Millisecond)
 
 		for _, srv := range [][4]byte{{8, 8, 8, 8}, {1, 1, 1, 1}, {9, 9, 9, 9}} {
 			go func(ip [4]byte) {
-				resIP, ttl, qErr := queryUDP53OnStack(qCtx, activeSess.s, ip, query, txID)
-				resCh <- dnsRes{ip: resIP, ttl: ttl, err: qErr}
+				resIP, ttl, qErr := queryUDP53OnStack(probeCtx, activeSess.s, ip, query, txID)
+				if qErr == nil && len(resIP) == 4 {
+					select {
+					case innerAliveCh <- struct{}{}:
+					default:
+					}
+				}
+				resCh <- dnsRes{ip: resIP, ttl: ttl, isOuter: false, err: qErr}
 			}(srv)
 		}
 
@@ -2224,33 +2231,72 @@ func ovpnFastResolveIPv4(ctx context.Context, dialer internet.Dialer, sess *sstp
 			select {
 			case <-time.After(180 * time.Millisecond):
 				go func() {
-					resIP, ttl, qErr := queryTCP53OnStack(qCtx, activeSess.s, [4]byte{8, 8, 8, 8}, query, txID)
-					resCh <- dnsRes{ip: resIP, ttl: ttl, err: qErr}
+					resIP, ttl, qErr := queryTCP53OnStack(probeCtx, activeSess.s, [4]byte{8, 8, 8, 8}, query, txID)
+					if qErr == nil && len(resIP) == 4 {
+						select {
+						case innerAliveCh <- struct{}{}:
+						default:
+						}
+					}
+					resCh <- dnsRes{ip: resIP, ttl: ttl, isOuter: false, err: qErr}
 				}()
 				go func() {
-					resIP, ttl, qErr := queryTCP53OnStack(qCtx, activeSess.s, [4]byte{1, 1, 1, 1}, query, txID)
-					resCh <- dnsRes{ip: resIP, ttl: ttl, err: qErr}
+					resIP, ttl, qErr := queryTCP53OnStack(probeCtx, activeSess.s, [4]byte{1, 1, 1, 1}, query, txID)
+					if qErr == nil && len(resIP) == 4 {
+						select {
+						case innerAliveCh <- struct{}{}:
+						default:
+						}
+					}
+					resCh <- dnsRes{ip: resIP, ttl: ttl, isOuter: false, err: qErr}
 				}()
+				// 改为 8.8.8.8 (dns.google)，彻底避开 Cloudflare Worker 禁连 1.1.1.1 的防火墙限制
 				go func() {
-					resIP, ttl, qErr := queryOuterDoT(qCtx, dialer, "1.1.1.1", "cloudflare-dns.com", query, txID)
-					resCh <- dnsRes{ip: resIP, ttl: ttl, err: qErr}
+					resIP, ttl, qErr := queryOuterDoT(probeCtx, dialer, "8.8.8.8", "dns.google", query, txID)
+					resCh <- dnsRes{ip: resIP, ttl: ttl, isOuter: true, err: qErr}
 				}()
-			case <-qCtx.Done():
+			case <-probeCtx.Done():
 			}
 		}()
 
 		var lastErr error
 		for i := 0; i < 6; i++ {
 			select {
-			case <-qCtx.Done():
-				return nil, qCtx.Err()
+			case <-ctx.Done():
+				probeCancel()
+				return nil, ctx.Err()
+			case <-probeCtx.Done():
+				probeCancel()
+				if activeSess.markDead != nil {
+					activeSess.markDead()
+				}
+				return nil, fmt.Errorf("tunnel dns timeout, zombie session purged")
 			case r := <-resCh:
 				if r.err == nil && len(r.ip) == 4 {
 					dnsCache.Store(host, dnsEntry{ip: r.ip, expire: time.Now().Add(30 * time.Minute)})
+					if r.isOuter {
+						// 若外层 DoT 抢先返回，后台再给内层隧道 1.2s 宽限期；若 5 路内层查询全死，立即斩杀僵尸隧道
+						go func(s *sstpSession) {
+							defer probeCancel()
+							select {
+							case <-innerAliveCh:
+							case <-time.After(1200 * time.Millisecond):
+								if s.markDead != nil {
+									s.markDead()
+								}
+							}
+						}(activeSess)
+					} else {
+						probeCancel()
+					}
 					return r.ip, nil
 				}
 				lastErr = r.err
 			}
+		}
+		probeCancel()
+		if activeSess.markDead != nil {
+			activeSess.markDead()
 		}
 		return nil, lastErr
 	})
@@ -2465,7 +2511,6 @@ func (u *udpPacketIO) RemoteAddr() net.Addr               { return u.raw.RemoteA
 func (u *udpPacketIO) SetDeadline(tm time.Time) error     { return u.raw.SetDeadline(tm) }
 func (u *udpPacketIO) SetReadDeadline(tm time.Time) error { return u.raw.SetReadDeadline(tm) }
 func (u *udpPacketIO) SetWriteDeadline(tm time.Time) error { return u.raw.SetWriteDeadline(tm) }
-
 type unackedCtrlPkt struct {
 	pkt      []byte
 	lastSent time.Time
@@ -3436,26 +3481,49 @@ func dialOpenVPNSessionCore(serverDest net.Destination, dialer internet.Dialer, 
 			}
 		}()
 	} else {
-		txCh := make(chan *stack.PacketBuffer, 64)
+		// QoS 大小包双轨插队：小包/DNS/握手包走 highCh 0ms 优先插队，大包走 lowCh
+		highCh := make(chan *stack.PacketBuffer, 64)
+		lowCh := make(chan *stack.PacketBuffer, 64)
 		go func() {
-			defer close(txCh)
 			for {
 				pkt := ep.ReadContext(bgCtx)
 				if pkt == nil {
+					close(highCh)
+					close(lowCh)
 					return
 				}
-				select {
-				case txCh <- pkt:
-				case <-sess.dead:
-					pkt.DecRef()
-					return
+				if pkt.Size() <= 420 {
+					select {
+					case highCh <- pkt:
+					case <-sess.dead:
+						pkt.DecRef()
+						return
+					}
+				} else {
+					select {
+					case lowCh <- pkt:
+					case <-sess.dead:
+						pkt.DecRef()
+						return
+					}
 				}
 			}
 		}()
 		go func() {
 			defer sess.markDead()
 			for {
-				firstPkt, ok := <-txCh
+				var firstPkt *stack.PacketBuffer
+				var ok bool
+				select {
+				case firstPkt, ok = <-highCh:
+				default:
+					select {
+					case firstPkt, ok = <-highCh:
+					case firstPkt, ok = <-lowCh:
+					case <-sess.dead:
+						return
+					}
+				}
 				if !ok || firstPkt == nil {
 					return
 				}
@@ -3476,15 +3544,28 @@ func dialOpenVPNSessionCore(serverDest net.Destination, dialer internet.Dialer, 
 
 				appendPkt(firstPkt)
 			drainLoop:
-				for i := 0; i < 23 && offset < 28000; i++ {
+				for i := 0; i < 15 && offset < 24000; i++ {
 					select {
-					case morePkt, ok2 := <-txCh:
-						if !ok2 || morePkt == nil {
+					case hp, ok2 := <-highCh:
+						if !ok2 || hp == nil {
 							break drainLoop
 						}
-						appendPkt(morePkt)
+						appendPkt(hp)
 					default:
-						break drainLoop
+						select {
+						case hp, ok2 := <-highCh:
+							if !ok2 || hp == nil {
+								break drainLoop
+							}
+							appendPkt(hp)
+						case lp, ok2 := <-lowCh:
+							if !ok2 || lp == nil {
+								break drainLoop
+							}
+							appendPkt(lp)
+						default:
+							break drainLoop
+						}
 					}
 				}
 
@@ -3500,10 +3581,11 @@ func dialOpenVPNSessionCore(serverDest net.Destination, dialer internet.Dialer, 
 		}()
 	}
 
+	// 10 分钟长效保活，彻底告别 90 秒断流重握
 	go func() {
 		defer sess.markDead()
 		ovpnPing := []byte{0x2a, 0x18, 0x7b, 0xf3, 0x64, 0x1e, 0xb4, 0xcb, 0x07, 0xed, 0x2d, 0x0a, 0x98, 0x1f, 0xc7, 0x48}
-		ticker := time.NewTicker(3 * time.Second)
+		ticker := time.NewTicker(4 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
@@ -3511,7 +3593,7 @@ func dialOpenVPNSessionCore(serverDest net.Destination, dialer internet.Dialer, 
 				return
 			case <-ticker.C:
 				now := time.Now().UnixNano()
-				if now-ctrl.lastRxNano.Load() > int64(15*time.Second) || now-lastActiveNano.Load() > int64(90*time.Second) {
+				if now-ctrl.lastRxNano.Load() > int64(20*time.Second) || now-lastActiveNano.Load() > int64(600*time.Second) {
 					return
 				}
 				if err := sendEncryptedPayload(ovpnPing, false); err != nil {
@@ -3548,14 +3630,31 @@ func dialOpenVPNSessionCore(serverDest net.Destination, dialer internet.Dialer, 
 """
     with open(ovpn_file, "w", encoding="utf-8") as f:
         f.write(ovpn_src)
-    print("  ✔ [VPNGate OpenVPN] 成功注入终极零拷贝引擎 (AEAD P_DATA_V2 + 原地解密 + 32KB写合并)")
+
+    # 同步将第 6 部分 (vpngate_sstp.go) 升级为 3.5MB 黄金 BDP 窗口 + 10 分钟长效保活 + 大流平滑呼吸
+    with open(vg_file, "r", encoding="utf-8") as f:
+        vg_code = f.read()
+    vg_code = vg_code.replace("Max: 16 * 1024 * 1024", "Max: 3584 * 1024")
+    vg_code = vg_code.replace("Default: 4 * 1024 * 1024", "Default: 2 * 1024 * 1024")
+    vg_code = vg_code.replace("int64(90*time.Second)", "int64(600*time.Second)")
+    if '"runtime"' not in vg_code:
+        vg_code = vg_code.replace('"io"', '"io"\n\t"runtime"', 1)
+        vg_code = vg_code.replace(
+            "b := *bp\n\t\tfor {\n\t\t\tn, rErr := gConn.Read(b)",
+            "b := *bp\n\t\tvar totalDown int64\n\t\tfor {\n\t\t\trSlice := b\n\t\t\tif totalDown > 1536*1024 {\n\t\t\t\trSlice = b[:16384]\n\t\t\t\truntime.Gosched()\n\t\t\t}\n\t\t\tn, rErr := gConn.Read(rSlice)\n\t\t\ttotalDown += int64(n)",
+            1,
+        )
+    with open(vg_file, "w", encoding="utf-8") as f:
+        f.write(vg_code)
+
+    print("  ✔ [VPNGate 爆发+稳定引擎] 成功注入 (QoS小包插队 + 3.5MB黄金BDP + 僵尸秒级自愈 + 10分钟保活)")
 
     if os.system("go mod tidy") != 0:
         raise RuntimeError("❌ go mod tidy 执行失败！")
     print("  ✔ [Go Mod] 已同步 gVisor 与全协议依赖树")
 
 # =========================================================================
-# 8. 突破口 1：直接爆改 $GOMODCACHE 中的 gVisor TCP 源码 (InitialCwnd=64 + 抗丢包锐速化)
+# 8. 突破口 1：直接爆改 $GOMODCACHE 中的 gVisor TCP 源码 (InitialCwnd=64 + 0.82 稳态抗丢包)
 # =========================================================================
 gvisor_dir = os.popen('go list -m -f "{{.Dir}}" gvisor.dev/gvisor').read().strip()
 if gvisor_dir and os.path.exists(gvisor_dir):
@@ -3575,20 +3674,19 @@ if gvisor_dir and os.path.exists(gvisor_dir):
                 tc_code = f.read()
             orig_tc = tc_code
 
-            # 将 gVisor 硬编码的 TCP 初始拥塞窗口 InitialCwnd 从 10 暴改至 64 (首包直接并发 80KB，消灭跨洋慢启动)
-            tc_code, n1 = re.subn(r"\bInitialCwnd\s*=\s*10\b", "InitialCwnd = 64", tc_code)
+            # 将 gVisor TCP 初始拥塞窗口提至 64 (首轮 RTT 直接并发 80KB，网页瞬间秒开)
+            tc_code, n1 = re.subn(r"\bInitialCwnd\s*=\s*\d+\b", "InitialCwnd = 64", tc_code)
             patched_cwnd += n1
 
-            # 魔改 cubic.go 丢包降窗系数 beta (从 0.7 提升至 0.9，轻微丢包仅降窗 10%，化身内层锐速)
+            # 将 cubic.go 丢包降窗系数精准设定在 0.82 (兼顾抗丢包与防 Bufferbloat 堵车)
             if fname == "cubic.go":
-                tc_code, n2 = re.subn(r"0\.7\b", "0.9", tc_code)
-                tc_code, n3 = re.subn(r"\*\s*7\s*/\s*10\b", "* 9 / 10", tc_code)
+                tc_code, n2 = re.subn(r"0\.[789]\d*\b", "0.82", tc_code)
+                tc_code, n3 = re.subn(r"\*\s*[789]\s*/\s*10\b", "* 82 / 100", tc_code)
                 patched_cc += (n2 + n3)
 
             if tc_code != orig_tc:
                 with open(fpath, "w", encoding="utf-8") as f:
                     f.write(tc_code)
-        print(f"  ✔ [gVisor 内核爆改] 已将 InitialCwnd 提至 64 ({patched_cwnd} 处)，Cubic 抗丢包锐速化 ({patched_cc} 处)")
+        print(f"  ✔ [gVisor 内核调优] InitialCwnd=64 ({patched_cwnd} 处)，Cubic 0.82 黄金抗丢包 ({patched_cc} 处)")
 
 print("🎉 Xray 核心所有定制补丁注入完成！")
-
