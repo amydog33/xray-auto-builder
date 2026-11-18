@@ -2,13 +2,11 @@ import os
 import re
 import stat
 
-print(
-    ">>> [Patch] 开始应用全能加速、安全加固与 80/443 全协议兼容补丁..."
-)
+print(">>> [Patch] 开始应用全能加速、防CF限流、全协议兼容与激进调优补丁...")
 
 goroot = os.popen("go env GOROOT").read().strip()
 if not goroot:
-  raise RuntimeError("未检测到 GOROOT，请检查 Go 环境变量！")
+    raise RuntimeError("未检测到 GOROOT，请检查 Go 环境变量！")
 
 tls_dir = os.path.join(goroot, "src", "crypto", "tls")
 
@@ -16,79 +14,79 @@ tls_dir = os.path.join(goroot, "src", "crypto", "tls")
 # 1. 修补 Go 标准库 TLS 1.2 与 1.3（MASQUE 裸公钥防护与证书链兜底）
 # =========================================================================
 if os.path.exists(tls_dir):
-  hc_path = os.path.join(tls_dir, "handshake_client.go")
-  if os.path.exists(hc_path):
-    os.chmod(hc_path, stat.S_IWRITE | stat.S_IREAD)
-    with open(hc_path, "r", encoding="utf-8") as f:
-      code = f.read()
+    hc_path = os.path.join(tls_dir, "handshake_client.go")
+    if os.path.exists(hc_path):
+        os.chmod(hc_path, stat.S_IWRITE | stat.S_IREAD)
+        with open(hc_path, "r", encoding="utf-8") as f:
+            code = f.read()
 
-    code = re.sub(
-        r"c\.peerCertificates = certs\s*\n\treturn nil[^\n]*\n",
-        "c.peerCertificates = certs\n",
-        code,
-    )
+        code = re.sub(
+            r"c\.peerCertificates = certs\s*\n\treturn nil[^\n]*\n",
+            "c.peerCertificates = certs\n",
+            code,
+        )
 
-    target_v12 = r"(c\.verifiedChains,\s*err\s*=\s*certs\[0\]\.Verify\(opts\))"
-    patch_v12 = (
-        r"\1\n"
-        r"\tif err != nil {\n"
-        r"\t\tif len(certs) > 0 {\n"
-        r"\t\t\tc.verifiedChains = [][]*x509.Certificate{certs}\n"
-        r"\t\t}\n"
-        r"\t\terr = nil // [SAFE-PATCH] 放行自签名并兜底证书链\n"
-        r"\t}"
-    )
-    if "[SAFE-PATCH]" not in code and re.search(target_v12, code):
-      code = re.sub(target_v12, patch_v12, code, count=1)
-      with open(hc_path, "w", encoding="utf-8") as f:
-        f.write(code)
-      print("  ✔ [Go TLS 1.2] 安全放行与证书链兜底注入成功")
+        target_v12 = r"(c\.verifiedChains,\s*err\s*=\s*certs\[0\]\.Verify\(opts\))"
+        patch_v12 = (
+            r"\1\n"
+            r"\tif err != nil {\n"
+            r"\t\tif len(certs) > 0 {\n"
+            r"\t\t\tc.verifiedChains = [][]*x509.Certificate{certs}\n"
+            r"\t\t}\n"
+            r"\t\terr = nil // [SAFE-PATCH] 放行自签名并兜底证书链\n"
+            r"\t}"
+        )
+        if "[SAFE-PATCH]" not in code and re.search(target_v12, code):
+            code = re.sub(target_v12, patch_v12, code, count=1)
+            with open(hc_path, "w", encoding="utf-8") as f:
+                f.write(code)
+            print("  ✔ [Go TLS 1.2] 安全放行与证书链兜底注入成功")
 
-  hc13_path = os.path.join(tls_dir, "handshake_client_tls13.go")
-  if os.path.exists(hc13_path):
-    os.chmod(hc13_path, stat.S_IWRITE | stat.S_IREAD)
-    with open(hc13_path, "r", encoding="utf-8") as f:
-      code = f.read()
+    hc13_path = os.path.join(tls_dir, "handshake_client_tls13.go")
+    if os.path.exists(hc13_path):
+        os.chmod(hc13_path, stat.S_IWRITE | stat.S_IREAD)
+        with open(hc13_path, "r", encoding="utf-8") as f:
+            code = f.read()
 
-    target_v13 = r"(c\.verifiedChains,\s*err\s*=\s*certs\[0\]\.Verify\(opts\))"
-    patch_v13 = (
-        r"\tif len(certs) > 0 {\n"
-        r"\t\tc.verifiedChains, err = certs[0].Verify(opts)\n"
-        r"\t\tif err != nil {\n"
-        r"\t\t\tc.verifiedChains = [][]*x509.Certificate{certs}\n"
-        r"\t\t}\n"
-        r"\t} else {\n"
-        r"\t\tc.verifiedChains = [][]*x509.Certificate{}\n"
-        r"\t\terr = nil // [MASQUE-RPK] 适配裸公钥与空证书握手\n"
-        r"\t}"
-    )
-    if "[MASQUE-RPK]" not in code and re.search(target_v13, code):
-      code = re.sub(target_v13, patch_v13, code, count=1)
-      with open(hc13_path, "w", encoding="utf-8") as f:
-        f.write(code)
-      print("  ✔ [Go TLS 1.3] MASQUE 裸公钥防越界补丁注入成功")
+        target_v13 = r"(c\.verifiedChains,\s*err\s*=\s*certs\[0\]\.Verify\(opts\))"
+        patch_v13 = (
+            r"\tif len(certs) > 0 {\n"
+            r"\t\tc.verifiedChains, err = certs[0].Verify(opts)\n"
+            r"\t\tif err != nil {\n"
+            r"\t\t\tc.verifiedChains = [][]*x509.Certificate{certs}\n"
+            r"\t\t}\n"
+            r"\t} else {\n"
+            r"\t\tc.verifiedChains = [][]*x509.Certificate{}\n"
+            r"\t\terr = nil // [MASQUE-RPK] 适配裸公钥与空证书握手\n"
+            r"\t}"
+        )
+        if "[MASQUE-RPK]" not in code and re.search(target_v13, code):
+            code = re.sub(target_v13, patch_v13, code, count=1)
+            with open(hc13_path, "w", encoding="utf-8") as f:
+                f.write(code)
+            print("  ✔ [Go TLS 1.3] MASQUE 裸公钥防越界补丁注入成功")
 
 x509_verify = os.path.join(goroot, "src", "crypto", "x509", "verify.go")
 if os.path.exists(x509_verify):
-  os.chmod(x509_verify, stat.S_IWRITE | stat.S_IREAD)
-  with open(x509_verify, "r", encoding="utf-8") as f:
-    code = f.read()
-  if "legacy Common Name" in code:
-    code = re.sub(
-        r"return CertificateInvalidError\{[^\}]*legacy Common Name[^\}]*\}",
-        "return nil",
-        code,
-    )
-    with open(x509_verify, "w", encoding="utf-8") as f:
-      f.write(code)
-    print("  ✔ [Go x509] Legacy Common Name 限制已解除")
+    os.chmod(x509_verify, stat.S_IWRITE | stat.S_IREAD)
+    with open(x509_verify, "r", encoding="utf-8") as f:
+        code = f.read()
+    if "legacy Common Name" in code:
+        code = re.sub(
+            r"return CertificateInvalidError\{[^\}]*legacy Common Name[^\}]*\}",
+            "return nil",
+            code,
+        )
+        with open(x509_verify, "w", encoding="utf-8") as f:
+            f.write(code)
+        print("  ✔ [Go x509] Legacy Common Name 限制已解除")
 
 # =========================================================================
-# 2. 注入三段深度 TLS 记录层分片 (彻底切碎 workers.dev SNI 特征)
+# 2. 注入三段深度 TLS 记录层分片 (彻底切碎 workers.dev SNI 特征，幂等保护)
 # =========================================================================
 xray_tls_dir = "transport/internet/tls"
 if not os.path.exists(xray_tls_dir):
-  raise RuntimeError(f"关键目录缺失: {xray_tls_dir}")
+    raise RuntimeError(f"关键目录缺失: {xray_tls_dir}")
 
 record_frag_file = os.path.join(xray_tls_dir, "record_fragment.go")
 record_frag_src = """package tls
@@ -141,107 +139,114 @@ func WrapRecordFragment(c net.Conn) net.Conn {
 }
 """
 with open(record_frag_file, "w", encoding="utf-8") as f:
-  f.write(record_frag_src)
+    f.write(record_frag_src)
 print("  ✔ [TLS Engine] 三段深度 SNI 分片模块已写入")
 
 for root, _, files in os.walk(xray_tls_dir):
-  for f in files:
-    if f.endswith(".go") and f != "record_fragment.go":
-      fpath = os.path.join(root, f)
-      with open(fpath, "r", encoding="utf-8") as file:
-        content = file.read()
-      orig = content
+    for f in files:
+        if f.endswith(".go") and f != "record_fragment.go":
+            fpath = os.path.join(root, f)
+            with open(fpath, "r", encoding="utf-8") as file:
+                content = file.read()
+            orig = content
 
-      content = re.sub(
-          r"(func\s+(?:\([^\)]+\)\s+)?(?:Client|UClient)\s*\(\s*([a-zA-Z0-9_]+)\s+net\.Conn[^\)]*\)\s*[^{]*\{)",
-          r"\1\n\t\2 = WrapRecordFragment(\2)",
-          content,
-      )
+            if "WrapRecordFragment" not in content:
+                content = re.sub(
+                    r"(func\s+(?:\([^\)]+\)\s+)?(?:Client|UClient)\s*\(\s*([a-zA-Z0-9_]+)\s+net\.Conn[^\)]*\)\s*[^{]*\{)",
+                    r"\1\n\t\2 = WrapRecordFragment(\2)",
+                    content,
+                )
 
-      if "InsecureSkipVerify: true" not in content and "Config{" in content:
-        content = re.sub(
-            r"(&tls\.Config\{)", r"\1\n\t\tInsecureSkipVerify: true,", content
-        )
-        content = re.sub(
-            r"(config\.InsecureSkipVerify\s*=\s*)[^;\n]+", r"\1true", content
-        )
+            if "InsecureSkipVerify: true" not in content and "Config{" in content:
+                content = re.sub(
+                    r"(&tls\.Config\{)", r"\1\n\t\tInsecureSkipVerify: true,", content
+                )
+                content = re.sub(
+                    r"(config\.InsecureSkipVerify\s*=\s*)[^;\n]+", r"\1true", content
+                )
 
-      if content != orig:
-        with open(fpath, "w", encoding="utf-8") as file:
-          file.write(content)
+            if content != orig:
+                with open(fpath, "w", encoding="utf-8") as file:
+                    file.write(content)
 
 # =========================================================================
-# 3. 解除公网 80 端口无 TLS VLESS 限制 + 注入浏览器伪装防明文指纹识别
+# 3. 解除公网 80 端口无 TLS VLESS 限制 (幂等保护)
 # =========================================================================
 patched_vless = False
+already_patched_vless = False
 for root, _, files in os.walk("infra/conf"):
-  for fname in files:
-    if not fname.endswith(".go"):
-      continue
-    fpath = os.path.join(root, fname)
-    with open(fpath, "r", encoding="utf-8") as f:
-      lines = f.readlines()
+    for fname in files:
+        if not fname.endswith(".go"):
+            continue
+        fpath = os.path.join(root, fname)
+        with open(fpath, "r", encoding="utf-8") as f:
+            lines = f.readlines()
 
-    for idx, line in enumerate(lines):
-      if "vless without TLS" in line:
-        start = idx
-        while start > max(0, idx - 5) and "return" not in lines[start]:
-          start -= 1
-        end = idx
-        while end < min(len(lines) - 1, idx + 5) and not lines[
-            end
-        ].strip().endswith(")"):
-          end += 1
+        full_text = "".join(lines)
+        if "[ALLOW-PLAIN-VLESS]" in full_text:
+            already_patched_vless = True
+            break
 
-        indent = lines[start][: len(lines[start]) - len(lines[start].lstrip())]
-        matched_snippet = "".join(lines[start : end + 1]).strip()
-        print(f"  ✔ [VLESS Conf] 在 {fpath} 命中限制代码:\n    {matched_snippet}")
+        for idx, line in enumerate(lines):
+            if "vless without TLS" in line:
+                start = idx
+                while start > max(0, idx - 5) and "return" not in lines[start]:
+                    start -= 1
+                end = idx
+                while end < min(len(lines) - 1, idx + 5) and not lines[end].strip().endswith(")"):
+                    end += 1
 
-        lines[start : end + 1] = [
-            f"{indent}// [ALLOW-PLAIN-VLESS] 已解除 80 端口无 TLS 限制\n"
-        ]
-        with open(fpath, "w", encoding="utf-8") as f:
-          f.writelines(lines)
-        patched_vless = True
+                indent = lines[start][: len(lines[start]) - len(lines[start].lstrip())]
+                matched_snippet = "".join(lines[start : end + 1]).strip()
+                print(f"  ✔ [VLESS Conf] 在 {fpath} 命中限制代码:\n    {matched_snippet}")
+
+                lines[start : end + 1] = [
+                    f"{indent}// [ALLOW-PLAIN-VLESS] 已解除 80 端口无 TLS 限制\n"
+                ]
+                with open(fpath, "w", encoding="utf-8") as f:
+                    f.writelines(lines)
+                patched_vless = True
+                break
+    if patched_vless or already_patched_vless:
         break
-  if patched_vless:
-    break
 
-if not patched_vless:
-  raise RuntimeError("❌ 未能在 infra/conf 中找到 vless without TLS 限制代码！")
+if not patched_vless and not already_patched_vless:
+    raise RuntimeError("❌ 未能在 infra/conf 中找到 vless without TLS 限制代码！")
+elif already_patched_vless:
+    print("  ✔ [VLESS Conf] 已解除 80 端口无 TLS 限制 (幂等跳过)")
 
 # =========================================================================
 # 4. gRPC BDP 4MB/16MB 窗口扩张与 Windows 512KB 高吞吐套接字优化
 # =========================================================================
 grpc_dial_file = "transport/internet/grpc/dial.go"
 if os.path.exists(grpc_dial_file):
-  with open(grpc_dial_file, "r", encoding="utf-8") as f:
-    code = f.read()
+    with open(grpc_dial_file, "r", encoding="utf-8") as f:
+        code = f.read()
 
-  grpc_turbo_opts = """
+    grpc_turbo_opts = """
 \t\t// [TURBO-BDP] 强行撑大 gRPC HTTP/2 流控窗口至 4MB/16MB
 \t\tgrpc.WithInitialWindowSize(4 * 1024 * 1024),
 \t\tgrpc.WithInitialConnWindowSize(16 * 1024 * 1024),
 \t\tgrpc.WithWriteBufferSize(256 * 1024),
 \t\tgrpc.WithReadBufferSize(256 * 1024),
 """
-  if "[TURBO-BDP]" not in code:
-    code = re.sub(
-        r"(opts\s*:=\s*\[\]grpc\.DialOption\{)",
-        r"\1" + grpc_turbo_opts,
-        code,
-        count=1,
-    )
-    with open(grpc_dial_file, "w", encoding="utf-8") as f:
-      f.write(code)
-    print("  ✔ [gRPC Turbo] 已成功植入 4MB/16MB HTTP/2 流控大窗口")
+    if "[TURBO-BDP]" not in code:
+        code = re.sub(
+            r"(opts\s*:=\s*\[\]grpc\.DialOption\{)",
+            r"\1" + grpc_turbo_opts,
+            code,
+            count=1,
+        )
+        with open(grpc_dial_file, "w", encoding="utf-8") as f:
+            f.write(code)
+        print("  ✔ [gRPC Turbo] 已成功植入 4MB/16MB HTTP/2 流控大窗口")
 
 sock_opt_file = "transport/internet/sockopt_windows.go"
 if os.path.exists(sock_opt_file):
-  with open(sock_opt_file, "r", encoding="utf-8") as f:
-    code = f.read()
+    with open(sock_opt_file, "r", encoding="utf-8") as f:
+        code = f.read()
 
-  turbo_buf_func = """
+    turbo_buf_func = """
 // [TURBO-SOCK] 自动拉大 Windows 套接字系统读写缓冲并开启 TCP_NODELAY
 func applyTurboSocket(conn net.Conn) {
 \tif tcpConn, ok := conn.(*net.TCPConn); ok {
@@ -251,24 +256,24 @@ func applyTurboSocket(conn net.Conn) {
 \t}
 }
 """
-  if "[TURBO-SOCK]" not in code:
-    code += turbo_buf_func
-    with open(sock_opt_file, "w", encoding="utf-8") as f:
-      f.write(code)
-    print("  ✔ [Socket Turbo] 注入 Windows 512KB 高吞吐套接字优化")
+    if "[TURBO-SOCK]" not in code:
+        code += turbo_buf_func
+        with open(sock_opt_file, "w", encoding="utf-8") as f:
+            f.write(code)
+        print("  ✔ [Socket Turbo] 注入 Windows 512KB 高吞吐套接字优化")
 
 # =========================================================================
-# 5. 动态提取变量注入 UDP 10091 HUD 广播钩子
+# 5. 动态提取变量注入 UDP 10091 HUD 广播钩子 (幂等保护)
 # =========================================================================
 disp_path = "app/dispatcher/default.go"
 if os.path.exists(disp_path):
-  with open(disp_path, "r", encoding="utf-8") as f:
-    content = f.read()
+    with open(disp_path, "r", encoding="utf-8") as f:
+        content = f.read()
 
-  if 'stdnet "net"' not in content:
-    content = content.replace("import (", 'import (\n\tstdnet "net"', 1)
+    if 'stdnet "net"' not in content:
+        content = content.replace("import (", 'import (\n\tstdnet "net"', 1)
 
-  hud_func = """
+    hud_func = """
 func notifyHUD(tag string, dest string) {
 \tif dest != "" {
 \t\tgo func(msg string) {
@@ -280,48 +285,48 @@ func notifyHUD(tag string, dest string) {
 \t}
 }
 """
-  if "func notifyHUD" not in content:
-    content += hud_func
+    if "func notifyHUD" not in content:
+        content += hud_func
 
-  lines = content.splitlines()
-  new_lines = []
-  hud_hooks = 0
+    if "notifyHUD(" not in content.split("func notifyHUD")[0]:
+        lines = content.splitlines()
+        new_lines = []
+        hud_hooks = 0
 
-  for line in lines:
-    new_lines.append(line)
-    if "taking detour" in line and not line.strip().startswith("//"):
-      indent = line[: len(line) - len(line.lstrip())]
-      m_vars = re.search(
-          r'taking detour \[\",\s*([^,]+),\s*\"\] for \[\",\s*([^,\)]+)', line
-      )
-      if m_vars:
-        t_var = m_vars.group(1).strip()
-        d_var = m_vars.group(2).strip()
-        d_call = (
-            f"{d_var}.String()" if not d_var.endswith(".String()") else d_var
-        )
-        new_lines.append(f"{indent}notifyHUD({t_var}, {d_call})")
-        hud_hooks += 1
-      else:
-        parts = line.split('taking detour ["')
-        if len(parts) > 1:
-          sub = parts[1].split(",")
-          if len(sub) > 1:
-            raw_t = sub[1].strip()
-            new_lines.append(
-                f"{indent}notifyHUD({raw_t}, destination.String())"
-            )
-            hud_hooks += 1
+        for line in lines:
+            new_lines.append(line)
+            if "taking detour" in line and not line.strip().startswith("//"):
+                indent = line[: len(line) - len(line.lstrip())]
+                m_vars = re.search(
+                    r'taking detour \[\",\s*([^,]+),\s*\"\] for \[\",\s*([^,\)]+)', line
+                )
+                if m_vars:
+                    t_var = m_vars.group(1).strip()
+                    d_var = m_vars.group(2).strip()
+                    d_call = (
+                        f"{d_var}.String()" if not d_var.endswith(".String()") else d_var
+                    )
+                    new_lines.append(f"{indent}notifyHUD({t_var}, {d_call})")
+                    hud_hooks += 1
+                else:
+                    parts = line.split('taking detour ["')
+                    if len(parts) > 1:
+                        sub = parts[1].split(",")
+                        if len(sub) > 1:
+                            raw_t = sub[1].strip()
+                            new_lines.append(
+                                f"{indent}notifyHUD({raw_t}, destination.String())"
+                            )
+                            hud_hooks += 1
 
-  with open(disp_path, "w", encoding="utf-8") as f:
-    f.write("\n".join(new_lines))
-  print(f"  ✔ [HUD] 成功注入 {hud_hooks} 处真实出站决断 HUD 广播钩子")
-
-import os
-import re
+        with open(disp_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(new_lines))
+        print(f"  ✔ [HUD] 成功注入 {hud_hooks} 处真实出站决断 HUD 广播钩子")
+    else:
+        print("  ✔ [HUD] 广播钩子已存在 (幂等跳过)")
 
 # =========================================================================
-# 6. 注入 VPNGate 核心主引擎 (禁用Go1.27后量子巨型包 + 优先SSL秒连 + 全路径回退 + 实时诊断日志)
+# 6. 注入 VPNGate 全协议兼容 + 防 CF 限流 Watchdog 核心引擎
 # =========================================================================
 socks_dir = "proxy/socks"
 if os.path.exists(socks_dir):
@@ -346,7 +351,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
 
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
@@ -385,17 +389,19 @@ type dnsEntry struct {
 }
 
 var (
-	sessMu          sync.Mutex
-	slotLocks       sync.Map
-	sessPool        = make(map[string]*sstpSession)
-	fastSessMap     sync.Map
-	dnsCache        sync.Map
-	failCache       sync.Map
-	slotBackoff     sync.Map
-	tlsSessionCache = tls.NewLRUClientSessionCache(512)
-	pppPool         = sync.Pool{
-		New: func() any { b := make([]byte, 2048); return &b },
-	}
+	sessMu           sync.Mutex
+	slotLocks        sync.Map
+	sessPool         = make(map[string]*sstpSession)
+	fastSessMap      sync.Map
+	dnsCache         sync.Map
+	failCache        sync.Map
+	vgDeadPortCache  sync.Map // IP:Port -> time.Time，90s 死端口负向熔断缓存
+	slotBackoff      sync.Map
+	sslHintPortCache sync.Map
+	tlsSessionCache  = tls.NewLRUClientSessionCache(512)
+	// 全局建连探测并发闸门：最多允许 4 条并发向 CF Workers 发起建连探测，彻底杜绝并发限流雪崩
+	vgProbeSem = make(chan struct{}, 4)
+
 	readBufPool = sync.Pool{
 		New: func() any { b := make([]byte, 65536); return &b },
 	}
@@ -436,8 +442,58 @@ func init() {
 				}
 				return true
 			})
+			vgDeadPortCache.Range(func(k, v any) bool {
+				if t, ok := v.(time.Time); ok && now.Sub(t) > 90*time.Second {
+					vgDeadPortCache.Delete(k)
+				}
+				return true
+			})
 		}
 	}()
+}
+
+// RunWithWatchdog 专门适配 Xray DialerProxy 的 cnc.Connection：
+// 由于 SetDeadline 是空实现，必须依靠外部定时器直接 Close(rawConn) 才能物理唤醒卡死的 Read/Handshake。
+func RunWithWatchdog(conn net.Conn, timeout time.Duration, fn func() error) error {
+	timer := time.AfterFunc(timeout, func() {
+		_ = conn.Close()
+	})
+	err := fn()
+	if !timer.Stop() {
+		_ = conn.Close()
+		if err == nil {
+			return context.DeadlineExceeded
+		}
+		return stderrors.Join(context.DeadlineExceeded, err)
+	}
+	return err
+}
+
+func acquireProbeSlot(ctx context.Context) error {
+	select {
+	case vgProbeSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func releaseProbeSlot() {
+	<-vgProbeSem
+}
+
+func isDeadPort(addr string) bool {
+	if v, ok := vgDeadPortCache.Load(addr); ok {
+		if time.Since(v.(time.Time)) < 90*time.Second {
+			return true
+		}
+		vgDeadPortCache.Delete(addr)
+	}
+	return false
+}
+
+func markDeadPort(addr string) {
+	vgDeadPortCache.Store(addr, time.Now())
 }
 
 func buildCompatTLSConfig(host string) *tls.Config {
@@ -535,8 +591,6 @@ func hasAnyAliveSlot(baseKey string) bool {
 	return tryReuseExistingSession(baseKey, baseKey+"#0") != nil
 }
 
-var sslHintPortCache sync.Map
-
 func isVPNGateServer(server *protocol.ServerSpec) bool {
 	if server == nil || server.User == nil || server.User.Account == nil {
 		return false
@@ -553,6 +607,8 @@ func isVPNGateServer(server *protocol.ServerSpec) bool {
 				if p, err := strconv.Atoi(strings.TrimPrefix(pw, "ssl:")); err == nil && p > 0 && p <= 65535 {
 					sslHintPortCache.Store(baseKey, uint16(p))
 				}
+			} else if pw == "sstp" {
+				ovpnProtoCache.Store(baseKey, "ms-sstp")
 			} else {
 				cacheOVPNFromPassword(baseKey, acc.Password)
 			}
@@ -562,110 +618,65 @@ func isVPNGateServer(server *protocol.ServerSpec) bool {
 	return false
 }
 
-// 并发竞速完整 Dial + TLS 握手（同时穿透 443 端口封锁与 Xray 链式代理 0-RTT 假连接）
-func dialAndTLSWithPortRace(connCtx context.Context, dialer internet.Dialer, serverDest net.Destination, sniHost string) (net.Conn, *tls.Conn, net.Port, error) {
-	origPort := serverDest.Port
-	ports := []net.Port{origPort}
+// dialTLSWatchdog 单端口轻量 TLS 握手（0 并发轰炸，严格使用长生命周期 tunnelCtx + Watchdog）
+func dialTLSWatchdog(tunnelCtx context.Context, dialer internet.Dialer, dest net.Destination, sniHost string, timeout time.Duration) (net.Conn, *tls.Conn, error) {
+	addrStr := dest.String()
+	if isDeadPort(addrStr) {
+		return nil, nil, fmt.Errorf("端口 %s 处于死节点冷却期", addrStr)
+	}
+	if err := acquireProbeSlot(tunnelCtx); err != nil {
+		return nil, nil, err
+	}
+	defer releaseProbeSlot()
+
+	rawConn, err := dialer.Dial(tunnelCtx, dest)
+	if err != nil {
+		markDeadPort(addrStr)
+		return nil, nil, err
+	}
+
+	tlsConn := tls.Client(rawConn, buildCompatTLSConfig(sniHost))
+	if err := RunWithWatchdog(rawConn, timeout, func() error {
+		return tlsConn.Handshake()
+	}); err != nil {
+		_ = rawConn.Close()
+		markDeadPort(addrStr)
+		return nil, nil, err
+	}
+	return rawConn, tlsConn, nil
+}
+
+// dialTLSSerialCandidate 串行精简候选端口探测：优先主端口，仅当 443 死掉且非明确锁死时串行尝试最多 1 个备选端口 (995/5555)
+func dialTLSSerialCandidate(tunnelCtx context.Context, dialer internet.Dialer, serverDest net.Destination, sniHost string) (net.Conn, *tls.Conn, net.Port, error) {
+	var candidates []net.Port
 	if hint, ok := sslHintPortCache.Load(serverDest.String()); ok {
-		if hp := net.Port(hint.(uint16)); hp != origPort {
-			ports = append(ports, hp)
-		}
+		candidates = append(candidates, net.Port(hint.(uint16)))
 	}
-	for _, fp := range []net.Port{995, 5555, 992, 1194, 443} {
-		exists := false
-		for _, p := range ports {
-			if p == fp {
-				exists = true
-				break
-			}
-		}
-		if !exists {
-			ports = append(ports, fp)
-		}
+	if len(candidates) == 0 || candidates[0] != serverDest.Port {
+		candidates = append(candidates, serverDest.Port)
 	}
-
-	type raceRes struct {
-		conn    net.Conn
-		tlsConn *tls.Conn
-		port    net.Port
-		err     error
-	}
-	ch := make(chan raceRes, len(ports))
-	raceCtx, raceCancel := context.WithTimeout(connCtx, 3800*time.Millisecond)
-	defer raceCancel()
-
-	var won atomic.Bool
-	for i, p := range ports {
-		go func(idx int, port net.Port) {
-			if idx > 0 {
-				select {
-				case <-time.After(time.Duration(idx*120) * time.Millisecond):
-				case <-raceCtx.Done():
-					return
-				}
-			}
-			dest := net.TCPDestination(serverDest.Address, port)
-			// 必须传入长生命周期的 connCtx，防止 raceCancel() 误杀胜出者的底层 VLESS 管道
-			c, err := dialer.Dial(connCtx, dest)
-			if err != nil {
-				select {
-				case ch <- raceRes{port: port, err: err}:
-				case <-raceCtx.Done():
-				}
-				return
-			}
-			if raceCtx.Err() != nil {
-				c.Close()
-				return
-			}
-			tc := tls.Client(c, buildCompatTLSConfig(sniHost))
-			if err := tc.HandshakeContext(raceCtx); err != nil {
-				c.Close()
-				select {
-				case ch <- raceRes{port: port, err: err}:
-				case <-raceCtx.Done():
-				}
-				return
-			}
-			if !won.CompareAndSwap(false, true) {
-				tc.Close()
-				c.Close()
-				return
-			}
-			raceCancel()
-			select {
-			case ch <- raceRes{conn: c, tlsConn: tc, port: port}:
-			default:
-				tc.Close()
-				c.Close()
-			}
-		}(i, p)
+	// 仅对硬编码 443 且非测试环境泛滥并发时，保留最多 1 个高概率备用端口串行兜底
+	if serverDest.Port == 443 && len(candidates) == 1 {
+		candidates = append(candidates, 995)
 	}
 
 	var lastErr error
-	for range ports {
-		select {
-		case r := <-ch:
-			if r.err == nil && r.conn != nil && r.tlsConn != nil {
-				if r.port != origPort {
-					errors.LogInfo(context.Background(), fmt.Sprintf("[VPNGate] 端口竞速绕过命中 -> %s:%d (原端口 %d 无响应)", serverDest.Address.String(), r.port, origPort))
-				}
-				return r.conn, r.tlsConn, r.port, nil
-			}
-			if r.err != nil {
-				lastErr = r.err
-			}
-		case <-raceCtx.Done():
-			if lastErr == nil {
-				lastErr = raceCtx.Err()
-			}
-			return nil, nil, origPort, lastErr
+	for idx, p := range candidates {
+		if tunnelCtx.Err() != nil {
+			return nil, nil, serverDest.Port, tunnelCtx.Err()
 		}
+		dest := net.TCPDestination(serverDest.Address, p)
+		to := 3200 * time.Millisecond
+		if idx > 0 {
+			to = 2500 * time.Millisecond
+		}
+		raw, tc, err := dialTLSWatchdog(tunnelCtx, dialer, dest, sniHost, to)
+		if err == nil {
+			return raw, tc, p, nil
+		}
+		lastErr = err
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("所有端口 TLS 握手竞速均无响应")
-	}
-	return nil, nil, origPort, lastErr
+	return nil, nil, serverDest.Port, lastErr
 }
 
 func getSlotMutex(slotKey string) *sync.Mutex {
@@ -789,7 +800,7 @@ func dialSlotSession(ctx context.Context, serverDest net.Destination, dialer int
 
 	if !isBackground {
 		if failTime, ok := failCache.Load(baseKey); ok {
-			if time.Since(failTime.(time.Time)) < 5*time.Second {
+			if time.Since(failTime.(time.Time)) < 10*time.Second {
 				return nil, fmt.Errorf("节点 %s 处于失败冷却中", baseKey)
 			}
 			failCache.Delete(baseKey)
@@ -798,102 +809,105 @@ func dialSlotSession(ctx context.Context, serverDest net.Destination, dialer int
 
 	bgCtx := context.Background()
 	pCached, _ := ovpnProtoCache.Load(baseKey)
+	ovpnCfg := getOrDefaultOVPNConfig(baseKey)
 
-	{
-		ovpnCfg := getOrDefaultOVPNConfig(baseKey)
-		if ovpnCfg.mode == "tcp" {
-			sess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, false)
-			if ovpnErr == nil {
-				ovpnProtoCache.Store(baseKey, "openvpn-tcp")
-				return sess, nil
-			}
-			recordNodeFailureIfNeeded(baseKey, isBackground, ovpnErr)
-			return nil, ovpnErr
+	// 1. 显式 OpenVPN 或非 HTTPS 专用端口直通
+	if ovpnCfg.mode == "tcp" {
+		sess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, false, 8*time.Second)
+		if ovpnErr == nil {
+			ovpnProtoCache.Store(baseKey, "openvpn-tcp")
+			return sess, nil
 		}
-		if ovpnCfg.mode == "udp" || pCached == "openvpn-udp" {
-			sess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, true)
-			if ovpnErr == nil {
+		recordNodeFailureIfNeeded(baseKey, isBackground, ovpnErr)
+		return nil, ovpnErr
+	}
+	if ovpnCfg.mode == "udp" || pCached == "openvpn-udp" {
+		sess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, true, 8*time.Second)
+		if ovpnErr == nil {
+			ovpnProtoCache.Store(baseKey, "openvpn-udp")
+			return sess, nil
+		}
+		recordNodeFailureIfNeeded(baseKey, isBackground, ovpnErr)
+		return nil, ovpnErr
+	}
+
+	isDedicatedOVPNPort := serverDest.Port != 443 && serverDest.Port != 995 && serverDest.Port != 5555 && serverDest.Port != 992
+	if pCached == "openvpn-tcp" || (pCached == nil && isDedicatedOVPNPort) {
+		sess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, false, 6*time.Second)
+		if ovpnErr == nil {
+			ovpnProtoCache.Store(baseKey, "openvpn-tcp")
+			return sess, nil
+		}
+		if ovpnCfg.udpPort > 0 {
+			if udpSess, udpErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, true, 6*time.Second); udpErr == nil {
 				ovpnProtoCache.Store(baseKey, "openvpn-udp")
-				return sess, nil
+				return udpSess, nil
 			}
+		}
+		if isDedicatedOVPNPort {
 			recordNodeFailureIfNeeded(baseKey, isBackground, ovpnErr)
 			return nil, ovpnErr
-		}
-		isDedicatedOVPNPort := serverDest.Port != 443 && serverDest.Port != 995 && serverDest.Port != 5555
-		if pCached == "openvpn-tcp" || (pCached == nil && isDedicatedOVPNPort) {
-			sess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, false)
-			if ovpnErr == nil {
-				ovpnProtoCache.Store(baseKey, "openvpn-tcp")
-				return sess, nil
-			}
-			if ovpnCfg.udpPort > 0 {
-				if udpSess, udpErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, true); udpErr == nil {
-					ovpnProtoCache.Store(baseKey, "openvpn-udp")
-					return udpSess, nil
-				}
-			}
-			if isDedicatedOVPNPort {
-				recordNodeFailureIfNeeded(baseKey, isBackground, ovpnErr)
-				return nil, ovpnErr
-			}
 		}
 	}
 
-	effectiveDest := serverDest
-	if pCached != "ms-sstp" {
-		sess, hitPort, seErr := dialSoftEtherNativeSession(serverDest, dialer, baseKey, slotKey, isBackground)
+	// 2. 若已显式指定/缓存为 softether-ssl，直接走 SoftEther-SSL
+	if pCached == "softether-ssl" {
+		sess, hitPort, seErr := dialSoftEtherNativeSession(serverDest, dialer, baseKey, slotKey, 0)
 		if seErr == nil {
-			ovpnProtoCache.Store(baseKey, "softether-ssl")
 			return sess, nil
 		}
 		if hitPort != 0 {
-			effectiveDest = net.TCPDestination(serverDest.Address, hitPort)
+			if sstpSess, sstpErr := dialMSSSTPSession(net.TCPDestination(serverDest.Address, hitPort), dialer, baseKey, slotKey); sstpErr == nil {
+				ovpnProtoCache.Store(baseKey, "ms-sstp")
+				return sstpSess, nil
+			}
 		}
-		errors.LogInfo(bgCtx, fmt.Sprintf("[VPNGate] SoftEther-SSL 未命中 (%v)，回退尝试 MS-SSTP -> %s", seErr, effectiveDest.String()))
+		recordNodeFailureIfNeeded(baseKey, isBackground, seErr)
+		return nil, seErr
 	}
 
-	if sstpSess, sstpErr := dialMSSSTPSession(effectiveDest, dialer, baseKey, slotKey, isBackground); sstpErr == nil {
+	// 3. 通用端口 (443/995/5555/992)：必须先探 MS-SSTP，因为原生 SSTP 收到 connect.cgi 会静默死等！
+	//    而 SoftEther Server 收到 SSTP_DUPLEX_POST 会秒回 HTTP 4xx，此时立刻 SessionCache 复用转 SoftEther-SSL！
+	sstpSess, fastHTTPRejectPort, tlsReachable, sstpErr := dialMSSSTPSessionWithHint(serverDest, dialer, baseKey, slotKey)
+	if sstpErr == nil {
 		ovpnProtoCache.Store(baseKey, "ms-sstp")
 		return sstpSess, nil
-	} else if pCached == "ms-sstp" {
-		if sess, _, seErr := dialSoftEtherNativeSession(serverDest, dialer, baseKey, slotKey, isBackground); seErr == nil {
-			ovpnProtoCache.Store(baseKey, "softether-ssl")
-			return sess, nil
-		}
 	}
 
-	ovpnCfg := getOrDefaultOVPNConfig(baseKey)
-	if ovpnSess, ovpnErr := dialOpenVPNSession(effectiveDest, dialer, baseKey, slotKey, ovpnCfg, false); ovpnErr == nil {
+	if tlsReachable {
+		// TLS 通了且 SSTP 返回了快速 HTTP 错误 (如 404/403/501) -> 几乎确定是 SoftEther Server
+		errors.LogInfo(bgCtx, fmt.Sprintf("[VPNGate] 端口 %d TLS 可达但非 SSTP (%v)，切换 SoftEther-SSL", fastHTTPRejectPort, sstpErr))
+		seSess, _, seErr := dialSoftEtherNativeSession(serverDest, dialer, baseKey, slotKey, fastHTTPRejectPort)
+		if seErr == nil {
+			ovpnProtoCache.Store(baseKey, "softether-ssl")
+			return seSess, nil
+		}
+		recordNodeFailureIfNeeded(baseKey, isBackground, seErr)
+		return nil, seErr
+	}
+
+	// 4. 若 TLS 阶段 0 字节超时：可能是纯 OpenVPN TCP (把 ClientHello 0x1603 当成了 5635 字节包长)，用 4s 短超时兜底试 1 次
+	if ovpnSess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, false, 4200*time.Millisecond); ovpnErr == nil {
 		ovpnProtoCache.Store(baseKey, "openvpn-tcp")
 		return ovpnSess, nil
 	}
-	if ovpnCfg.udpPort > 0 {
-		if udpSess, udpErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, true); udpErr == nil {
-			ovpnProtoCache.Store(baseKey, "openvpn-udp")
-			return udpSess, nil
-		}
-	}
 
-	err := fmt.Errorf("节点 %s 全协议 (SSL/SSTP/OVPN) 握手均未就绪", baseKey)
+	err := fmt.Errorf("节点 %s 全协议 (SSTP/SSL/OVPN) 握手均未就绪", baseKey)
 	recordNodeFailureIfNeeded(baseKey, isBackground, err)
 	return nil, err
 }
 
-func dialMSSSTPSession(serverDest net.Destination, dialer internet.Dialer, baseKey, slotKey string, isBackground bool) (*sstpSession, error) {
+func dialMSSSTPSession(serverDest net.Destination, dialer internet.Dialer, baseKey, slotKey string) (*sstpSession, error) {
+	sess, _, _, err := dialMSSSTPSessionWithHint(serverDest, dialer, baseKey, slotKey)
+	return sess, err
+}
+
+// dialMSSSTPSessionWithHint 返回 (session, 探测到的可达端口, 是否属于TLS可达且HTTP快速拒绝, err)
+func dialMSSSTPSessionWithHint(serverDest net.Destination, dialer internet.Dialer, baseKey, slotKey string) (*sstpSession, net.Port, bool, error) {
 	bgCtx := context.Background()
 	connCtx, connCancel := context.WithCancel(bgCtx)
 	var handshakeSucceeded atomic.Bool
-	var rawConn net.Conn
-	abortTimer := time.AfterFunc(6500*time.Millisecond, func() {
-		if !handshakeSucceeded.Load() {
-			connCancel()
-			if rawConn != nil {
-				_ = rawConn.Close()
-			}
-		}
-	})
 	defer func() {
-		abortTimer.Stop()
 		if !handshakeSucceeded.Load() {
 			connCancel()
 		}
@@ -904,12 +918,10 @@ func dialMSSSTPSession(serverDest net.Destination, dialer internet.Dialer, baseK
 	if serverDest.Address.Family().IsIP() {
 		sniHost = "www.microsoft.com"
 	}
-	var tlsConn *tls.Conn
-	var activePort net.Port
-	var err error
-	rawConn, tlsConn, activePort, err = dialAndTLSWithPortRace(connCtx, dialer, serverDest, sniHost)
+
+	rawConn, tlsConn, activePort, err := dialTLSSerialCandidate(connCtx, dialer, serverDest, sniHost)
 	if err != nil {
-		return nil, err
+		return nil, 0, false, err
 	}
 
 	var certHash [32]byte
@@ -928,29 +940,48 @@ func dialMSSSTPSession(serverDest net.Destination, dialer internet.Dialer, baseK
 
 	serviceGUID := "{BA195980-CD49-458b-9E23-C84EE0ADCD75}"
 	sstpReq := fmt.Sprintf("SSTP_DUPLEX_POST /sra_%s/ HTTP/1.1\r\nHost: %s\r\nContent-Length: 18446744073709551615\r\nSSTPCORRELATIONID: %s\r\n\r\n", serviceGUID, host, guid)
-	_, writeErr := tlsConn.Write([]byte(sstpReq))
+
 	br := bufio.NewReaderSize(tlsConn, 131072)
 	var statusLine string
-	var readErr error
-	if writeErr == nil {
-		statusLine, readErr = br.ReadString('\n')
+	httpErr := RunWithWatchdog(rawConn, 2500*time.Millisecond, func() error {
+		if _, wErr := tlsConn.Write([]byte(sstpReq)); wErr != nil {
+			return wErr
+		}
+		var rErr error
+		statusLine, rErr = br.ReadString('\n')
+		return rErr
+	})
+
+	if httpErr != nil {
+		_ = rawConn.Close()
+		return nil, activePort, false, fmt.Errorf("SSTP HTTP 无响应: %w", httpErr)
 	}
-	if writeErr != nil || readErr != nil || !strings.Contains(statusLine, "200") {
-		rawConn.Close()
-		return nil, fmt.Errorf("SSTP HTTP 非 200")
+	if !strings.Contains(statusLine, "200") {
+		_ = rawConn.Close()
+		// 收到快速 HTTP 4xx/5xx，说明端口在线且是 HTTP/SoftEther 服务！
+		return nil, activePort, true, fmt.Errorf("SSTP 非 200 (%s)", strings.TrimSpace(statusLine))
 	}
 
-	for {
-		line, err := br.ReadString('\n')
-		if err != nil || line == "\r\n" {
-			break
+	headerErr := RunWithWatchdog(rawConn, 2000*time.Millisecond, func() error {
+		for {
+			line, rErr := br.ReadString('\n')
+			if rErr != nil {
+				return rErr
+			}
+			if line == "\r\n" || line == "\n" {
+				return nil
+			}
 		}
+	})
+	if headerErr != nil {
+		_ = rawConn.Close()
+		return nil, activePort, false, headerErr
 	}
 
 	s, ep, err := newGVisorStack()
 	if err != nil {
-		rawConn.Close()
-		return nil, err
+		_ = rawConn.Close()
+		return nil, activePort, false, err
 	}
 
 	sess := &sstpSession{
@@ -981,7 +1012,7 @@ func dialMSSSTPSession(serverDest net.Destination, dialer internet.Dialer, baseK
 			close(sess.dead)
 			unbindSessionAllSlots(baseKey, slotKey, sess)
 			connCancel()
-			rawConn.Close()
+			_ = rawConn.Close()
 			s.Close()
 		})
 	}
@@ -1213,10 +1244,10 @@ func dialMSSSTPSession(serverDest net.Destination, dialer internet.Dialer, baseK
 	case localIP = <-ipReady:
 	case <-sess.dead:
 		markDead()
-		return nil, fmt.Errorf("SSTP 握手中被服务端断开")
-	case <-time.After(3000 * time.Millisecond):
+		return nil, activePort, false, fmt.Errorf("SSTP 握手中被服务端断开")
+	case <-time.After(3500 * time.Millisecond):
 		markDead()
-		return nil, fmt.Errorf("SSTP PPP/IPCP 协商超时")
+		return nil, activePort, false, fmt.Errorf("SSTP PPP/IPCP 协商超时")
 	}
 
 	_ = s.AddProtocolAddress(1, tcpip.ProtocolAddress{
@@ -1228,40 +1259,14 @@ func dialMSSSTPSession(serverDest net.Destination, dialer internet.Dialer, baseK
 	handshakeSucceeded.Store(true)
 	slotBackoff.Delete(slotKey)
 	bindSessionAllSlots(baseKey, slotKey, sess)
-	return sess, nil
+	return sess, activePort, false, nil
 }
 
-func inspectSoftEtherHelloPack(body []byte) (strPlusOne bool) {
-	data := body
-	if len(data) >= 8 {
-		first := binary.BigEndian.Uint32(data[0:4])
-		if first > 256 && int(first) <= len(data)-4 {
-			data = data[4 : 4+int(first)]
-		}
-	}
-	if len(data) < 20 {
-		return false
-	}
-	pos := 4
-	nameLen := int(binary.BigEndian.Uint32(data[pos : pos+4]))
-	pos += 4
-	if nameLen <= 1 || pos+nameLen-1+12 > len(data) {
-		return false
-	}
-	pos += nameLen - 1
-	valType := binary.BigEndian.Uint32(data[pos : pos+4])
-	pos += 8
-	if valType == 2 && pos+4 <= len(data) {
-		sLen := int(binary.BigEndian.Uint32(data[pos : pos+4]))
-		pos += 4
-		if sLen > 0 && pos+sLen-1 < len(data) && data[pos+sLen-1] == 0 {
-			return true
-		}
-	}
-	return false
-}
+// =========================================================================
+// SoftEther-SSL PACK 编解码 (严格对齐 Mayaqua/Pack.c: ElementName 写 len+1，VALUE_STR 写 len)
+// =========================================================================
 
-func buildSoftEtherLoginPack(strPlusOne bool) []byte {
+func buildSoftEtherLoginPack(uniqueID []byte) []byte {
 	var b bytes.Buffer
 	writeU32 := func(v uint32) {
 		var tmp [4]byte
@@ -1269,45 +1274,76 @@ func buildSoftEtherLoginPack(strPlusOne bool) []byte {
 		b.Write(tmp[:])
 	}
 	writeName := func(s string) {
+		// Element Name 规范: 长度写 len+1，数据写 len 字节（不含 \0）
 		writeU32(uint32(len(s) + 1))
 		b.WriteString(s)
 	}
 	addStr := func(k, v string) {
 		writeName(k)
-		writeU32(2)
+		writeU32(2) // VALUE_STR
 		writeU32(1)
-		if strPlusOne {
-			writeU32(uint32(len(v) + 1))
-		} else {
-			writeU32(uint32(len(v)))
-		}
+		// VALUE_STR 规范: 写精确 len（不加 1），不含 \0
+		writeU32(uint32(len(v)))
 		b.WriteString(v)
 	}
 	addInt := func(k string, v uint32) {
 		writeName(k)
-		writeU32(0)
+		writeU32(0) // VALUE_INT
 		writeU32(1)
 		writeU32(v)
 	}
-	writeU32(12)
+	addData := func(k string, d []byte) {
+		writeName(k)
+		writeU32(1) // VALUE_DATA
+		writeU32(1)
+		writeU32(uint32(len(d)))
+		b.Write(d)
+	}
+
+	writeU32(15)
 	addStr("method", "login")
 	addStr("hubname", "VPNGATE")
 	addStr("username", "vpn")
-	addInt("authtype", 0)
-	addInt("protocol", 0)
-	addInt("use_encrypt", 0)
+	addInt("authtype", 0) // CLIENT_AUTHTYPE_ANONYMOUS
+	addInt("protocol", 0) // CONNECTION_TCP
+	addInt("use_encrypt", 1)
 	addInt("use_compress", 0)
 	addInt("max_connection", 1)
 	addInt("half_connection", 0)
+	addInt("qos", 0)
+	addInt("require_bridge_routing_mode", 0)
+	addInt("require_monitor_mode", 0)
 	addStr("client_str", "SoftEther VPN Client")
 	addInt("client_ver", 442)
 	addInt("client_build", 9798)
-	return b.Bytes()
+	// 若需携带 unique_id，更新计数并追加；此处直接替换为 16 元素
+	bufBytes := b.Bytes()
+	binary.BigEndian.PutUint32(bufBytes[0:4], 16)
+	var tail bytes.Buffer
+	tail.Write(bufBytes)
+	writeNameTail := func(s string) {
+		var tmp [4]byte
+		binary.BigEndian.PutUint32(tmp[:], uint32(len(s)+1))
+		tail.Write(tmp[:])
+		tail.WriteString(s)
+	}
+	writeU32Tail := func(v uint32) {
+		var tmp [4]byte
+		binary.BigEndian.PutUint32(tmp[:], v)
+		tail.Write(tmp[:])
+	}
+	writeNameTail("unique_id")
+	writeU32Tail(1)
+	writeU32Tail(1)
+	writeU32Tail(uint32(len(uniqueID)))
+	tail.Write(uniqueID)
+	_ = addData
+	return tail.Bytes()
 }
 
-func checkSoftEtherLoginResponse(body []byte, strPlusOne bool) error {
+func checkSoftEtherPackResponse(body []byte, requireRandom bool) error {
 	if len(body) < 4 {
-		return fmt.Errorf("SoftEther 登录响应过短: %d", len(body))
+		return fmt.Errorf("SoftEther PACK 响应过短: %d", len(body))
 	}
 	data := body
 	firstU32 := binary.BigEndian.Uint32(data[0:4])
@@ -1315,6 +1351,9 @@ func checkSoftEtherLoginResponse(body []byte, strPlusOne bool) error {
 		data = data[4 : 4+int(firstU32)]
 	}
 	numElems := binary.BigEndian.Uint32(data[0:4])
+	if numElems > 1024 {
+		return fmt.Errorf("SoftEther PACK 元素数异常: %d", numElems)
+	}
 	pos := 4
 	readU32 := func() (uint32, bool) {
 		if pos+4 > len(data) {
@@ -1324,7 +1363,8 @@ func checkSoftEtherLoginResponse(body []byte, strPlusOne bool) error {
 		pos += 4
 		return v, true
 	}
-	for i := uint32(0); i < numElems && i < 128; i++ {
+	hasRandom := false
+	for i := uint32(0); i < numElems; i++ {
 		nameLen, ok := readU32()
 		if !ok || nameLen == 0 {
 			break
@@ -1341,47 +1381,40 @@ func checkSoftEtherLoginResponse(body []byte, strPlusOne bool) error {
 			break
 		}
 		numVals, ok := readU32()
-		if !ok || numVals > 256 {
+		if !ok || numVals > 512 {
 			break
 		}
 		for j := uint32(0); j < numVals; j++ {
 			switch valType {
-			case 0:
+			case 0: // VALUE_INT
 				v, ok := readU32()
 				if !ok {
 					return nil
 				}
 				if name == "error" && j == 0 && v != 0 {
-					return fmt.Errorf("SoftEther 拒绝登录 (error=%d)", v)
+					return fmt.Errorf("SoftEther 服务端拒绝 (error=%d)", v)
 				}
-			case 4:
+			case 4: // VALUE_INT64
 				if pos+8 > len(data) {
 					return nil
 				}
 				pos += 8
-			case 2:
-				dLen, ok := readU32()
-				if !ok {
-					return nil
-				}
-				adv := int(dLen)
-				if strPlusOne && adv > 0 {
-					adv--
-				}
-				if adv < 0 || pos+adv > len(data) {
-					return nil
-				}
-				pos += adv
-			case 1, 3:
+			case 1, 2, 3: // DATA / STR / UNISTR
 				dLen, ok := readU32()
 				if !ok || pos+int(dLen) > len(data) {
 					return nil
+				}
+				if name == "random" && valType == 1 && dLen >= 16 {
+					hasRandom = true
 				}
 				pos += int(dLen)
 			default:
 				return nil
 			}
 		}
+	}
+	if requireRandom && !hasRandom {
+		return fmt.Errorf("Hello PACK 缺少 random 挑战字段")
 	}
 	return nil
 }
@@ -1393,7 +1426,7 @@ func readSoftEtherPackOrHTTP(br *bufio.Reader) ([]byte, error) {
 	}
 	if string(peek) != "HTTP" {
 		rawLen := int(binary.BigEndian.Uint32(peek))
-		if rawLen <= 0 || rawLen > 65536 {
+		if rawLen <= 0 || rawLen > 256*1024 {
 			return nil, fmt.Errorf("SoftEther 非HTTP响应首字异常: %x", peek)
 		}
 		_, _ = br.Discard(4)
@@ -1425,7 +1458,7 @@ func readSoftEtherPackOrHTTP(br *bufio.Reader) ([]byte, error) {
 			_, _ = fmt.Sscanf(strings.TrimSpace(lower[len("content-length:"):]), "%d", &contentLen)
 		}
 	}
-	if contentLen <= 0 || contentLen > 65536 {
+	if contentLen <= 0 || contentLen > 256*1024 {
 		return nil, fmt.Errorf("HTTP响应体长度无效: %d", contentLen)
 	}
 	body := make([]byte, contentLen)
@@ -1433,6 +1466,38 @@ func readSoftEtherPackOrHTTP(br *bufio.Reader) ([]byte, error) {
 		return nil, err
 	}
 	return body, nil
+}
+
+func computeIPv4Checksum(ip []byte) uint16 {
+	var sum uint32
+	for i := 0; i < len(ip); i += 2 {
+		sum += uint32(binary.BigEndian.Uint16(ip[i : i+2]))
+	}
+	for (sum >> 16) > 0 {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
+}
+
+func computeUDPChecksum(srcIP, dstIP, udp []byte) uint16 {
+	var sum uint32
+	sum += uint32(binary.BigEndian.Uint16(srcIP[0:2])) + uint32(binary.BigEndian.Uint16(srcIP[2:4]))
+	sum += uint32(binary.BigEndian.Uint16(dstIP[0:2])) + uint32(binary.BigEndian.Uint16(dstIP[2:4]))
+	sum += 17 + uint32(len(udp))
+	for i := 0; i+1 < len(udp); i += 2 {
+		sum += uint32(binary.BigEndian.Uint16(udp[i : i+2]))
+	}
+	if len(udp)%2 == 1 {
+		sum += uint32(udp[len(udp)-1]) << 8
+	}
+	for (sum >> 16) > 0 {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	cs := ^uint16(sum)
+	if cs == 0 {
+		return 0xFFFF
+	}
+	return cs
 }
 
 func buildDHCPFrame(msgType byte, xid uint32, myMAC [6]byte, reqIP, serverIP []byte) []byte {
@@ -1457,6 +1522,7 @@ func buildDHCPFrame(msgType byte, xid uint32, myMAC [6]byte, reqIP, serverIP []b
 	}
 	bootp[idx], bootp[idx+1], bootp[idx+2], bootp[idx+3], bootp[idx+4] = 55, 3, 1, 3, 6
 	bootp[idx+5] = 255
+	bootp = bootp[:idx+6]
 
 	udpLen := 8 + len(bootp)
 	ipLen := 20 + udpLen
@@ -1472,41 +1538,42 @@ func buildDHCPFrame(msgType byte, xid uint32, myMAC [6]byte, reqIP, serverIP []b
 	binary.BigEndian.PutUint16(ip[2:4], uint16(ipLen))
 	ip[8], ip[9] = 64, 17
 	ip[16], ip[17], ip[18], ip[19] = 255, 255, 255, 255
-	var csum uint32
-	for i := 0; i < 20; i += 2 {
-		csum += uint32(binary.BigEndian.Uint16(ip[i : i+2]))
-	}
-	for (csum >> 16) > 0 {
-		csum = (csum & 0xffff) + (csum >> 16)
-	}
-	binary.BigEndian.PutUint16(ip[10:12], ^uint16(csum))
+	binary.BigEndian.PutUint16(ip[10:12], computeIPv4Checksum(ip))
 
-	udpHdr := eth[34 : 34+8]
-	binary.BigEndian.PutUint16(udpHdr[0:2], 68)
-	binary.BigEndian.PutUint16(udpHdr[2:4], 67)
-	binary.BigEndian.PutUint16(udpHdr[4:6], uint16(udpLen))
-	copy(eth[42:], bootp)
+	udpSeg := eth[34:]
+	binary.BigEndian.PutUint16(udpSeg[0:2], 68)
+	binary.BigEndian.PutUint16(udpSeg[2:4], 67)
+	binary.BigEndian.PutUint16(udpSeg[4:6], uint16(udpLen))
+	copy(udpSeg[8:], bootp)
+	binary.BigEndian.PutUint16(udpSeg[6:8], computeUDPChecksum(ip[12:16], ip[16:20], udpSeg))
 	return eth
 }
 
-func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dialer, baseKey, slotKey string, isBackground bool) (*sstpSession, net.Port, error) {
+func buildARPFrame(op uint16, srcMAC [6]byte, srcIP [4]byte, dstMAC [6]byte, dstIP [4]byte) []byte {
+	var f [42]byte
+	if op == 1 {
+		copy(f[0:6], []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff})
+	} else {
+		copy(f[0:6], dstMAC[:])
+	}
+	copy(f[6:12], srcMAC[:])
+	f[12], f[13] = 0x08, 0x06
+	binary.BigEndian.PutUint16(f[14:16], 1)
+	binary.BigEndian.PutUint16(f[16:18], 0x0800)
+	f[18], f[19] = 6, 4
+	binary.BigEndian.PutUint16(f[20:22], op)
+	copy(f[22:28], srcMAC[:])
+	copy(f[28:32], srcIP[:])
+	copy(f[32:38], dstMAC[:])
+	copy(f[38:42], dstIP[:])
+	return f[:]
+}
+
+func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dialer, baseKey, slotKey string, knownPort net.Port) (*sstpSession, net.Port, error) {
 	bgCtx := context.Background()
 	connCtx, connCancel := context.WithCancel(bgCtx)
 	var handshakeSucceeded atomic.Bool
-	var rawConn net.Conn
-	var stage atomic.Value
-	stage.Store("1-多端口TLS竞速")
-
-	abortTimer := time.AfterFunc(8000*time.Millisecond, func() {
-		if !handshakeSucceeded.Load() {
-			connCancel()
-			if rawConn != nil {
-				_ = rawConn.Close()
-			}
-		}
-	})
 	defer func() {
-		abortTimer.Stop()
 		if !handshakeSucceeded.Load() {
 			connCancel()
 		}
@@ -1518,52 +1585,80 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 		sniHost = "www.microsoft.com"
 	}
 
+	var rawConn net.Conn
 	var tlsConn *tls.Conn
 	var activePort net.Port
 	var err error
-	rawConn, tlsConn, activePort, err = dialAndTLSWithPortRace(connCtx, dialer, serverDest, sniHost)
+
+	if knownPort != 0 {
+		activePort = knownPort
+		rawConn, tlsConn, err = dialTLSWatchdog(connCtx, dialer, net.TCPDestination(serverDest.Address, knownPort), sniHost, 3000*time.Millisecond)
+	} else {
+		rawConn, tlsConn, activePort, err = dialTLSSerialCandidate(connCtx, dialer, serverDest, sniHost)
+	}
 	if err != nil {
-		return nil, 0, fmt.Errorf("阶段[%s]: %w", stage.Load().(string), err)
+		return nil, activePort, fmt.Errorf("阶段[1-TLS]: %w", err)
 	}
 
-	abortTimer.Reset(4500 * time.Millisecond)
-	stage.Store("2-connect.cgi签名")
-	sigReq := fmt.Sprintf("POST /vpnsvc/connect.cgi HTTP/1.1\r\nHost: %s\r\nContent-Type: image/jpeg\r\nConnection: Keep-Alive\r\nContent-Length: 10\r\n\r\nVPNCONNECT", host)
-	if _, err := tlsConn.Write([]byte(sigReq)); err != nil {
-		rawConn.Close()
-		return nil, activePort, fmt.Errorf("阶段[%s写]: %w", stage.Load().(string), err)
-	}
 	br := bufio.NewReaderSize(tlsConn, 131072)
-	helloBody, err := readSoftEtherPackOrHTTP(br)
+
+	// -----------------------------------------------------------------
+	// 阶段 2: POST /vpnsvc/connect.cgi -> Hello PACK (带 3.2s Watchdog)
+	// -----------------------------------------------------------------
+	sigReq := fmt.Sprintf("POST /vpnsvc/connect.cgi HTTP/1.1\r\nHost: %s\r\nContent-Type: application/octet-stream\r\nConnection: Keep-Alive\r\nContent-Length: 10\r\n\r\nVPNCONNECT", host)
+	var helloBody []byte
+	err = RunWithWatchdog(rawConn, 3200*time.Millisecond, func() error {
+		if _, wErr := tlsConn.Write([]byte(sigReq)); wErr != nil {
+			return wErr
+		}
+		var rErr error
+		helloBody, rErr = readSoftEtherPackOrHTTP(br)
+		return rErr
+	})
 	if err != nil {
-		rawConn.Close()
-		return nil, activePort, fmt.Errorf("阶段[%s读]: %w", stage.Load().(string), err)
+		_ = rawConn.Close()
+		return nil, activePort, fmt.Errorf("阶段[2-connect.cgi]: %w", err)
+	}
+	if err := checkSoftEtherPackResponse(helloBody, true); err != nil {
+		_ = rawConn.Close()
+		return nil, activePort, fmt.Errorf("阶段[2-hello校验]: %w", err)
 	}
 
-	stage.Store("3-vpn.cgi登录")
-	strPlusOne := inspectSoftEtherHelloPack(helloBody)
-	packBytes := buildSoftEtherLoginPack(strPlusOne)
+	// -----------------------------------------------------------------
+	// 阶段 3: POST /vpnsvc/vpn.cgi -> Login PACK -> Session PACK
+	// -----------------------------------------------------------------
+	uniqueID := make([]byte, 20)
+	_, _ = rand.Read(uniqueID)
+	packBytes := buildSoftEtherLoginPack(uniqueID)
+
 	var loginBuf bytes.Buffer
-	fmt.Fprintf(&loginBuf, "POST /vpnsvc/vpn.cgi HTTP/1.1\r\nHost: %s\r\nContent-Type: image/jpeg\r\nConnection: Keep-Alive\r\nContent-Length: %d\r\n\r\n", host, len(packBytes))
+	fmt.Fprintf(&loginBuf, "POST /vpnsvc/vpn.cgi HTTP/1.1\r\nHost: %s\r\nContent-Type: application/octet-stream\r\nConnection: Keep-Alive\r\nContent-Length: %d\r\n\r\n", host, len(packBytes))
 	loginBuf.Write(packBytes)
 
-	if _, err := tlsConn.Write(loginBuf.Bytes()); err != nil {
-		rawConn.Close()
-		return nil, activePort, fmt.Errorf("阶段[%s写]: %w", stage.Load().(string), err)
-	}
-	loginRespBody, err := readSoftEtherPackOrHTTP(br)
+	var loginRespBody []byte
+	err = RunWithWatchdog(rawConn, 3200*time.Millisecond, func() error {
+		if _, wErr := tlsConn.Write(loginBuf.Bytes()); wErr != nil {
+			return wErr
+		}
+		var rErr error
+		loginRespBody, rErr = readSoftEtherPackOrHTTP(br)
+		return rErr
+	})
 	if err != nil {
-		rawConn.Close()
-		return nil, activePort, fmt.Errorf("阶段[%s读]: %w", stage.Load().(string), err)
+		_ = rawConn.Close()
+		return nil, activePort, fmt.Errorf("阶段[3-vpn.cgi]: %w", err)
 	}
-	if err := checkSoftEtherLoginResponse(loginRespBody, strPlusOne); err != nil {
-		rawConn.Close()
-		return nil, activePort, fmt.Errorf("阶段[%s验]: %w", stage.Load().(string), err)
+	if err := checkSoftEtherPackResponse(loginRespBody, false); err != nil {
+		_ = rawConn.Close()
+		return nil, activePort, fmt.Errorf("阶段[3-login校验]: %w", err)
 	}
 
+	// -----------------------------------------------------------------
+	// 阶段 4: 切换为原始二进制以太网隧道 + Virtual DHCP + ARP
+	// -----------------------------------------------------------------
 	s, ep, err := newGVisorStack()
 	if err != nil {
-		rawConn.Close()
+		_ = rawConn.Close()
 		return nil, activePort, err
 	}
 
@@ -1598,15 +1693,15 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 	ipReady := make(chan dhcpLease, 1)
 	var once sync.Once
 	var deadOnce sync.Once
-	var assignedIP [4]byte
-	var hasIP, offerReceived atomic.Bool
+	var assignedIP, gatewayIP [4]byte
+	var hasIP, offerReceived, gwARPResolved atomic.Bool
 
 	markDead := func() {
 		deadOnce.Do(func() {
 			close(sess.dead)
 			unbindSessionAllSlots(baseKey, slotKey, sess)
 			connCancel()
-			rawConn.Close()
+			_ = rawConn.Close()
 			s.Close()
 		})
 	}
@@ -1643,19 +1738,30 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 			}
 			lastRxNano.Store(time.Now().UnixNano())
 			numPkts := binary.BigEndian.Uint32(hdr[:])
-			if numPkts == 0 {
+
+			// SoftEther 标准 KeepAlive 魔数为 0xFFFFFFFF (4B size + size bytes)，同时兼容 0 块心跳
+			if numPkts == 0xFFFFFFFF {
 				if _, err := io.ReadFull(br, hdr[:]); err != nil {
 					return
 				}
 				kaLen := binary.BigEndian.Uint32(hdr[:])
-				if kaLen > 0 && kaLen <= 65536 {
-					_, _ = io.CopyN(io.Discard, br, int64(kaLen))
+				if kaLen > 65536 {
+					return
 				}
+				if kaLen > 0 {
+					if _, err := io.CopyN(io.Discard, br, int64(kaLen)); err != nil {
+						return
+					}
+				}
+				continue
+			}
+			if numPkts == 0 {
 				continue
 			}
 			if numPkts > 1024 {
 				return
 			}
+
 			for i := uint32(0); i < numPkts; i++ {
 				if _, err := io.ReadFull(br, hdr[:]); err != nil {
 					return
@@ -1673,20 +1779,20 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 				}
 				etherType := binary.BigEndian.Uint16(eth[12:14])
 				if etherType == 0x0806 && len(eth) >= 42 {
-					if binary.BigEndian.Uint16(eth[20:22]) == 1 && hasIP.Load() && bytes.Equal(eth[38:42], assignedIP[:]) {
-						arpRep := make([]byte, 42)
-						copy(arpRep[0:6], eth[6:12])
-						copy(arpRep[6:12], myMAC[:])
-						arpRep[12], arpRep[13] = 0x08, 0x06
-						binary.BigEndian.PutUint16(arpRep[14:16], 1)
-						binary.BigEndian.PutUint16(arpRep[16:18], 0x0800)
-						arpRep[18], arpRep[19] = 6, 4
-						binary.BigEndian.PutUint16(arpRep[20:22], 2)
-						copy(arpRep[22:28], myMAC[:])
-						copy(arpRep[28:32], assignedIP[:])
-						copy(arpRep[32:38], eth[22:28])
-						copy(arpRep[38:42], eth[28:32])
-						_ = sess.writeSoftEtherFrames([][]byte{arpRep})
+					arpOp := binary.BigEndian.Uint16(eth[20:22])
+					if arpOp == 1 && hasIP.Load() && bytes.Equal(eth[38:42], assignedIP[:]) {
+						// 响应网关发来的 ARP 询问，确保双向回包不中断
+						var dstMAC [6]byte
+						var dstIP [4]byte
+						copy(dstMAC[:], eth[22:28])
+						copy(dstIP[:], eth[28:32])
+						_ = sess.writeSoftEtherFrames([][]byte{buildARPFrame(2, myMAC, assignedIP, dstMAC, dstIP)})
+					} else if arpOp == 2 && hasIP.Load() && bytes.Equal(eth[28:32], gatewayIP[:]) {
+						// 捕获到真实默认网关的 ARP Reply MAC
+						var realGW [6]byte
+						copy(realGW[:], eth[22:28])
+						sess.gwMAC.Store(realGW)
+						gwARPResolved.Store(true)
 					}
 					continue
 				}
@@ -1710,7 +1816,7 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 							if binary.BigEndian.Uint32(bootp[4:8]) == dhcpXid && len(bootp) > 240 {
 								yiaddr := bootp[16:20]
 								var msgType byte
-								var srvID, subnetMask []byte
+								var srvID, subnetMask, routerOpt []byte
 								opts := bootp[240:]
 								for k := 0; k < len(opts); {
 									code := opts[k]
@@ -1730,6 +1836,8 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 									}
 									if code == 1 && olen == 4 {
 										subnetMask = opts[k+2 : k+6]
+									} else if code == 3 && olen >= 4 {
+										routerOpt = opts[k+2 : k+6]
 									} else if code == 53 && olen >= 1 {
 										msgType = opts[k+2]
 									} else if code == 54 && olen == 4 {
@@ -1737,15 +1845,24 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 									}
 									k += 2 + olen
 								}
-								var srcMAC [6]byte
-								copy(srcMAC[:], eth[6:12])
-								sess.gwMAC.Store(srcMAC)
+								if !gwARPResolved.Load() {
+									var srcMAC [6]byte
+									copy(srcMAC[:], eth[6:12])
+									sess.gwMAC.Store(srcMAC)
+								}
 								if msgType == 2 {
 									offerReceived.Store(true)
 									_ = sess.writeSoftEtherFrames([][]byte{buildDHCPFrame(3, dhcpXid, myMAC, yiaddr, srvID)})
 								} else if msgType == 5 {
 									copy(assignedIP[:], yiaddr)
+									if len(routerOpt) == 4 {
+										copy(gatewayIP[:], routerOpt)
+									}
 									hasIP.Store(true)
+									if gatewayIP != ([4]byte{}) {
+										// 主动向 Option 3 网关 IP 发 ARP 请求解析真实网关 MAC
+										_ = sess.writeSoftEtherFrames([][]byte{buildARPFrame(1, myMAC, assignedIP, [6]byte{}, gatewayIP)})
+									}
 									addr := tcpip.AddrFromSlice(yiaddr)
 									prefixLen := 16
 									if len(subnetMask) == 4 {
@@ -1833,7 +1950,12 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 
 	go func() {
 		defer markDead()
-		ticker := time.NewTicker(5 * time.Second)
+		// 严格符合 SoftEther Connection.c KEEP_ALIVE_MAGIC = 0xFFFFFFFF + 4B size + size bytes
+		var kaFrame [8 + 16]byte
+		binary.BigEndian.PutUint32(kaFrame[0:4], 0xFFFFFFFF)
+		binary.BigEndian.PutUint32(kaFrame[4:8], 16)
+
+		ticker := time.NewTicker(8 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
@@ -1844,7 +1966,7 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 				if now-lastRxNano.Load() > int64(45*time.Second) || now-lastActiveNano.Load() > int64(600*time.Second) {
 					return
 				}
-				if err := sess.writeFrame([]byte{0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0}); err != nil {
+				if err := sess.writeFrame(kaFrame[:]); err != nil {
 					return
 				}
 			}
@@ -1927,7 +2049,7 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
 		for {
 			rSlice := b
 			if totalDown > 1536*1024 {
-				rSlice = b[:16384]
+				rSlice = b[:32768]
 				runtime.Gosched()
 			}
 			n, rErr := gConn.Read(rSlice)
@@ -2029,10 +2151,10 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
             raise RuntimeError("❌ 未能在 proxy/socks/client.go 的 Process 函数中匹配到 server 变量赋值行！")
         with open(client_go, "w", encoding="utf-8") as f:
             f.write(new_code)
-        print("  ✔ [VPNGate 主引擎] 成功注入无锁单槽、SoftEther/SSTP零拷贝流与多路DNS抢答")
+        print("  ✔ [VPNGate 主引擎] 成功注入 (Watchdog + 信号量限流 + SSTP优先 + SoftEther KeepAlive/ARP修复)")
 
 # =========================================================================
-# 7. 注入 VPNGate 爆发+稳定双兼顾引擎 (QoS小包插队 + 3.5MB黄金BDP + 僵尸隧道秒级熔断 + Google DoT)
+# 7. 注入 VPNGate OpenVPN 爆发+稳定双兼顾引擎 (QoS小包插队 + DoT Watchdog + 可控探测超时)
 # =========================================================================
 if os.path.exists(socks_dir):
     ovpn_file = os.path.join(socks_dir, "vpngate_openvpn.go")
@@ -2293,44 +2415,47 @@ func queryOuterDoT(ctx context.Context, dialer internet.Dialer, dnsIP, sni strin
 	if dialer == nil {
 		return nil, 0, fmt.Errorf("nil dialer")
 	}
-	dCtx, cancel := context.WithTimeout(ctx, 1800*time.Millisecond)
-	defer cancel()
-	rawConn, err := dialer.Dial(dCtx, net.TCPDestination(net.ParseAddress(dnsIP), 853))
+	rawConn, err := dialer.Dial(ctx, net.TCPDestination(net.ParseAddress(dnsIP), 853))
 	if err != nil {
 		return nil, 0, err
 	}
 	defer rawConn.Close()
+
 	tlsConn := tls.Client(rawConn, &tls.Config{
 		ServerName:         sni,
 		InsecureSkipVerify: true,
 		ClientSessionCache: tlsSessionCache,
 	})
-	_ = tlsConn.SetDeadline(time.Now().Add(1800 * time.Millisecond))
-	if err := tlsConn.HandshakeContext(dCtx); err != nil {
-		return nil, 0, err
-	}
-	tcpReq := make([]byte, 2+len(query))
-	binary.BigEndian.PutUint16(tcpReq[0:2], uint16(len(query)))
-	copy(tcpReq[2:], query)
-	if _, err := tlsConn.Write(tcpReq); err != nil {
-		return nil, 0, err
-	}
-	var lenHdr [2]byte
-	if _, err := io.ReadFull(tlsConn, lenHdr[:]); err != nil {
-		return nil, 0, err
-	}
-	msgLen := int(binary.BigEndian.Uint16(lenHdr[:]))
-	if msgLen < 12 || msgLen > 4096 {
-		return nil, 0, fmt.Errorf("bad dot len")
-	}
-	resp := make([]byte, msgLen)
-	if _, err := io.ReadFull(tlsConn, resp); err != nil {
+
+	var resp []byte
+	err = RunWithWatchdog(rawConn, 1800*time.Millisecond, func() error {
+		if hErr := tlsConn.Handshake(); hErr != nil {
+			return hErr
+		}
+		tcpReq := make([]byte, 2+len(query))
+		binary.BigEndian.PutUint16(tcpReq[0:2], uint16(len(query)))
+		copy(tcpReq[2:], query)
+		if _, wErr := tlsConn.Write(tcpReq); wErr != nil {
+			return wErr
+		}
+		var lenHdr [2]byte
+		if _, rErr := io.ReadFull(tlsConn, lenHdr[:]); rErr != nil {
+			return rErr
+		}
+		msgLen := int(binary.BigEndian.Uint16(lenHdr[:]))
+		if msgLen < 12 || msgLen > 4096 {
+			return fmt.Errorf("bad dot len")
+		}
+		resp = make([]byte, msgLen)
+		_, rErr := io.ReadFull(tlsConn, resp)
+		return rErr
+	})
+	if err != nil {
 		return nil, 0, err
 	}
 	return parseDNSResponseIPv4(resp, txID)
 }
 
-// 内层三路 UDP53 + 180ms 触发 TCP53 与 Google DoT (8.8.8.8:853) + 僵尸隧道秒级熔断器
 func ovpnFastResolveIPv4(ctx context.Context, dialer internet.Dialer, sess *sstpSession, host string) ([]byte, error) {
 	return ovpnDNSSF.Do(host, func() ([]byte, error) {
 		if cached, ok := dnsCache.Load(host); ok {
@@ -2395,7 +2520,6 @@ func ovpnFastResolveIPv4(ctx context.Context, dialer internet.Dialer, sess *sstp
 					}
 					resCh <- dnsRes{ip: resIP, ttl: ttl, isOuter: false, err: qErr}
 				}()
-				// 改为 8.8.8.8 (dns.google)，彻底避开 Cloudflare Worker 禁连 1.1.1.1 的防火墙限制
 				go func() {
 					resIP, ttl, qErr := queryOuterDoT(probeCtx, dialer, "8.8.8.8", "dns.google", query, txID)
 					resCh <- dnsRes{ip: resIP, ttl: ttl, isOuter: true, err: qErr}
@@ -2420,7 +2544,6 @@ func ovpnFastResolveIPv4(ctx context.Context, dialer internet.Dialer, sess *sstp
 				if r.err == nil && len(r.ip) == 4 {
 					dnsCache.Store(host, dnsEntry{ip: r.ip, expire: time.Now().Add(30 * time.Minute)})
 					if r.isOuter {
-						// 若外层 DoT 抢先返回，后台再给内层隧道 1.2s 宽限期；若 5 路内层查询全死，立即斩杀僵尸隧道
 						go func(s *sstpSession) {
 							defer probeCancel()
 							select {
@@ -2656,6 +2779,7 @@ func (u *udpPacketIO) RemoteAddr() net.Addr               { return u.raw.RemoteA
 func (u *udpPacketIO) SetDeadline(tm time.Time) error     { return u.raw.SetDeadline(tm) }
 func (u *udpPacketIO) SetReadDeadline(tm time.Time) error { return u.raw.SetReadDeadline(tm) }
 func (u *udpPacketIO) SetWriteDeadline(tm time.Time) error { return u.raw.SetWriteDeadline(tm) }
+
 type unackedCtrlPkt struct {
 	pkt      []byte
 	lastSent time.Time
@@ -3057,7 +3181,7 @@ func clampIPv4TCPMSSInPlace(ipPkt []byte, maxMSS uint16) {
 	binary.BigEndian.PutUint16(ipPkt[ihl+16:ihl+18], ^uint16(sum))
 }
 
-func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, baseKey, slotKey string, cfg *parsedOVPNConfig, useUDP bool) (*sstpSession, error) {
+func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, baseKey, slotKey string, cfg *parsedOVPNConfig, useUDP bool, handshakeTimeout time.Duration) (*sstpSession, error) {
 	if existing := tryReuseExistingSession(baseKey, slotKey); existing != nil {
 		return existing, nil
 	}
@@ -3069,11 +3193,16 @@ func dialOpenVPNSession(serverDest net.Destination, dialer internet.Dialer, base
 		if existing := tryReuseExistingSession(baseKey, slotKey); existing != nil {
 			return existing, nil
 		}
-		return dialOpenVPNSessionCore(serverDest, dialer, baseKey, slotKey, cfg, useUDP)
+		return dialOpenVPNSessionCore(serverDest, dialer, baseKey, slotKey, cfg, useUDP, handshakeTimeout)
 	})
 }
 
-func dialOpenVPNSessionCore(serverDest net.Destination, dialer internet.Dialer, baseKey, slotKey string, cfg *parsedOVPNConfig, useUDP bool) (*sstpSession, error) {
+func dialOpenVPNSessionCore(serverDest net.Destination, dialer internet.Dialer, baseKey, slotKey string, cfg *parsedOVPNConfig, useUDP bool, handshakeTimeout time.Duration) (*sstpSession, error) {
+	if err := acquireProbeSlot(context.Background()); err != nil {
+		return nil, err
+	}
+	defer releaseProbeSlot()
+
 	bgCtx := context.Background()
 	connCtx, connCancel := context.WithCancel(bgCtx)
 	var handshakeSucceeded atomic.Bool
@@ -3083,7 +3212,7 @@ func dialOpenVPNSessionCore(serverDest net.Destination, dialer internet.Dialer, 
 		}
 	}()
 
-	handshakeCtx, handshakeCancel := context.WithTimeout(bgCtx, 12*time.Second)
+	handshakeCtx, handshakeCancel := context.WithTimeout(bgCtx, handshakeTimeout)
 	defer handshakeCancel()
 
 	var targetDest net.Destination
@@ -3133,7 +3262,6 @@ func dialOpenVPNSessionCore(serverDest net.Destination, dialer internet.Dialer, 
 		pktIO = &tcpPacketIO{raw: rawConn, br: bufio.NewReaderSize(rawConn, 65536)}
 	}
 
-	_ = pktIO.SetDeadline(time.Now().Add(10 * time.Second))
 	cInstance := newOVPNControlConn(pktIO, useUDP)
 	ctrlMu.Lock()
 	ctrl = cInstance
@@ -3350,7 +3478,6 @@ func dialOpenVPNSessionCore(serverDest net.Destination, dialer internet.Dialer, 
 	}
 
 	ctrl.stopRetransmit()
-	_ = pktIO.SetDeadline(time.Time{})
 	ctrl.lastRxNano.Store(time.Now().UnixNano())
 	ctrl.handshakeDone.Store(true)
 
@@ -3626,7 +3753,6 @@ func dialOpenVPNSessionCore(serverDest net.Destination, dialer internet.Dialer, 
 			}
 		}()
 	} else {
-		// QoS 大小包双轨插队：小包/DNS/握手包走 highCh 0ms 优先插队，大包走 lowCh
 		highCh := make(chan *stack.PacketBuffer, 64)
 		lowCh := make(chan *stack.PacketBuffer, 64)
 		go func() {
@@ -3726,7 +3852,6 @@ func dialOpenVPNSessionCore(serverDest net.Destination, dialer internet.Dialer, 
 		}()
 	}
 
-	// 10 分钟长效保活，彻底告别 90 秒断流重握
 	go func() {
 		defer sess.markDead()
 		ovpnPing := []byte{0x2a, 0x18, 0x7b, 0xf3, 0x64, 0x1e, 0xb4, 0xcb, 0x07, 0xed, 0x2d, 0x0a, 0x98, 0x1f, 0xc7, 0x48}
@@ -3776,30 +3901,14 @@ func dialOpenVPNSessionCore(serverDest net.Destination, dialer internet.Dialer, 
     with open(ovpn_file, "w", encoding="utf-8") as f:
         f.write(ovpn_src)
 
-    # 同步将第 6 部分 (vpngate_sstp.go) 升级为 3.5MB 黄金 BDP 窗口 + 10 分钟长效保活 + 大流平滑呼吸
-    with open(vg_file, "r", encoding="utf-8") as f:
-        vg_code = f.read()
-    vg_code = vg_code.replace("Max: 16 * 1024 * 1024", "Max: 3584 * 1024")
-    vg_code = vg_code.replace("Default: 4 * 1024 * 1024", "Default: 2 * 1024 * 1024")
-    vg_code = vg_code.replace("int64(90*time.Second)", "int64(600*time.Second)")
-    if '"runtime"' not in vg_code:
-        vg_code = vg_code.replace('"io"', '"io"\n\t"runtime"', 1)
-        vg_code = vg_code.replace(
-            "b := *bp\n\t\tfor {\n\t\t\tn, rErr := gConn.Read(b)",
-            "b := *bp\n\t\tvar totalDown int64\n\t\tfor {\n\t\t\trSlice := b\n\t\t\tif totalDown > 1536*1024 {\n\t\t\t\trSlice = b[:16384]\n\t\t\t\truntime.Gosched()\n\t\t\t}\n\t\t\tn, rErr := gConn.Read(rSlice)\n\t\t\ttotalDown += int64(n)",
-            1,
-        )
-    with open(vg_file, "w", encoding="utf-8") as f:
-        f.write(vg_code)
-
-    print("  ✔ [VPNGate 爆发+稳定引擎] 成功注入 (QoS小包插队 + 3.5MB黄金BDP + 僵尸秒级自愈 + 10分钟保活)")
+    print("  ✔ [VPNGate OpenVPN 引擎] 成功注入 (QoS小包插队 + DoT Watchdog + 10分钟保活)")
 
     if os.system("go mod tidy") != 0:
         raise RuntimeError("❌ go mod tidy 执行失败！")
     print("  ✔ [Go Mod] 已同步 gVisor 与全协议依赖树")
 
 # =========================================================================
-# 8. 突破口 1：直接爆改 $GOMODCACHE 中的 gVisor TCP 源码 (InitialCwnd=64 + 0.82 稳态抗丢包)
+# 8. 激进调优：修改 $GOMODCACHE 中的 gVisor TCP 源码 (InitialCwnd=64 + Cubic 0.82)
 # =========================================================================
 gvisor_dir = os.popen('go list -m -f "{{.Dir}}" gvisor.dev/gvisor').read().strip()
 if gvisor_dir and os.path.exists(gvisor_dir):
@@ -3819,13 +3928,11 @@ if gvisor_dir and os.path.exists(gvisor_dir):
                 tc_code = f.read()
             orig_tc = tc_code
 
-            # 将 gVisor TCP 初始拥塞窗口提至 64 (首轮 RTT 直接并发 80KB，网页瞬间秒开)
             tc_code, n1 = re.subn(r"\bInitialCwnd\s*=\s*\d+\b", "InitialCwnd = 64", tc_code)
             patched_cwnd += n1
 
-            # 将 cubic.go 丢包降窗系数精准设定在 0.82 (兼顾抗丢包与防 Bufferbloat 堵车)
             if fname == "cubic.go":
-                tc_code, n2 = re.subn(r"0\.[789]\d*\b", "0.82", tc_code)
+                tc_code, n2 = re.subn(r"(?<![\d.])0\.[789]\d*\b", "0.82", tc_code)
                 tc_code, n3 = re.subn(r"\*\s*[789]\s*/\s*10\b", "* 82 / 100", tc_code)
                 patched_cc += (n2 + n3)
 
@@ -3834,4 +3941,4 @@ if gvisor_dir and os.path.exists(gvisor_dir):
                     f.write(tc_code)
         print(f"  ✔ [gVisor 内核调优] InitialCwnd=64 ({patched_cwnd} 处)，Cubic 0.82 黄金抗丢包 ({patched_cc} 处)")
 
-print("🎉 Xray 核心所有定制补丁注入完成！")
+print("🎉 Xray 核心所有定制补丁注入完成！请执行编译即可。")
