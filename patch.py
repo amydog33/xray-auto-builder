@@ -1846,7 +1846,7 @@ func buildSELoginPack(uniqueID []byte, random []byte) []byte {
 	p.addInt("use_encrypt", 1)
 	p.addInt("use_compress", 0)
 	p.addInt("max_connection", 4)  // 协商上限 4 管，实际按 1->2->4 弹性按需拉起
-	p.addInt("half_connection", 1) // 开启收发物理分离（ACK 与视频下行互不抢占）
+	p.addInt("half_connection", 0) // 开启收发物理分离（ACK 与视频下行互不抢占）
 	p.addInt("qos", 1)             // 开启服务端小包插队 QoS
 	p.addInt("protocol", 0)
 
@@ -2066,53 +2066,54 @@ func (sess *sstpSession) runSEKeepaliveLoop(pipe *sePipe) {
 }
 
 // 弹性多管管家：1管冷启动 -> 1秒后升2管(1上1下) -> 高清视频(>250KB/s)自动升4管 -> 断管自动静默补齐
+// 直拉满管管家：真实流量进入后立即并发拉满 maxConns（默认 4 管），断管自动补齐
 func (sess *sstpSession) ensureSEElasticManager(serverDest net.Destination, dialer internet.Dialer) {
 	if !sess.isSoftEther || len(sess.seSessionKey) != 20 || sess.seMaxConns <= 1 {
 		return
 	}
 	sess.seMgrOnce.Do(func() {
 		go func() {
-			// 错峰 1 秒避开冷启动握手和 DoT 并发高峰
-			select {
-			case <-time.After(1000 * time.Millisecond):
-			case <-sess.dead:
-				return
-			}
-
-			target := 2
-			if target > sess.seMaxConns {
-				target = sess.seMaxConns
-			}
-			lastBytes := sess.seDownBytes.Load()
+			target := sess.seMaxConns
 			consecFails := 0
 
 			tryFillToTarget := func() {
-				for isAlive(sess) && sess.activeSEPipeCount() < target {
-					if consecFails >= 3 {
-						break
-					}
-					if sess.dialSoftEtherAdditionalPipe(serverDest, dialer) {
-						consecFails = 0
-						select {
-						case <-time.After(250 * time.Millisecond):
-						case <-sess.dead:
+				need := target - sess.activeSEPipeCount()
+				if need <= 0 || !isAlive(sess) || consecFails >= 3 {
+					return
+				}
+				var wg sync.WaitGroup
+				var okCnt atomic.Int32
+				for i := 0; i < need; i++ {
+					wg.Add(1)
+					go func(idx int) {
+						defer wg.Done()
+						if idx > 0 {
+							select {
+							case <-time.After(time.Duration(idx) * 120 * time.Millisecond):
+							case <-sess.dead:
+								return
+							}
+						}
+						if !isAlive(sess) || sess.activeSEPipeCount() >= target {
 							return
 						}
-					} else {
-						consecFails++
-						select {
-						case <-time.After(time.Duration(consecFails) * 1200 * time.Millisecond):
-						case <-sess.dead:
-							return
+						if sess.dialSoftEtherAdditionalPipe(serverDest, dialer) {
+							okCnt.Add(1)
 						}
-					}
+					}(i)
+				}
+				wg.Wait()
+				if okCnt.Load() > 0 {
+					consecFails = 0
+				} else {
+					consecFails++
 				}
 			}
 
-			// 首次升档至 2 管（1 上 1 下）
+			// 立即并发拉满全部管道
 			tryFillToTarget()
 
-			ticker := time.NewTicker(2 * time.Second)
+			ticker := time.NewTicker(5 * time.Second)
 			defer ticker.Stop()
 
 			for {
@@ -2120,26 +2121,14 @@ func (sess *sstpSession) ensureSEElasticManager(serverDest net.Destination, dial
 				case <-sess.dead:
 					return
 				case <-sess.seHealCh:
-					// 有管道被前置掐断，0.5 秒后静默自愈补齐
 					select {
-					case <-time.After(500 * time.Millisecond):
+					case <-time.After(300 * time.Millisecond):
 					case <-sess.dead:
 						return
 					}
 					consecFails = 0
 					tryFillToTarget()
 				case <-ticker.C:
-					curBytes := sess.seDownBytes.Load()
-					delta := curBytes - lastBytes
-					lastBytes = curBytes
-
-					// 2 秒内下行 > 500KB (~250KB/s，如 1080p/4K 视频或下载) 自动升档至 4 管拉满
-					if target < sess.seMaxConns && delta > 500*1024 {
-						target = sess.seMaxConns
-						consecFails = 0
-						errors.LogInfo(context.Background(), fmt.Sprintf("[VPNGate-SSL] 检测到高吞吐流 (%d KB/s)，弹性升档至 %d 管道 (%s)", delta/2048, target, sess.seSlotKey))
-					}
-
 					if sess.activeSEPipeCount() < target {
 						if consecFails > 0 {
 							consecFails--
