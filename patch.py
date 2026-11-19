@@ -2849,7 +2849,7 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 		}
 	}()
 
-	go sess.runSEReceiveLoop(initPipe)
+go sess.runSEReceiveLoop(initPipe)
 	go sess.runSEKeepaliveLoop(initPipe)
 
 	// 会话级统一活性看门狗
