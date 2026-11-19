@@ -1146,10 +1146,10 @@ func dialSlotSession(ctx context.Context, serverDest net.Destination, dialer int
 				ovpnProtoCache.Store(baseKey, "ms-sstp")
 				return sstpSess, nil
 			}
-		}
-		if ovpnSess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, false, 5000*time.Millisecond); ovpnErr == nil {
-			ovpnProtoCache.Store(baseKey, "openvpn-tcp")
-			return ovpnSess, nil
+			if ovpnSess, ovpnErr := dialOpenVPNSession(serverDest, dialer, baseKey, slotKey, ovpnCfg, false, 5000*time.Millisecond); ovpnErr == nil {
+				ovpnProtoCache.Store(baseKey, "openvpn-tcp")
+				return ovpnSess, nil
+			}
 		}
 		recordNodeFailureIfNeeded(baseKey, isBackground, seErr)
 		return nil, seErr
@@ -2261,7 +2261,7 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 		rawConn, tlsConn, activePort, err = dialTLSSerialCandidate(connCtx, dialer, serverDest, sniHost)
 	}
 	if err != nil {
-		return nil, activePort, fmt.Errorf("阶段[1-TLS]: %w", err)
+		return nil, 0, fmt.Errorf("阶段[1-TLS]: %w", err)
 	}
 
 	br := bufio.NewReaderSize(tlsConn, 262144)
