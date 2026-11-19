@@ -326,7 +326,7 @@ func notifyHUD(tag string, dest string) {
         print("  ✔ [HUD] 广播钩子已存在 (幂等跳过)")
 
 # =========================================================================
-# 6. 注入 VPNGate 弹性激进主引擎 (无主自愈 + half_connection=1 + 1->2->4 动态换挡 + gVisor Cubic)
+# 6. 注入 VPNGate 双模主引擎 (SoftEther 原生 UDP 加速 V1/V2 + TCP 直拉4管无主自愈 + gVisor Cubic)
 # =========================================================================
 socks_dir = "proxy/socks"
 if os.path.exists(socks_dir):
@@ -337,7 +337,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/cipher"
 	"crypto/rand"
+	"crypto/rc4"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
@@ -351,6 +353,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/crypto/chacha20poly1305"
 
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
@@ -376,7 +380,7 @@ type sePipe struct {
 	br        *bufio.Reader
 	bw        *bufio.Writer
 	writeMu   sync.Mutex
-	direction uint32 // 0=TCP_BOTH, 1=TCP_SERVER_TO_CLIENT(纯下行), 2=TCP_CLIENT_TO_SERVER(纯上行)
+	direction uint32 // 0=TCP_BOTH, 1=TCP_SERVER_TO_CLIENT, 2=TCP_CLIENT_TO_SERVER
 	closed    atomic.Bool
 }
 
@@ -427,6 +431,149 @@ func (p *sePipe) writeSoftEtherFrames(ethFrames [][]byte) error {
 	return p.bw.Flush()
 }
 
+// =========================================================================
+// SoftEther 原生 UDP Acceleration 加速通道 (支持 V2 ChaCha20-Poly1305 与 V1 SHA0+RC4)
+// =========================================================================
+type seUDPAccel struct {
+	conn         net.Conn
+	version      uint32
+	serverPort   uint16
+	serverCookie uint32
+	clientCookie uint32
+	clientKeyV1  [20]byte
+	serverKeyV1  [20]byte
+	aeadSend     cipher.AEAD
+	aeadRecv     cipher.AEAD
+	startNano    int64
+	serverTick   atomic.Uint64
+	lastRxNano   atomic.Int64
+	ready        atomic.Bool
+	closed       atomic.Bool
+	writeMu      sync.Mutex
+}
+
+func (u *seUDPAccel) close() {
+	if u == nil {
+		return
+	}
+	if u.closed.CompareAndSwap(false, true) {
+		u.ready.Store(false)
+		if u.conn != nil {
+			_ = u.conn.Close()
+		}
+	}
+}
+
+func (u *seUDPAccel) isReady() bool {
+	if u == nil || u.closed.Load() || !u.ready.Load() {
+		return false
+	}
+	return time.Now().UnixNano()-u.lastRxNano.Load() < int64(7*time.Second)
+}
+
+func (u *seUDPAccel) myTick() uint64 {
+	ms := (time.Now().UnixNano() - u.startNano) / int64(time.Millisecond)
+	if ms <= 0 {
+		return 1
+	}
+	return uint64(ms)
+}
+
+func (u *seUDPAccel) sendFrame(eth []byte) error {
+	if u == nil || u.closed.Load() || u.conn == nil || len(eth) > 0xFFFF {
+		return io.ErrClosedPipe
+	}
+
+	extra := 0
+	if u.version == 1 {
+		extra = 20 // V1 尾部 20 字节全零校验区
+	}
+	plainLen := 23 + len(eth) + extra
+	plain := make([]byte, plainLen)
+	binary.BigEndian.PutUint32(plain[0:4], u.serverCookie)
+	binary.BigEndian.PutUint64(plain[4:12], u.myTick())
+	binary.BigEndian.PutUint64(plain[12:20], u.serverTick.Load())
+	binary.BigEndian.PutUint16(plain[20:22], uint16(len(eth)))
+	plain[22] = 0 // compress_flag = 0
+	copy(plain[23:23+len(eth)], eth)
+
+	var out []byte
+	if u.version == 2 && u.aeadSend != nil {
+		var nonce [12]byte
+		_, _ = rand.Read(nonce[:])
+		nonce[0] |= 0x01 // 避免全零 IV
+		out = make([]byte, 12, 12+plainLen+16)
+		copy(out[:12], nonce[:])
+		out = u.aeadSend.Seal(out, nonce[:], plain, nil)
+	} else {
+		var iv [20]byte
+		_, _ = rand.Read(iv[:])
+		var keyIn [40]byte
+		copy(keyIn[:20], u.clientKeyV1[:])
+		copy(keyIn[20:], iv[:])
+		rc4Key := softEtherSHA0(keyIn[:])
+		c, err := rc4.NewCipher(rc4Key[:])
+		if err != nil {
+			return err
+		}
+		out = make([]byte, 20+plainLen)
+		copy(out[:20], iv[:])
+		c.XORKeyStream(out[20:], plain)
+	}
+
+	u.writeMu.Lock()
+	_, err := u.conn.Write(out)
+	u.writeMu.Unlock()
+	return err
+}
+
+func (u *seUDPAccel) decryptPacket(pkt []byte) (uint64, byte, []byte, bool) {
+	var plain []byte
+	if u.version == 2 && u.aeadRecv != nil {
+		if len(pkt) < 12+23+16 {
+			return 0, 0, nil, false
+		}
+		p, err := u.aeadRecv.Open(nil, pkt[:12], pkt[12:], nil)
+		if err != nil || len(p) < 23 {
+			return 0, 0, nil, false
+		}
+		plain = p
+	} else {
+		if len(pkt) < 20+23+20 {
+			return 0, 0, nil, false
+		}
+		var keyIn [40]byte
+		copy(keyIn[:20], u.serverKeyV1[:])
+		copy(keyIn[20:], pkt[:20])
+		rc4Key := softEtherSHA0(keyIn[:])
+		c, err := rc4.NewCipher(rc4Key[:])
+		if err != nil {
+			return 0, 0, nil, false
+		}
+		plain = make([]byte, len(pkt)-20)
+		c.XORKeyStream(plain, pkt[20:])
+		verify := plain[len(plain)-20:]
+		for _, b := range verify {
+			if b != 0 {
+				return 0, 0, nil, false
+			}
+		}
+		plain = plain[:len(plain)-20]
+	}
+
+	cookie := binary.BigEndian.Uint32(plain[0:4])
+	if cookie != u.clientCookie {
+		return 0, 0, nil, false
+	}
+	myTick := binary.BigEndian.Uint64(plain[4:12])
+	dataSize := int(binary.BigEndian.Uint16(plain[20:22]))
+	compressFlag := plain[22]
+	if 23+dataSize > len(plain) {
+		return 0, 0, nil, false
+	}
+	return myTick, compressFlag, plain[23 : 23+dataSize], true
+}
+
 type sstpSession struct {
 	s           *stack.Stack
 	rawConn     net.Conn
@@ -441,24 +588,23 @@ type sstpSession struct {
 	dhcpDNS     [4]byte
 	hasDHCPDNS  atomic.Bool
 
-	// SoftEther 无主多管自愈 + 弹性扩缩容字段
+	// SoftEther 无主多管自愈 + UDP 加速字段
 	seSlotKey        string
 	seHost           string
 	seSNIHost        string
 	seActivePort     net.Port
 	seSessionKey     []byte
 	seMaxConns       int
-	seHalfConn       bool
 	seKATimeout      time.Duration
 	seFrameHandler   func(eth []byte)
 	seLastRxNano     atomic.Int64
 	seLastActiveNano atomic.Int64
-	seDownBytes      atomic.Uint64
 	seMgrOnce        sync.Once
 	seHealCh         chan struct{}
 	sePipesMu        sync.RWMutex
 	sePipes          []*sePipe
 	seTxRR           atomic.Uint64
+	seUDP            *seUDPAccel
 
 	// 持久化复用的外层 DoT 长连接
 	dotMu   sync.Mutex
@@ -502,7 +648,6 @@ func (sess *sstpSession) activeSEPipeCount() int {
 	return n
 }
 
-// 无主断管摘除：仅当最后一条管道也断开时才销毁整个会话，否则触发后台静默自愈
 func (sess *sstpSession) removeSEPipe(target *sePipe) {
 	target.close()
 	sess.sePipesMu.Lock()
@@ -537,14 +682,12 @@ func (sess *sstpSession) pickActiveSETxPipe() *sePipe {
 		return nil
 	}
 	start := int(sess.seTxRR.Add(1) % uint64(n))
-	// 优先选双向(0)或纯上行(2)管道
 	for i := 0; i < n; i++ {
 		p := sess.sePipes[(start+i)%n]
 		if !p.closed.Load() && (p.direction == 0 || p.direction == 2) {
 			return p
 		}
 	}
-	// 兜底：若极端情况下只剩下行管，仍返回存活管道避免卡死
 	for i := 0; i < n; i++ {
 		p := sess.sePipes[(start+i)%n]
 		if !p.closed.Load() {
@@ -801,7 +944,14 @@ func isVPNGateServer(server *protocol.ServerSpec) bool {
 		if u == "vpn" || u == "vpngate" {
 			pw := strings.ToLower(strings.TrimSpace(acc.Password))
 			baseKey := server.Destination.String()
-			if pw == "ssl" || pw == "softether" {
+			if pw == "ssludp" || strings.HasPrefix(pw, "ssludp:") {
+				ovpnProtoCache.Store(baseKey, "softether-ssl-udp")
+				if strings.HasPrefix(pw, "ssludp:") {
+					if p, err := strconv.Atoi(strings.TrimPrefix(pw, "ssludp:")); err == nil && p > 0 && p <= 65535 {
+						sslHintPortCache.Store(baseKey, uint16(p))
+					}
+				}
+			} else if pw == "ssl" || pw == "softether" {
 				ovpnProtoCache.Store(baseKey, "softether-ssl")
 			} else if strings.HasPrefix(pw, "ssl:") {
 				ovpnProtoCache.Store(baseKey, "softether-ssl")
@@ -851,7 +1001,6 @@ func dialTLSWatchdog(tunnelCtx context.Context, dialer internet.Dialer, dest net
 	return rawConn, tlsConn, nil
 }
 
-// 放宽至 2000ms 的 Happy Eyeballs：给链式前置充足建连时间，避免误发冗余 443 连接
 func dialTLSSerialCandidate(tunnelCtx context.Context, dialer internet.Dialer, serverDest net.Destination, sniHost string) (net.Conn, *tls.Conn, net.Port, error) {
 	candidates := []net.Port{serverDest.Port}
 	addCand := func(p net.Port) {
@@ -951,6 +1100,14 @@ func (sess *sstpSession) writeFrame(data []byte) error {
 }
 
 func (sess *sstpSession) writeSoftEtherFrames(ethFrames [][]byte) error {
+	if sess.seUDP != nil && sess.seUDP.isReady() {
+		for _, f := range ethFrames {
+			if err := sess.seUDP.sendFrame(f); err != nil {
+				break
+			}
+		}
+		return nil
+	}
 	p := sess.pickActiveSETxPipe()
 	if p == nil {
 		return io.ErrClosedPipe
@@ -1135,12 +1292,14 @@ func dialSlotSession(ctx context.Context, serverDest net.Destination, dialer int
 		}
 	}
 
-	if pCached == "softether-ssl" {
-		sess, hitPort, seErr := dialSoftEtherNativeSession(serverDest, dialer, baseKey, slotKey, 0)
+	if pCached == "softether-ssl" || pCached == "softether-ssl-udp" {
+		enableUDP := pCached == "softether-ssl-udp"
+		sess, hitPort, seErr := dialSoftEtherNativeSession(serverDest, dialer, baseKey, slotKey, 0, enableUDP)
 		if seErr == nil {
 			return sess, nil
 		}
 		errors.LogWarning(bgCtx, fmt.Sprintf("[VPNGate-SSL] %s 失败: %v", serverDest.String(), seErr))
+		// 仅当端口 TLS 确认可达时才回退尝试其他协议，死端口 1 轮直接熔断
 		if hitPort != 0 {
 			if sstpSess, sstpErr := dialMSSSTPSession(net.TCPDestination(serverDest.Address, hitPort), dialer, baseKey, slotKey); sstpErr == nil {
 				ovpnProtoCache.Store(baseKey, "ms-sstp")
@@ -1163,7 +1322,7 @@ func dialSlotSession(ctx context.Context, serverDest net.Destination, dialer int
 
 	if tlsReachable {
 		errors.LogInfo(bgCtx, fmt.Sprintf("[VPNGate] 端口 %d TLS 可达但非 SSTP (%v)，切换 SoftEther-SSL", reachablePort, sstpErr))
-		seSess, _, seErr := dialSoftEtherNativeSession(serverDest, dialer, baseKey, slotKey, reachablePort)
+		seSess, _, seErr := dialSoftEtherNativeSession(serverDest, dialer, baseKey, slotKey, reachablePort, false)
 		if seErr == nil {
 			ovpnProtoCache.Store(baseKey, "softether-ssl")
 			return seSess, nil
@@ -1313,9 +1472,7 @@ func dialMSSSTPSessionWithHint(serverDest net.Destination, dialer internet.Diale
 		rxBuf := make([]byte, 16384)
 		papSent := false
 		connSent := false
-		var serverNonce [32]byte
-
-		sendCallConnected := func() {
+		var serverNonce [32]bytesendCallConnected := func() {
 			if connSent {
 				return
 			}
@@ -1555,7 +1712,7 @@ func dialMSSSTPSessionWithHint(serverDest net.Destination, dialer internet.Diale
 }
 
 // =========================================================================
-// 标准 SoftEther 协议栈 (SHA-0 / PACK / QoS=1 / half_connection=1 / 无主弹性自愈)
+// 标准 SoftEther 协议栈 (SHA-0 / PACK / QoS=1 / UDP 加速 V1&V2 / TCP 4管自愈)
 // =========================================================================
 
 const (
@@ -1835,7 +1992,7 @@ func readSEPackResponse(br *bufio.Reader) (*sePack, error) {
 	return unmarshalSEPack(raw)
 }
 
-func buildSELoginPack(uniqueID []byte, random []byte) []byte {
+func buildSELoginPack(uniqueID []byte, random []byte, enableUDP bool, cliKeyV1 [20]byte, cliKeyV2 [32]byte, cliCookie uint32) []byte {
 	p := &sePack{}
 	p.addStr("method", "login")
 	p.addStr("hubname", "VPNGATE")
@@ -1845,9 +2002,19 @@ func buildSELoginPack(uniqueID []byte, random []byte) []byte {
 	p.addData("secure_password", sp[:])
 	p.addInt("use_encrypt", 1)
 	p.addInt("use_compress", 0)
-	p.addInt("max_connection", 4)  // 协商上限 4 管，实际按 1->2->4 弹性按需拉起
-	p.addInt("half_connection", 0) // 开启收发物理分离（ACK 与视频下行互不抢占）
-	p.addInt("qos", 1)             // 开启服务端小包插队 QoS
+	if enableUDP {
+		p.addInt("max_connection", 1) // UDP 加速模式下 TCP 仅作信令与兜底，1 管最快
+		p.addInt("use_udp_acceleration", 1)
+		p.addInt("udp_acceleration_max_version", 2)
+		p.addInt("udp_acceleration_client_cookie", cliCookie)
+		p.addData("udp_acceleration_client_key", cliKeyV1[:])
+		p.addData("udp_acceleration_client_key_v2", cliKeyV2[:])
+		p.addInt("udp_acceleration_client_port", 0)
+	} else {
+		p.addInt("max_connection", 4)
+	}
+	p.addInt("half_connection", 0)
+	p.addInt("qos", 1)
 	p.addInt("protocol", 0)
 
 	const clientStr = "secon SoftEther Compatible Client"
@@ -1974,6 +2141,72 @@ func buildARPFrame(op uint16, srcMAC [6]byte, srcIP [4]byte, dstMAC [6]byte, dst
 	return f[:]
 }
 
+func (sess *sstpSession) startSEUDPAccel(connCtx context.Context, serverDest net.Destination, dialer internet.Dialer, u *seUDPAccel) {
+	udpDest := net.UDPDestination(serverDest.Address, net.Port(u.serverPort))
+	udpConn, err := dialer.Dial(connCtx, udpDest)
+	if err != nil {
+		errors.LogWarning(context.Background(), fmt.Sprintf("[VPNGate-SSL-UDP] 拨号 %s 失败，自动回落 TCP: %v", udpDest.String(), err))
+		u.close()
+		return
+	}
+	u.conn = udpConn
+
+	var readyOnce sync.Once
+	// UDP 收包循环
+	go func() {
+		defer u.close()
+		rxBuf := make([]byte, 4096)
+		for {
+			n, rErr := udpConn.Read(rxBuf)
+			if rErr != nil {
+				return
+			}
+			sTick, compFlag, eth, ok := u.decryptPacket(rxBuf[:n])
+			if !ok {
+				continue
+			}
+			u.serverTick.Store(sTick)
+			now := time.Now().UnixNano()
+			u.lastRxNano.Store(now)
+			sess.seLastRxNano.Store(now)
+			u.ready.Store(true)
+			readyOnce.Do(func() {
+				errors.LogInfo(context.Background(), fmt.Sprintf("[VPNGate-SSL-UDP] 原生 UDP 加速已激活 (%s) | 版本: V%d | UDP端口: %d", sess.seSlotKey, u.version, u.serverPort))
+			})
+			if len(eth) > 0 && compFlag == 0 && sess.seFrameHandler != nil {
+				sess.seFrameHandler(eth)
+			}
+		}
+	}()
+
+	// UDP 初始打洞 + 1秒高频保活（保持前置 NAT 映射与加速激活态）
+	go func() {
+		for i := 0; i < 3; i++ {
+			if u.closed.Load() || !isAlive(sess) {
+				return
+			}
+			_ = u.sendFrame(nil)
+			time.Sleep(150 * time.Millisecond)
+		}
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-sess.dead:
+				return
+			case <-ticker.C:
+				if u.closed.Load() {
+					return
+				}
+				if err := u.sendFrame(nil); err != nil {
+					u.close()
+					return
+				}
+			}
+		}
+	}()
+}
+
 func (sess *sstpSession) runSEReceiveLoop(pipe *sePipe) {
 	defer sess.removeSEPipe(pipe)
 
@@ -2065,10 +2298,9 @@ func (sess *sstpSession) runSEKeepaliveLoop(pipe *sePipe) {
 	}
 }
 
-// 弹性多管管家：1管冷启动 -> 1秒后升2管(1上1下) -> 高清视频(>250KB/s)自动升4管 -> 断管自动静默补齐
-// 直拉满管管家：真实流量进入后立即并发拉满 maxConns（默认 4 管），断管自动补齐
+// 纯 TCP 直拉满管管家（UDP 加速模式已设为 maxConns=1，自动跳过）
 func (sess *sstpSession) ensureSEElasticManager(serverDest net.Destination, dialer internet.Dialer) {
-	if !sess.isSoftEther || len(sess.seSessionKey) != 20 || sess.seMaxConns <= 1 {
+	if !sess.isSoftEther || len(sess.seSessionKey) != 20 || sess.seMaxConns <= 1 || sess.seUDP != nil {
 		return
 	}
 	sess.seMgrOnce.Do(func() {
@@ -2110,7 +2342,6 @@ func (sess *sstpSession) ensureSEElasticManager(serverDest net.Destination, dial
 				}
 			}
 
-			// 立即并发拉满全部管道
 			tryFillToTarget()
 
 			ticker := time.NewTicker(5 * time.Second)
@@ -2233,7 +2464,7 @@ func (sess *sstpSession) dialSoftEtherAdditionalPipe(serverDest net.Destination,
 	return true
 }
 
-func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dialer, baseKey, slotKey string, knownPort net.Port) (*sstpSession, net.Port, error) {
+func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dialer, baseKey, slotKey string, knownPort net.Port, enableUDP bool) (*sstpSession, net.Port, error) {
 	bgCtx := context.Background()
 	connCtx, connCancel := context.WithCancel(bgCtx)
 	var handshakeSucceeded atomic.Bool
@@ -2291,7 +2522,18 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 
 	uniqueID := make([]byte, 20)
 	_, _ = rand.Read(uniqueID)
-	loginBytes := buildSELoginPack(uniqueID, randomBytes)
+	var cliKeyV1 [20]byte
+	var cliKeyV2 [32]byte
+	var cookieBuf [4]byte
+	_, _ = rand.Read(cliKeyV1[:])
+	_, _ = rand.Read(cliKeyV2[:])
+	_, _ = rand.Read(cookieBuf[:])
+	cliCookie := binary.BigEndian.Uint32(cookieBuf[:])
+	if cliCookie == 0 {
+		cliCookie = 1
+	}
+
+	loginBytes := buildSELoginPack(uniqueID, randomBytes, enableUDP, cliKeyV1, cliKeyV2, cliCookie)
 
 	var welcomePack *sePack
 	err = RunWithWatchdog(rawConn, 7500*time.Millisecond, func() error {
@@ -2335,7 +2577,50 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 	} else if maxConns > 4 {
 		maxConns = 4
 	}
-	halfConn := welcomePack.getInt("half_connection") != 0
+
+	// 解析服务端下发的 UDP Acceleration 参数
+	var udpAccel *seUDPAccel
+	if enableUDP && welcomePack.getInt("use_udp_acceleration") != 0 {
+		srvPort := welcomePack.getInt("udp_acceleration_server_port")
+		srvCookie := welcomePack.getInt("udp_acceleration_server_cookie")
+		ver := welcomePack.getInt("udp_acceleration_version")
+		if ver == 0 {
+			ver = 1
+		}
+		if srvPort > 0 && srvPort <= 65535 && srvCookie != 0 {
+			u := &seUDPAccel{
+				version:      ver,
+				serverPort:   uint16(srvPort),
+				serverCookie: srvCookie,
+				clientCookie: cliCookie,
+				clientKeyV1:  cliKeyV1,
+				startNano:    time.Now().UnixNano(),
+			}
+			okKey := false
+			if ver == 2 {
+				srvKeyV2 := welcomePack.getData("udp_acceleration_server_key_v2")
+				if len(srvKeyV2) == 32 {
+					aSend, e1 := chacha20poly1305.New(cliKeyV2[:])
+					aRecv, e2 := chacha20poly1305.New(srvKeyV2)
+					if e1 == nil && e2 == nil {
+						u.aeadSend = aSend
+						u.aeadRecv = aRecv
+						okKey = true
+					}
+				}
+			} else {
+				srvKeyV1 := welcomePack.getData("udp_acceleration_server_key")
+				if len(srvKeyV1) == 20 {
+					copy(u.serverKeyV1[:], srvKeyV1)
+					okKey = true
+				}
+			}
+			if okKey {
+				udpAccel = u
+				maxConns = 1
+			}
+		}
+	}
 
 	s, ep, err := newGVisorStack()
 	if err != nil {
@@ -2373,10 +2658,10 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 		seActivePort: activePort,
 		seSessionKey: sessionKey,
 		seMaxConns:   maxConns,
-		seHalfConn:   halfConn,
 		seKATimeout:  kaTimeout,
 		seHealCh:     make(chan struct{}, 4),
 		sePipes:      []*sePipe{initPipe},
+		seUDP:        udpAccel,
 	}
 	sess.gwMAC.Store(defaultGW)
 
@@ -2398,6 +2683,9 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 		deadOnce.Do(func() {
 			close(sess.dead)
 			unbindSlotSession(baseKey, slotKey, sess)
+			if sess.seUDP != nil {
+				sess.seUDP.close()
+			}
 			sess.closeAllSEPipes()
 			connCancel()
 			s.Close()
@@ -2515,7 +2803,11 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 										prefixLen = bits.OnesCount32(mask)
 									}
 								}
-								errors.LogInfo(bgCtx, fmt.Sprintf("[VPNGate] 隧道就绪 (%s) | 协议: SoftEther-SSL (QoS=1, half=%v, maxConn=%d) | 端口: %d | IP: %s/%d", slotKey, halfConn, maxConns, activePort, addr.String(), prefixLen))
+								modeTag := fmt.Sprintf("SoftEther-SSL (QoS=1, maxConn=%d)", maxConns)
+								if udpAccel != nil {
+									modeTag = fmt.Sprintf("SoftEther-SSL+UDP加速V%d (UDP:%d)", udpAccel.version, udpAccel.serverPort)
+								}
+								errors.LogInfo(bgCtx, fmt.Sprintf("[VPNGate] 隧道就绪 (%s) | 协议: %s | 端口: %d | IP: %s/%d", slotKey, modeTag, activePort, addr.String(), prefixLen))
 								ipReady <- dhcpLease{ip: addr, prefixLen: prefixLen}
 							})
 						}
@@ -2526,13 +2818,16 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 		}
 
 		sess.seLastActiveNano.Store(time.Now().UnixNano())
-		sess.seDownBytes.Add(uint64(len(ipPkt)))
 		clampIPv4TCPMSSInPlace(ipPkt, 1320)
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 			Payload: buffer.MakeWithData(ipPkt),
 		})
 		ep.InjectInbound(header.IPv4ProtocolNumber, pkt)
 		pkt.DecRef()
+	}
+
+	if udpAccel != nil {
+		go sess.startSEUDPAccel(connCtx, serverDest, dialer, udpAccel)
 	}
 
 	discoverFrame := buildDHCPFrame(1, dhcpXid, myMAC, nil, nil)
@@ -2557,7 +2852,7 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 	go sess.runSEReceiveLoop(initPipe)
 	go sess.runSEKeepaliveLoop(initPipe)
 
-	// 会话级统一活性看门狗（独立于单条管道生死）
+	// 会话级统一活性看门狗
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
@@ -2576,7 +2871,7 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 		}
 	}()
 
-	// 按 IPv4 流哈希固定上行管道 + 128 帧大批量冲刷（断管自动切走、不杀会话）
+	// 上行发包循环：UDP 加速就绪时直走 UDP，未就绪或异常时无感回落 TCP 管道
 	go func() {
 		defer markDead()
 		var batch [128]*stack.PacketBuffer
@@ -2589,6 +2884,10 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 		var frameHdr [18]byte
 		copy(frameHdr[10:16], myMAC[:])
 		frameHdr[16], frameHdr[17] = 0x08, 0x00
+
+		var udpEthBuf [2048]byte
+		copy(udpEthBuf[6:12], myMAC[:])
+		udpEthBuf[12], udpEthBuf[13] = 0x08, 0x00
 
 		flushBucket := func(pipe *sePipe, pkts []*stack.PacketBuffer) {
 			if len(pkts) == 0 {
@@ -2642,12 +2941,42 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 				nBatch++
 			}
 
+			// 优先尝试走原生 UDP 加速通道
+			startIdx := 0
+			if sess.seUDP != nil && sess.seUDP.isReady() {
+				gw := sess.gwMAC.Load().([6]byte)
+				copy(udpEthBuf[0:6], gw[:])
+				for i := 0; i < nBatch; i++ {
+					p := batch[i]
+					v := p.ToView()
+					ipData := v.AsSlice()
+					if 14+len(ipData) > len(udpEthBuf) {
+						v.Release()
+						break
+					}
+					clampIPv4TCPMSSInPlace(ipData, 1320)
+					copy(udpEthBuf[14:], ipData)
+					err := sess.seUDP.sendFrame(udpEthBuf[:14+len(ipData)])
+					v.Release()
+					if err != nil {
+						break
+					}
+					p.DecRef()
+					batch[i] = nil
+					startIdx = i + 1
+				}
+				if startIdx == nBatch {
+					continue
+				}
+			}
+
+			rem := batch[startIdx:nBatch]
 			txPipes := sess.snapshotActiveSETxPipes(pipesBuf[:0])
 			nPipes := len(txPipes)
 			if nPipes == 0 {
-				for i := 0; i < nBatch; i++ {
-					batch[i].DecRef()
-					batch[i] = nil
+				for i := range rem {
+					rem[i].DecRef()
+					rem[i] = nil
 				}
 				return
 			}
@@ -2656,16 +2985,16 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 			}
 
 			if nPipes == 1 {
-				flushBucket(txPipes[0], batch[:nBatch])
+				flushBucket(txPipes[0], rem)
 				continue
 			}
 
 			for i := 0; i < nPipes; i++ {
 				buckets[i] = buckets[i][:0]
 			}
-			for i := 0; i < nBatch; i++ {
-				p := batch[i]
-				batch[i] = nil
+			for i := range rem {
+				p := rem[i]
+				rem[i] = nil
 				v := p.ToView()
 				idx := int(ipv4FlowHash(v.AsSlice()) % uint32(nPipes))
 				v.Release()
@@ -2848,7 +3177,7 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
             raise RuntimeError("❌ 未能在 proxy/socks/client.go 的 Process 函数中匹配到 server 变量赋值行！")
         with open(client_go, "w", encoding="utf-8") as f:
             f.write(new_code)
-        print("  ✔ [VPNGate 弹性激进主引擎] 成功注入 (无主自愈 + half_connection=1 + 1->2->4 弹性换挡)")
+        print("  ✔ [VPNGate 双模主引擎] 成功注入 (SoftEther UDP加速 V1/V2 + TCP 4管自愈)")
 
 # =========================================================================
 # 7. 注入 VPNGate OpenVPN 极速引擎 (250ms UDP ARQ + 长连接复用 DoT + 四路 DNS 竞速)
