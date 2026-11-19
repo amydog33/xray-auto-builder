@@ -326,7 +326,7 @@ func notifyHUD(tag string, dest string) {
         print("  ✔ [HUD] 广播钩子已存在 (幂等跳过)")
 
 # =========================================================================
-# 6. 注入 VPNGate 极速主引擎 (SoftEther 原生 QoS + 4连接聚合 + gVisor BBR 8MB)
+# 6. 注入 VPNGate 稳速主引擎 (SoftEther 原生 QoS + 流哈希 2连接聚合 + gVisor Cubic)
 # =========================================================================
 socks_dir = "proxy/socks"
 if os.path.exists(socks_dir):
@@ -525,6 +525,29 @@ func (sess *sstpSession) pickActiveSETxPipe() *sePipe {
 		return sess.sePrimaryPipe
 	}
 	return nil
+}
+
+func (sess *sstpSession) snapshotActiveSETxPipes(dst []*sePipe) []*sePipe {
+	sess.sePipesMu.RLock()
+	for _, p := range sess.sePipes {
+		if !p.closed.Load() && (p.direction == 0 || p.direction == 2) {
+			dst = append(dst, p)
+		}
+	}
+	sess.sePipesMu.RUnlock()
+	return dst
+}
+
+func ipv4FlowHash(ip []byte) uint32 {
+	if len(ip) < 20 || (ip[0]>>4) != 4 {
+		return 0
+	}
+	h := binary.BigEndian.Uint32(ip[16:20])
+	ihl := int(ip[0]&0x0f) * 4
+	if (ip[9] == 6 || ip[9] == 17) && len(ip) >= ihl+4 {
+		h ^= binary.BigEndian.Uint32(ip[ihl : ihl+4])
+	}
+	return h ^ (h >> 16)
 }
 
 type dnsEntry struct {
@@ -915,7 +938,7 @@ func (sess *sstpSession) sendPPPControl(proto uint16, data []byte) {
 }
 
 // 智能并发调度：
-// - SoftEther-SSL：在同一个 Session 内原生拉起最多 4 条 TCP 聚合（不重复建 Session、零额外 L2 广播开销）
+// - SoftEther-SSL：在同一个 Session 内原生拉起最多 2 条 TCP 聚合 + 按流哈希固定管道
 // - MS-SSTP / OpenVPN：维持后台双隧道（#0 + #1）轮询并发
 func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, targetDest net.Destination, dialer internet.Dialer) (*sstpSession, error) {
 	baseKey := serverDest.String()
@@ -983,17 +1006,17 @@ func newGVisorStack() (*stack.Stack, *channel.Endpoint, error) {
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sackEnabled)
 	delayEnabled := tcpip.TCPDelayEnabled(false)
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &delayEnabled)
-	ccOpt := tcpip.CongestionControlOption("bbr")
+	ccOpt := tcpip.CongestionControlOption("cubic")
 	if ccErr := s.SetTransportProtocolOption(tcp.ProtocolNumber, &ccOpt); ccErr != nil {
-		errors.LogWarning(context.Background(), fmt.Sprintf("[gVisor] 启用 BBR 失败: %v", ccErr))
+		errors.LogWarning(context.Background(), fmt.Sprintf("[gVisor] 启用 Cubic 失败: %v", ccErr))
 	}
 	rackOpt := tcpip.TCPRecovery(tcpip.TCPRACKLossDetection)
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &rackOpt)
-	minRTO := tcpip.TCPMinRTOOption(100 * time.Millisecond)
+	minRTO := tcpip.TCPMinRTOOption(300 * time.Millisecond)
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &minRTO)
 
-	rcvBuf := tcpip.TCPReceiveBufferSizeRangeOption{Min: 65536, Default: 4 * 1024 * 1024, Max: 8 * 1024 * 1024}
-	sndBuf := tcpip.TCPSendBufferSizeRangeOption{Min: 65536, Default: 4 * 1024 * 1024, Max: 8 * 1024 * 1024}
+	rcvBuf := tcpip.TCPReceiveBufferSizeRangeOption{Min: 32768, Default: 2 * 1024 * 1024, Max: 4 * 1024 * 1024}
+	sndBuf := tcpip.TCPSendBufferSizeRangeOption{Min: 32768, Default: 2 * 1024 * 1024, Max: 4 * 1024 * 1024}
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &rcvBuf)
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sndBuf)
 	modOpt := tcpip.TCPModerateReceiveBufferOption(true)
@@ -1382,8 +1405,10 @@ func dialMSSSTPSessionWithHint(serverDest net.Destination, dialer internet.Diale
 				} else if code == 0x02 && len(pppData) >= 10 {
 					sendCallConnected()
 					addr := tcpip.AddrFromSlice(pppData[6:10])
-					errors.LogInfo(bgCtx, fmt.Sprintf("[VPNGate] 隧道就绪 (%s) | 协议: MS-SSTP | 端口: %d | IP: %s", slotKey, activePort, addr.String()))
-					once.Do(func() { ipReady <- addr })
+					once.Do(func() {
+						errors.LogInfo(bgCtx, fmt.Sprintf("[VPNGate] 隧道就绪 (%s) | 协议: MS-SSTP | 端口: %d | IP: %s", slotKey, activePort, addr.String()))
+						ipReady <- addr
+					})
 				}
 			case 0x0021:
 				if len(pppData) >= 20 {
@@ -1498,7 +1523,7 @@ func dialMSSSTPSessionWithHint(serverDest net.Destination, dialer internet.Diale
 }
 
 // =========================================================================
-// 标准 SoftEther 协议栈 (SHA-0 / PACK / QoS=1 / 原生 4 连接并发聚合)
+// 标准 SoftEther 协议栈 (SHA-0 / PACK / QoS=1 / 流哈希 2连接聚合)
 // =========================================================================
 
 const (
@@ -1788,9 +1813,9 @@ func buildSELoginPack(uniqueID []byte, random []byte) []byte {
 	p.addData("secure_password", sp[:])
 	p.addInt("use_encrypt", 1)
 	p.addInt("use_compress", 0)
-	p.addInt("max_connection", 4) // 原生 4 连接并发聚合
+	p.addInt("max_connection", 2) // 稳速 2 连接聚合，兼顾高吞吐与低乱序
 	p.addInt("half_connection", 0)
-	p.addInt("qos", 1)            // 开启服务端 ACK/SYN/DNS 小包插队 QoS
+	p.addInt("qos", 1) // 开启服务端 ACK/SYN/DNS 小包插队 QoS
 	p.addInt("protocol", 0)
 
 	const clientStr = "secon SoftEther Compatible Client"
@@ -2037,8 +2062,8 @@ func (sess *sstpSession) ensureAdditionalSEPipes(serverDest net.Destination, dia
 	}
 	sess.seAddOnce.Do(func() {
 		extra := sess.seMaxConns - 1
-		if extra > 3 {
-			extra = 3
+		if extra > 1 {
+			extra = 1
 		}
 		for i := 0; i < extra; i++ {
 			delay := time.Duration(i) * 80 * time.Millisecond
@@ -2249,8 +2274,8 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 	maxConns := int(welcomePack.getInt("max_connection"))
 	if maxConns < 1 {
 		maxConns = 1
-	} else if maxConns > 4 {
-		maxConns = 4
+	} else if maxConns > 2 {
+		maxConns = 2
 	}
 
 	s, ep, err := newGVisorStack()
@@ -2407,28 +2432,33 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 							offerReceived.Store(true)
 							_ = sess.writeSoftEtherFrames([][]byte{buildDHCPFrame(3, dhcpXid, myMAC, yiaddr, srvID)})
 						} else if msgType == 5 {
-							copy(assignedIP[:], yiaddr)
-							if len(routerOpt) == 4 {
-								copy(gatewayIP[:], routerOpt)
+							if hasIP.Load() {
+								return
 							}
-							if len(dnsOpt) == 4 {
-								copy(sess.dhcpDNS[:], dnsOpt)
-								sess.hasDHCPDNS.Store(true)
-							}
-							hasIP.Store(true)
-							if gatewayIP != ([4]byte{}) {
-								_ = sess.writeSoftEtherFrames([][]byte{buildARPFrame(1, myMAC, assignedIP, [6]byte{}, gatewayIP)})
-							}
-							addr := tcpip.AddrFromSlice(yiaddr)
-							prefixLen := 16
-							if len(subnetMask) == 4 {
-								mask := binary.BigEndian.Uint32(subnetMask)
-								if mask != 0 && (^mask&(^mask+1)) == 0 {
-									prefixLen = bits.OnesCount32(mask)
+							once.Do(func() {
+								copy(assignedIP[:], yiaddr)
+								if len(routerOpt) == 4 {
+									copy(gatewayIP[:], routerOpt)
 								}
-							}
-							errors.LogInfo(bgCtx, fmt.Sprintf("[VPNGate] 隧道就绪 (%s) | 协议: SoftEther-SSL (QoS=1, maxConn=%d) | 端口: %d | IP: %s/%d", slotKey, maxConns, activePort, addr.String(), prefixLen))
-							once.Do(func() { ipReady <- dhcpLease{ip: addr, prefixLen: prefixLen} })
+								if len(dnsOpt) == 4 {
+									copy(sess.dhcpDNS[:], dnsOpt)
+									sess.hasDHCPDNS.Store(true)
+								}
+								hasIP.Store(true)
+								if gatewayIP != ([4]byte{}) {
+									_ = sess.writeSoftEtherFrames([][]byte{buildARPFrame(1, myMAC, assignedIP, [6]byte{}, gatewayIP)})
+								}
+								addr := tcpip.AddrFromSlice(yiaddr)
+								prefixLen := 16
+								if len(subnetMask) == 4 {
+									mask := binary.BigEndian.Uint32(subnetMask)
+									if mask != 0 && (^mask&(^mask+1)) == 0 {
+										prefixLen = bits.OnesCount32(mask)
+									}
+								}
+								errors.LogInfo(bgCtx, fmt.Sprintf("[VPNGate] 隧道就绪 (%s) | 协议: SoftEther-SSL (QoS=1, maxConn=%d) | 端口: %d | IP: %s/%d", slotKey, maxConns, activePort, addr.String(), prefixLen))
+								ipReady <- dhcpLease{ip: addr, prefixLen: prefixLen}
+							})
 						}
 					}
 					return
@@ -2467,50 +2497,32 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 	go sess.runSEReceiveLoop(primaryPipe, true)
 	go sess.runSEKeepaliveLoop(primaryPipe, true)
 
-	// 多管道轮询 128 帧大批量冲刷发包协程
+	// 按 IPv4 流哈希固定管道 + 128 帧大批量冲刷发包协程，消除跨管道上行乱序
 	go func() {
 		defer markDead()
 		var batch [128]*stack.PacketBuffer
+		var pipesBuf [4]*sePipe
+		var buckets [4][]*stack.PacketBuffer
+		for i := range buckets {
+			buckets[i] = make([]*stack.PacketBuffer, 0, 64)
+		}
 		var countBuf [4]byte
 		var frameHdr [18]byte
 		copy(frameHdr[10:16], myMAC[:])
 		frameHdr[16], frameHdr[17] = 0x08, 0x00
 
-		for {
-			pkt := ep.ReadContext(bgCtx)
-			if pkt == nil {
-				return
+		flushBucket := func(pipe *sePipe, pkts []*stack.PacketBuffer) bool {
+			if len(pkts) == 0 {
+				return true
 			}
-			sess.seLastActiveNano.Store(time.Now().UnixNano())
-			batch[0] = pkt
-			nBatch := 1
-			for nBatch < 128 {
-				nextPkt := ep.Read()
-				if nextPkt == nil {
-					break
-				}
-				batch[nBatch] = nextPkt
-				nBatch++
-			}
-
-			pipe := sess.pickActiveSETxPipe()
-			if pipe == nil {
-				for i := 0; i < nBatch; i++ {
-					batch[i].DecRef()
-					batch[i] = nil
-				}
-				return
-			}
-
 			gw := sess.gwMAC.Load().([6]byte)
 			copy(frameHdr[4:10], gw[:])
-			binary.BigEndian.PutUint32(countBuf[:], uint32(nBatch))
+			binary.BigEndian.PutUint32(countBuf[:], uint32(len(pkts)))
 
 			pipe.writeMu.Lock()
 			_, wErr := pipe.bw.Write(countBuf[:])
-			for i := 0; i < nBatch; i++ {
-				p := batch[i]
-				batch[i] = nil
+			for i, p := range pkts {
+				pkts[i] = nil
 				v := p.ToView()
 				ipData := v.AsSlice()
 				clampIPv4TCPMSSInPlace(ipData, 1320)
@@ -2531,9 +2543,71 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 
 			if wErr != nil {
 				if pipe == primaryPipe {
-					return
+					return false
 				}
 				sess.removeSEPipe(pipe)
+			}
+			return true
+		}
+
+		for {
+			pkt := ep.ReadContext(bgCtx)
+			if pkt == nil {
+				return
+			}
+			sess.seLastActiveNano.Store(time.Now().UnixNano())
+			batch[0] = pkt
+			nBatch := 1
+			for nBatch < 128 {
+				nextPkt := ep.Read()
+				if nextPkt == nil {
+					break
+				}
+				batch[nBatch] = nextPkt
+				nBatch++
+			}
+
+			txPipes := sess.snapshotActiveSETxPipes(pipesBuf[:0])
+			nPipes := len(txPipes)
+			if nPipes == 0 {
+				for i := 0; i < nBatch; i++ {
+					batch[i].DecRef()
+					batch[i] = nil
+				}
+				return
+			}
+			if nPipes > len(buckets) {
+				nPipes = len(buckets)
+			}
+
+			if nPipes == 1 {
+				if !flushBucket(txPipes[0], batch[:nBatch]) {
+					return
+				}
+				continue
+			}
+
+			for i := 0; i < nPipes; i++ {
+				buckets[i] = buckets[i][:0]
+			}
+			for i := 0; i < nBatch; i++ {
+				p := batch[i]
+				batch[i] = nil
+				v := p.ToView()
+				idx := int(ipv4FlowHash(v.AsSlice()) % uint32(nPipes))
+				v.Release()
+				buckets[idx] = append(buckets[idx], p)
+			}
+			for i := 0; i < nPipes; i++ {
+				if !flushBucket(txPipes[i], buckets[i]) {
+					for j := i + 1; j < nPipes; j++ {
+						for k, rem := range buckets[j] {
+							rem.DecRef()
+							buckets[j][k] = nil
+						}
+					}
+					return
+				}
 			}
 		}
 	}()
@@ -2709,7 +2783,7 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
             raise RuntimeError("❌ 未能在 proxy/socks/client.go 的 Process 函数中匹配到 server 变量赋值行！")
         with open(client_go, "w", encoding="utf-8") as f:
             f.write(new_code)
-        print("  ✔ [VPNGate 极速主引擎] 成功注入 (SoftEther 原生 QoS=1 + 4连接聚合 + gVisor BBR 8MB)")
+        print("  ✔ [VPNGate 稳速主引擎] 成功注入 (SoftEther QoS=1 + 流哈希 2连接聚合 + gVisor Cubic 300ms RTO)")
 
 # =========================================================================
 # 7. 注入 VPNGate OpenVPN 极速引擎 (250ms UDP ARQ + 长连接复用 DoT + 四路 DNS 竞速)
