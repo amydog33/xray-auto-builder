@@ -4121,4 +4121,38 @@ func dialOpenVPNSessionCore(serverDest net.Destination, dialer internet.Dialer, 
         raise RuntimeError("❌ go mod tidy 执行失败！")
     print("  ✔ [Go Mod] 已同步 gVisor 与全协议依赖树")
 
+# =========================================================================
+# 8. 激进调优：修改 $GOMODCACHE 中的 gVisor TCP 源码 (InitialCwnd=64 + Cubic 0.82)
+# =========================================================================
+gvisor_dir = os.popen('go list -m -f "{{.Dir}}" gvisor.dev/gvisor').read().strip()
+if gvisor_dir and os.path.exists(gvisor_dir):
+    gvisor_tcp_dir = os.path.join(gvisor_dir, "pkg", "tcpip", "transport", "tcp")
+    if os.path.exists(gvisor_tcp_dir):
+        patched_cwnd = 0
+        patched_cc = 0
+        for fname in os.listdir(gvisor_tcp_dir):
+            if not fname.endswith(".go"):
+                continue
+            fpath = os.path.join(gvisor_tcp_dir, fname)
+            try:
+                os.chmod(fpath, stat.S_IWRITE | stat.S_IREAD)
+            except Exception:
+                pass
+            with open(fpath, "r", encoding="utf-8") as f:
+                tc_code = f.read()
+            orig_tc = tc_code
+
+            tc_code, n1 = re.subn(r"\bInitialCwnd\s*=\s*\d+\b", "InitialCwnd = 64", tc_code)
+            patched_cwnd += n1
+
+            if fname == "cubic.go":
+                tc_code, n2 = re.subn(r"(?<![\d.])0\.[789]\d*\b", "0.82", tc_code)
+                tc_code, n3 = re.subn(r"\*\s*[789]\s*/\s*10\b", "* 82 / 100", tc_code)
+                patched_cc += (n2 + n3)
+
+            if tc_code != orig_tc:
+                with open(fpath, "w", encoding="utf-8") as f:
+                    f.write(tc_code)
+        print(f"  ✔ [gVisor 内核调优] InitialCwnd=64 ({patched_cwnd} 处)，Cubic 0.82 黄金抗丢包 ({patched_cc} 处)")
+
 print("🎉 Xray 核心所有定制补丁注入完成！请执行编译即可。")
