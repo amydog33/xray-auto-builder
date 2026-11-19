@@ -326,7 +326,7 @@ func notifyHUD(tag string, dest string) {
         print("  ✔ [HUD] 广播钩子已存在 (幂等跳过)")
 
 # =========================================================================
-# 6. 注入 VPNGate 极速激进主引擎 (secon 标准栈 + 双隧道并发 + BBR + 长连接 DoT)
+# 6. 注入 VPNGate 极速主引擎 (SoftEther 原生 QoS + 4连接聚合 + gVisor BBR 8MB)
 # =========================================================================
 socks_dir = "proxy/socks"
 if os.path.exists(socks_dir):
@@ -370,6 +370,63 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 )
 
+type sePipe struct {
+	rawConn   net.Conn
+	tlsConn   *tls.Conn
+	br        *bufio.Reader
+	bw        *bufio.Writer
+	writeMu   sync.Mutex
+	direction uint32 // 0=TCP_BOTH, 1=TCP_SERVER_TO_CLIENT, 2=TCP_CLIENT_TO_SERVER
+	closed    atomic.Bool
+}
+
+func (p *sePipe) close() {
+	if p.closed.CompareAndSwap(false, true) {
+		if p.rawConn != nil {
+			_ = p.rawConn.Close()
+		}
+	}
+}
+
+func (p *sePipe) writeFrame(data []byte) error {
+	if p.closed.Load() {
+		return io.ErrClosedPipe
+	}
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	_, err := p.bw.Write(data)
+	if err == nil {
+		err = p.bw.Flush()
+	}
+	return err
+}
+
+func (p *sePipe) writeSoftEtherFrames(ethFrames [][]byte) error {
+	if len(ethFrames) == 0 {
+		return nil
+	}
+	if p.closed.Load() {
+		return io.ErrClosedPipe
+	}
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	var hdr [4]byte
+	binary.BigEndian.PutUint32(hdr[:], uint32(len(ethFrames)))
+	if _, err := p.bw.Write(hdr[:]); err != nil {
+		return err
+	}
+	for _, f := range ethFrames {
+		binary.BigEndian.PutUint32(hdr[:], uint32(len(f)))
+		if _, err := p.bw.Write(hdr[:]); err != nil {
+			return err
+		}
+		if _, err := p.bw.Write(f); err != nil {
+			return err
+		}
+	}
+	return p.bw.Flush()
+}
+
 type sstpSession struct {
 	s           *stack.Stack
 	rawConn     net.Conn
@@ -384,7 +441,24 @@ type sstpSession struct {
 	dhcpDNS     [4]byte
 	hasDHCPDNS  atomic.Bool
 
-	// 持久化复用的外层 DoT 长连接，消除新域名重复 TLS 握手耗时
+	// SoftEther 原生单会话多 TCP 连接聚合字段
+	seSlotKey        string
+	seHost           string
+	seSNIHost        string
+	seActivePort     net.Port
+	seSessionKey     []byte
+	seMaxConns       int
+	seKATimeout      time.Duration
+	seFrameHandler   func(eth []byte)
+	seLastRxNano     atomic.Int64
+	seLastActiveNano atomic.Int64
+	seAddOnce        sync.Once
+	sePipesMu        sync.RWMutex
+	sePipes          []*sePipe
+	sePrimaryPipe    *sePipe
+	seTxRR           atomic.Uint64
+
+	// 持久化复用的外层 DoT 长连接
 	dotMu   sync.Mutex
 	dotConn *tls.Conn
 }
@@ -396,6 +470,61 @@ func (sess *sstpSession) closeDoT() {
 		sess.dotConn = nil
 	}
 	sess.dotMu.Unlock()
+}
+
+func (sess *sstpSession) closeAllSEPipes() {
+	sess.sePipesMu.Lock()
+	pipes := sess.sePipes
+	sess.sePipes = nil
+	sess.sePipesMu.Unlock()
+	for _, p := range pipes {
+		p.close()
+	}
+}
+
+func (sess *sstpSession) addSEPipe(p *sePipe) int {
+	sess.sePipesMu.Lock()
+	defer sess.sePipesMu.Unlock()
+	if !isAlive(sess) {
+		p.close()
+		return len(sess.sePipes)
+	}
+	sess.sePipes = append(sess.sePipes, p)
+	return len(sess.sePipes)
+}
+
+func (sess *sstpSession) removeSEPipe(target *sePipe) {
+	target.close()
+	sess.sePipesMu.Lock()
+	defer sess.sePipesMu.Unlock()
+	for i, p := range sess.sePipes {
+		if p == target {
+			sess.sePipes = append(sess.sePipes[:i], sess.sePipes[i+1:]...)
+			break
+		}
+	}
+}
+
+func (sess *sstpSession) pickActiveSETxPipe() *sePipe {
+	sess.sePipesMu.RLock()
+	n := len(sess.sePipes)
+	if n == 0 {
+		sess.sePipesMu.RUnlock()
+		return nil
+	}
+	start := int(sess.seTxRR.Add(1) % uint64(n))
+	for i := 0; i < n; i++ {
+		p := sess.sePipes[(start+i)%n]
+		if !p.closed.Load() && (p.direction == 0 || p.direction == 2) {
+			sess.sePipesMu.RUnlock()
+			return p
+		}
+	}
+	sess.sePipesMu.RUnlock()
+	if sess.sePrimaryPipe != nil && !sess.sePrimaryPipe.closed.Load() {
+		return sess.sePrimaryPipe
+	}
+	return nil
 }
 
 type dnsEntry struct {
@@ -561,7 +690,6 @@ func tryReuseExistingSession(baseKey, slotKey string) *sstpSession {
 	if s := getAliveSlot(slotKey); s != nil {
 		return s
 	}
-	// 仅主槽允许复用备用槽；拉起 #1 时必须独立新建实现双隧道并发
 	if strings.HasSuffix(slotKey, "#0") {
 		if s := getAliveSlot(baseKey + "#1"); s != nil {
 			return s
@@ -666,7 +794,6 @@ func dialTLSWatchdog(tunnelCtx context.Context, dialer internet.Dialer, dest net
 	return rawConn, tlsConn, nil
 }
 
-// 激进 Happy Eyeballs：主端口 0ms 直发，800ms 未胜出立即并发抢跑备选端口
 func dialTLSSerialCandidate(tunnelCtx context.Context, dialer internet.Dialer, serverDest net.Destination, sniHost string) (net.Conn, *tls.Conn, net.Port, error) {
 	candidates := []net.Port{serverDest.Port}
 	addCand := func(p net.Port) {
@@ -766,26 +893,11 @@ func (sess *sstpSession) writeFrame(data []byte) error {
 }
 
 func (sess *sstpSession) writeSoftEtherFrames(ethFrames [][]byte) error {
-	if len(ethFrames) == 0 {
-		return nil
+	p := sess.pickActiveSETxPipe()
+	if p == nil {
+		return io.ErrClosedPipe
 	}
-	sess.writeMu.Lock()
-	defer sess.writeMu.Unlock()
-	var hdr [4]byte
-	binary.BigEndian.PutUint32(hdr[:], uint32(len(ethFrames)))
-	if _, err := sess.bw.Write(hdr[:]); err != nil {
-		return err
-	}
-	for _, f := range ethFrames {
-		binary.BigEndian.PutUint32(hdr[:], uint32(len(f)))
-		if _, err := sess.bw.Write(hdr[:]); err != nil {
-			return err
-		}
-		if _, err := sess.bw.Write(f); err != nil {
-			return err
-		}
-	}
-	return sess.bw.Flush()
+	return p.writeSoftEtherFrames(ethFrames)
 }
 
 func (sess *sstpSession) sendPPPControl(proto uint16, data []byte) {
@@ -802,11 +914,20 @@ func (sess *sstpSession) sendPPPControl(proto uint16, data []byte) {
 	_ = sess.writeFrame(pkt)
 }
 
-// 双隧道智能调度：有真实流量时后台异步拉起 #1 隧道，双管道轮询翻倍吞吐
+// 智能并发调度：
+// - SoftEther-SSL：在同一个 Session 内原生拉起最多 4 条 TCP 聚合（不重复建 Session、零额外 L2 广播开销）
+// - MS-SSTP / OpenVPN：维持后台双隧道（#0 + #1）轮询并发
 func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, targetDest net.Destination, dialer internet.Dialer) (*sstpSession, error) {
 	baseKey := serverDest.String()
 	s0 := getAliveSlot(baseKey + "#0")
 	s1 := getAliveSlot(baseKey + "#1")
+
+	if s0 != nil && s0.isSoftEther {
+		if !isProbeTestDomain(targetDest) {
+			s0.ensureAdditionalSEPipes(serverDest, dialer)
+		}
+		return s0, nil
+	}
 
 	if s0 != nil && s1 != nil {
 		if (sessRR.Add(1) & 1) == 0 {
@@ -841,12 +962,16 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, tar
 	}
 
 	slot0Key := baseKey + "#0"
-	return ovpnDialSF.Do(slot0Key+"|main", func() (*sstpSession, error) {
+	sess, err := ovpnDialSF.Do(slot0Key+"|main", func() (*sstpSession, error) {
 		if existing := tryReuseExistingSession(baseKey, slot0Key); existing != nil {
 			return existing, nil
 		}
 		return dialSlotSession(ctx, serverDest, dialer, baseKey, slot0Key, false)
 	})
+	if err == nil && sess != nil && sess.isSoftEther && !isProbeTestDomain(targetDest) {
+		sess.ensureAdditionalSEPipes(serverDest, dialer)
+	}
+	return sess, err
 }
 
 func newGVisorStack() (*stack.Stack, *channel.Endpoint, error) {
@@ -868,10 +993,9 @@ func newGVisorStack() (*stack.Stack, *channel.Endpoint, error) {
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &minRTO)
 
 	rcvBuf := tcpip.TCPReceiveBufferSizeRangeOption{Min: 65536, Default: 4 * 1024 * 1024, Max: 8 * 1024 * 1024}
-	sndBuf := tcpip.TCPReceiveBufferSizeRangeOption{Min: 65536, Default: 4 * 1024 * 1024, Max: 8 * 1024 * 1024}
+	sndBuf := tcpip.TCPSendBufferSizeRangeOption{Min: 65536, Default: 4 * 1024 * 1024, Max: 8 * 1024 * 1024}
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &rcvBuf)
-	sndOpt := tcpip.TCPSendBufferSizeRangeOption(sndBuf)
-	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sndOpt)
+	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &sndBuf)
 	modOpt := tcpip.TCPModerateReceiveBufferOption(true)
 	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &modOpt)
 
@@ -1374,7 +1498,7 @@ func dialMSSSTPSessionWithHint(serverDest net.Destination, dialer internet.Diale
 }
 
 // =========================================================================
-// 标准 SoftEther 协议栈 (SHA-0 / PACK / Auth / 零分配帧收发)
+// 标准 SoftEther 协议栈 (SHA-0 / PACK / QoS=1 / 原生 4 连接并发聚合)
 // =========================================================================
 
 const (
@@ -1664,9 +1788,9 @@ func buildSELoginPack(uniqueID []byte, random []byte) []byte {
 	p.addData("secure_password", sp[:])
 	p.addInt("use_encrypt", 1)
 	p.addInt("use_compress", 0)
-	p.addInt("max_connection", 1)
+	p.addInt("max_connection", 4) // 原生 4 连接并发聚合
 	p.addInt("half_connection", 0)
-	p.addInt("qos", 0)
+	p.addInt("qos", 1)            // 开启服务端 ACK/SYN/DNS 小包插队 QoS
 	p.addInt("protocol", 0)
 
 	const clientStr = "secon SoftEther Compatible Client"
@@ -1678,6 +1802,17 @@ func buildSELoginPack(uniqueID []byte, random []byte) []byte {
 	p.addInt("client_build", 5187)
 	p.addInt("client_id", 0)
 	p.addData("unique_id", uniqueID)
+	return p.marshal()
+}
+
+func buildSEAdditionalConnectPack(sessionKey []byte) []byte {
+	p := &sePack{}
+	p.addStr("method", "additional_connect")
+	p.addData("session_key", sessionKey)
+	const clientStr = "secon SoftEther Compatible Client"
+	p.addStr("client_str", clientStr)
+	p.addInt("client_ver", 502)
+	p.addInt("client_build", 5187)
 	return p.marshal()
 }
 
@@ -1782,6 +1917,239 @@ func buildARPFrame(op uint16, srcMAC [6]byte, srcIP [4]byte, dstMAC [6]byte, dst
 	return f[:]
 }
 
+func (sess *sstpSession) runSEReceiveLoop(pipe *sePipe, isPrimary bool) {
+	defer func() {
+		if isPrimary {
+			if sess.markDead != nil {
+				sess.markDead()
+			}
+		} else {
+			sess.removeSEPipe(pipe)
+		}
+	}()
+
+	var hdr [4]byte
+	rxBuf := make([]byte, 65536)
+	br := pipe.br
+
+	for {
+		if _, err := io.ReadFull(br, hdr[:]); err != nil {
+			return
+		}
+		sess.seLastRxNano.Store(time.Now().UnixNano())
+		numPkts := binary.BigEndian.Uint32(hdr[:])
+
+		if numPkts == 0xFFFFFFFF {
+			if _, err := io.ReadFull(br, hdr[:]); err != nil {
+				return
+			}
+			kaLen := binary.BigEndian.Uint32(hdr[:])
+			if kaLen > 65536 {
+				return
+			}
+			if kaLen > 0 {
+				if _, err := io.CopyN(io.Discard, br, int64(kaLen)); err != nil {
+					return
+				}
+			}
+			continue
+		}
+		if numPkts == 0 {
+			continue
+		}
+		if numPkts > 1024 {
+			return
+		}
+
+		for i := uint32(0); i < numPkts; i++ {
+			if _, err := io.ReadFull(br, hdr[:]); err != nil {
+				return
+			}
+			pktLen := binary.BigEndian.Uint32(hdr[:])
+			if pktLen == 0 || pktLen > 65536 {
+				return
+			}
+			eth := rxBuf[:pktLen]
+			if _, err := io.ReadFull(br, eth); err != nil {
+				return
+			}
+			if sess.seFrameHandler != nil {
+				sess.seFrameHandler(eth)
+			}
+		}
+	}
+}
+
+func (sess *sstpSession) runSEKeepaliveLoop(pipe *sePipe, isPrimary bool) {
+	defer func() {
+		if isPrimary {
+			if sess.markDead != nil {
+				sess.markDead()
+			}
+		} else {
+			sess.removeSEPipe(pipe)
+		}
+	}()
+
+	var kaFrame [8 + 32]byte
+	binary.BigEndian.PutUint32(kaFrame[0:4], 0xFFFFFFFF)
+	binary.BigEndian.PutUint32(kaFrame[4:8], 32)
+	_, _ = rand.Read(kaFrame[8:])
+
+	kaTimeout := sess.seKATimeout
+	if kaTimeout <= 0 {
+		kaTimeout = 30 * time.Second
+	}
+	kaInterval := kaTimeout / 4
+	if kaInterval < 3*time.Second {
+		kaInterval = 3 * time.Second
+	} else if kaInterval > 10*time.Second {
+		kaInterval = 10 * time.Second
+	}
+
+	ticker := time.NewTicker(kaInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-sess.dead:
+			return
+		case <-ticker.C:
+			if pipe.closed.Load() {
+				return
+			}
+			if isPrimary {
+				now := time.Now().UnixNano()
+				if now-sess.seLastRxNano.Load() > int64(kaTimeout+15*time.Second) ||
+					now-sess.seLastActiveNano.Load() > int64(600*time.Second) {
+					return
+				}
+			}
+			if err := pipe.writeFrame(kaFrame[:]); err != nil {
+				return
+			}
+		}
+	}
+}
+
+func (sess *sstpSession) ensureAdditionalSEPipes(serverDest net.Destination, dialer internet.Dialer) {
+	if !sess.isSoftEther || len(sess.seSessionKey) != 20 || sess.seMaxConns <= 1 {
+		return
+	}
+	sess.seAddOnce.Do(func() {
+		extra := sess.seMaxConns - 1
+		if extra > 3 {
+			extra = 3
+		}
+		for i := 0; i < extra; i++ {
+			delay := time.Duration(i) * 80 * time.Millisecond
+			go func(wait time.Duration) {
+				if wait > 0 {
+					select {
+					case <-time.After(wait):
+					case <-sess.dead:
+						return
+					}
+				}
+				if !isAlive(sess) {
+					return
+				}
+				sess.dialSoftEtherAdditionalPipe(serverDest, dialer)
+			}(delay)
+		}
+	})
+}
+
+func (sess *sstpSession) dialSoftEtherAdditionalPipe(serverDest net.Destination, dialer internet.Dialer) {
+	if !isAlive(sess) {
+		return
+	}
+	pipeCtx, pipeCancel := context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-sess.dead:
+			pipeCancel()
+		case <-pipeCtx.Done():
+		}
+	}()
+
+	dest := net.TCPDestination(serverDest.Address, sess.seActivePort)
+	rawConn, tlsConn, err := dialTLSWatchdog(pipeCtx, dialer, dest, sess.seSNIHost, 6000*time.Millisecond)
+	if err != nil {
+		pipeCancel()
+		return
+	}
+
+	br := bufio.NewReaderSize(tlsConn, 262144)
+
+	var helloPack *sePack
+	err = RunWithWatchdog(rawConn, 5500*time.Millisecond, func() error {
+		if wErr := writeSEHTTP(tlsConn, "/vpnsvc/connect.cgi", sess.seHost, "image/jpeg", []byte("VPNCONNECT")); wErr != nil {
+			return wErr
+		}
+		var rErr error
+		helloPack, rErr = readSEPackResponse(br)
+		return rErr
+	})
+	if err != nil || helloPack.getInt("error") != 0 {
+		_ = rawConn.Close()
+		pipeCancel()
+		return
+	}
+
+	addBytes := buildSEAdditionalConnectPack(sess.seSessionKey)
+	var addPack *sePack
+	err = RunWithWatchdog(rawConn, 6500*time.Millisecond, func() error {
+		if wErr := writeSEHTTP(tlsConn, "/vpnsvc/vpn.cgi", sess.seHost, "application/octet-stream", addBytes); wErr != nil {
+			return wErr
+		}
+		for i := 0; i < 20; i++ {
+			ap, rErr := readSEPackResponse(br)
+			if rErr != nil {
+				return rErr
+			}
+			if ap.getInt("noop") != 2 {
+				addPack = ap
+				return nil
+			}
+		}
+		return fmt.Errorf("too many noop")
+	})
+	if err != nil || addPack == nil || addPack.getInt("error") != 0 {
+		_ = rawConn.Close()
+		pipeCancel()
+		return
+	}
+
+	dir := addPack.getInt("direction")
+	pipe := &sePipe{
+		rawConn:   rawConn,
+		tlsConn:   tlsConn,
+		br:        br,
+		bw:        bufio.NewWriterSize(tlsConn, 262144),
+		direction: dir,
+	}
+
+	if !isAlive(sess) {
+		pipe.close()
+		pipeCancel()
+		return
+	}
+
+	totalPipes := sess.addSEPipe(pipe)
+	if pipe.closed.Load() {
+		pipeCancel()
+		return
+	}
+
+	errors.LogInfo(context.Background(), fmt.Sprintf("[VPNGate-SSL] 原生多连接聚合已挂载 (%s) | 活跃管道: %d/%d | dir=%d", sess.seSlotKey, totalPipes, sess.seMaxConns, dir))
+
+	go func() {
+		sess.runSEReceiveLoop(pipe, false)
+		pipeCancel()
+	}()
+	go sess.runSEKeepaliveLoop(pipe, false)
+}
+
 func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dialer, baseKey, slotKey string, knownPort net.Port) (*sstpSession, net.Port, error) {
 	bgCtx := context.Background()
 	connCtx, connCancel := context.WithCancel(bgCtx)
@@ -1877,6 +2245,14 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 		kaTimeout = 30 * time.Second
 	}
 
+	sessionKey := append([]byte(nil), welcomePack.getData("session_key")...)
+	maxConns := int(welcomePack.getInt("max_connection"))
+	if maxConns < 1 {
+		maxConns = 1
+	} else if maxConns > 4 {
+		maxConns = 4
+	}
+
 	s, ep, err := newGVisorStack()
 	if err != nil {
 		_ = rawConn.Close()
@@ -1891,21 +2267,37 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 		defaultGW[i] = 0xff
 	}
 
+	primaryPipe := &sePipe{
+		rawConn:   rawConn,
+		tlsConn:   tlsConn,
+		br:        br,
+		bw:        bufio.NewWriterSize(tlsConn, 262144),
+		direction: 0,
+	}
+
 	sess := &sstpSession{
-		s:           s,
-		rawConn:     rawConn,
-		tlsConn:     tlsConn,
-		bw:          bufio.NewWriterSize(tlsConn, 262144),
-		dead:        make(chan struct{}),
-		isSoftEther: true,
-		myMAC:       myMAC,
+		s:             s,
+		rawConn:       rawConn,
+		tlsConn:       tlsConn,
+		bw:            primaryPipe.bw,
+		dead:          make(chan struct{}),
+		isSoftEther:   true,
+		myMAC:         myMAC,
+		seSlotKey:     slotKey,
+		seHost:        host,
+		seSNIHost:     sniHost,
+		seActivePort:  activePort,
+		seSessionKey:  sessionKey,
+		seMaxConns:    maxConns,
+		seKATimeout:   kaTimeout,
+		sePrimaryPipe: primaryPipe,
+		sePipes:       []*sePipe{primaryPipe},
 	}
 	sess.gwMAC.Store(defaultGW)
 
-	var lastRxNano, lastActiveNano atomic.Int64
 	nowNano := time.Now().UnixNano()
-	lastRxNano.Store(nowNano)
-	lastActiveNano.Store(nowNano)
+	sess.seLastRxNano.Store(nowNano)
+	sess.seLastActiveNano.Store(nowNano)
 
 	type dhcpLease struct {
 		ip        tcpip.Address
@@ -1922,8 +2314,8 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 			close(sess.dead)
 			unbindSlotSession(baseKey, slotKey, sess)
 			sess.closeDoT()
+			sess.closeAllSEPipes()
 			connCancel()
-			_ = rawConn.Close()
 			s.Close()
 		})
 	}
@@ -1932,8 +2324,129 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 	xidBytes := make([]byte, 4)
 	_, _ = rand.Read(xidBytes)
 	dhcpXid := binary.BigEndian.Uint32(xidBytes)
+
+	// 多管道共享的 L2 以太网帧处理器（完全线程安全）
+	sess.seFrameHandler = func(eth []byte) {
+		if len(eth) < 14 {
+			return
+		}
+		etherType := binary.BigEndian.Uint16(eth[12:14])
+		if etherType == 0x0806 && len(eth) >= 42 {
+			arpOp := binary.BigEndian.Uint16(eth[20:22])
+			if arpOp == 1 && hasIP.Load() && bytes.Equal(eth[38:42], assignedIP[:]) {
+				var dstMAC [6]byte
+				var dstIP [4]byte
+				copy(dstMAC[:], eth[22:28])
+				copy(dstIP[:], eth[28:32])
+				_ = sess.writeSoftEtherFrames([][]byte{buildARPFrame(2, myMAC, assignedIP, dstMAC, dstIP)})
+			} else if arpOp == 2 && hasIP.Load() && bytes.Equal(eth[28:32], gatewayIP[:]) {
+				var realGW [6]byte
+				copy(realGW[:], eth[22:28])
+				sess.gwMAC.Store(realGW)
+				gwARPResolved.Store(true)
+			}
+			return
+		}
+		if etherType != 0x0800 {
+			return
+		}
+		ipPkt := eth[14:]
+		if len(ipPkt) < 20 {
+			return
+		}
+		if tot := int(binary.BigEndian.Uint16(ipPkt[2:4])); tot >= 20 && tot <= len(ipPkt) {
+			ipPkt = ipPkt[:tot]
+		}
+		if ipPkt[9] == 17 {
+			ihl := int(ipPkt[0]&0x0f) * 4
+			if len(ipPkt) >= ihl+8+240 {
+				srcPort := binary.BigEndian.Uint16(ipPkt[ihl : ihl+2])
+				dstPort := binary.BigEndian.Uint16(ipPkt[ihl+2 : ihl+4])
+				if srcPort == 67 && dstPort == 68 {
+					bootp := ipPkt[ihl+8:]
+					if binary.BigEndian.Uint32(bootp[4:8]) == dhcpXid && len(bootp) > 240 {
+						yiaddr := bootp[16:20]
+						var msgType byte
+						var srvID, subnetMask, routerOpt, dnsOpt []byte
+						opts := bootp[240:]
+						for k := 0; k < len(opts); {
+							code := opts[k]
+							if code == 255 {
+								break
+							}
+							if code == 0 {
+								k++
+								continue
+							}
+							if k+1 >= len(opts) {
+								break
+							}
+							olen := int(opts[k+1])
+							if k+2+olen > len(opts) {
+								break
+							}
+							if code == 1 && olen == 4 {
+								subnetMask = opts[k+2 : k+6]
+							} else if code == 3 && olen >= 4 {
+								routerOpt = opts[k+2 : k+6]
+							} else if code == 6 && olen >= 4 {
+								dnsOpt = opts[k+2 : k+6]
+							} else if code == 53 && olen >= 1 {
+								msgType = opts[k+2]
+							} else if code == 54 && olen == 4 {
+								srvID = opts[k+2 : k+6]
+							}
+							k += 2 + olen
+						}
+						if !gwARPResolved.Load() {
+							var srcMAC [6]byte
+							copy(srcMAC[:], eth[6:12])
+							sess.gwMAC.Store(srcMAC)
+						}
+						if msgType == 2 {
+							offerReceived.Store(true)
+							_ = sess.writeSoftEtherFrames([][]byte{buildDHCPFrame(3, dhcpXid, myMAC, yiaddr, srvID)})
+						} else if msgType == 5 {
+							copy(assignedIP[:], yiaddr)
+							if len(routerOpt) == 4 {
+								copy(gatewayIP[:], routerOpt)
+							}
+							if len(dnsOpt) == 4 {
+								copy(sess.dhcpDNS[:], dnsOpt)
+								sess.hasDHCPDNS.Store(true)
+							}
+							hasIP.Store(true)
+							if gatewayIP != ([4]byte{}) {
+								_ = sess.writeSoftEtherFrames([][]byte{buildARPFrame(1, myMAC, assignedIP, [6]byte{}, gatewayIP)})
+							}
+							addr := tcpip.AddrFromSlice(yiaddr)
+							prefixLen := 16
+							if len(subnetMask) == 4 {
+								mask := binary.BigEndian.Uint32(subnetMask)
+								if mask != 0 && (^mask&(^mask+1)) == 0 {
+									prefixLen = bits.OnesCount32(mask)
+								}
+							}
+							errors.LogInfo(bgCtx, fmt.Sprintf("[VPNGate] 隧道就绪 (%s) | 协议: SoftEther-SSL (QoS=1, maxConn=%d) | 端口: %d | IP: %s/%d", slotKey, maxConns, activePort, addr.String(), prefixLen))
+							once.Do(func() { ipReady <- dhcpLease{ip: addr, prefixLen: prefixLen} })
+						}
+					}
+					return
+				}
+			}
+		}
+
+		sess.seLastActiveNano.Store(time.Now().UnixNano())
+		clampIPv4TCPMSSInPlace(ipPkt, 1320)
+		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+			Payload: buffer.MakeWithData(ipPkt),
+		})
+		ep.InjectInbound(header.IPv4ProtocolNumber, pkt)
+		pkt.DecRef()
+	}
+
 	discoverFrame := buildDHCPFrame(1, dhcpXid, myMAC, nil, nil)
-	_ = sess.writeSoftEtherFrames([][]byte{discoverFrame})
+	_ = primaryPipe.writeSoftEtherFrames([][]byte{discoverFrame})
 
 	go func() {
 		ticker := time.NewTicker(250 * time.Millisecond)
@@ -1946,178 +2459,15 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 				if hasIP.Load() || offerReceived.Load() {
 					return
 				}
-				_ = sess.writeSoftEtherFrames([][]byte{discoverFrame})
+				_ = primaryPipe.writeSoftEtherFrames([][]byte{discoverFrame})
 			}
 		}
 	}()
 
-	// 零分配高频收包协程
-	go func() {
-		defer markDead()
-		var hdr [4]byte
-		rxBuf := make([]byte, 65536)
-		for {
-			if _, err := io.ReadFull(br, hdr[:]); err != nil {
-				return
-			}
-			lastRxNano.Store(time.Now().UnixNano())
-			numPkts := binary.BigEndian.Uint32(hdr[:])
+	go sess.runSEReceiveLoop(primaryPipe, true)
+	go sess.runSEKeepaliveLoop(primaryPipe, true)
 
-			if numPkts == 0xFFFFFFFF {
-				if _, err := io.ReadFull(br, hdr[:]); err != nil {
-					return
-				}
-				kaLen := binary.BigEndian.Uint32(hdr[:])
-				if kaLen > 65536 {
-					return
-				}
-				if kaLen > 0 {
-					if _, err := io.CopyN(io.Discard, br, int64(kaLen)); err != nil {
-						return
-					}
-				}
-				continue
-			}
-			if numPkts == 0 {
-				continue
-			}
-			if numPkts > 1024 {
-				return
-			}
-
-			for i := uint32(0); i < numPkts; i++ {
-				if _, err := io.ReadFull(br, hdr[:]); err != nil {
-					return
-				}
-				pktLen := binary.BigEndian.Uint32(hdr[:])
-				if pktLen == 0 || pktLen > 65536 {
-					return
-				}
-				eth := rxBuf[:pktLen]
-				if _, err := io.ReadFull(br, eth); err != nil {
-					return
-				}
-				if len(eth) < 14 {
-					continue
-				}
-				etherType := binary.BigEndian.Uint16(eth[12:14])
-				if etherType == 0x0806 && len(eth) >= 42 {
-					arpOp := binary.BigEndian.Uint16(eth[20:22])
-					if arpOp == 1 && hasIP.Load() && bytes.Equal(eth[38:42], assignedIP[:]) {
-						var dstMAC [6]byte
-						var dstIP [4]byte
-						copy(dstMAC[:], eth[22:28])
-						copy(dstIP[:], eth[28:32])
-						_ = sess.writeSoftEtherFrames([][]byte{buildARPFrame(2, myMAC, assignedIP, dstMAC, dstIP)})
-					} else if arpOp == 2 && hasIP.Load() && bytes.Equal(eth[28:32], gatewayIP[:]) {
-						var realGW [6]byte
-						copy(realGW[:], eth[22:28])
-						sess.gwMAC.Store(realGW)
-						gwARPResolved.Store(true)
-					}
-					continue
-				}
-				if etherType != 0x0800 {
-					continue
-				}
-				ipPkt := eth[14:]
-				if len(ipPkt) < 20 {
-					continue
-				}
-				if tot := int(binary.BigEndian.Uint16(ipPkt[2:4])); tot >= 20 && tot <= len(ipPkt) {
-					ipPkt = ipPkt[:tot]
-				}
-				if ipPkt[9] == 17 {
-					ihl := int(ipPkt[0]&0x0f) * 4
-					if len(ipPkt) >= ihl+8+240 {
-						srcPort := binary.BigEndian.Uint16(ipPkt[ihl : ihl+2])
-						dstPort := binary.BigEndian.Uint16(ipPkt[ihl+2 : ihl+4])
-						if srcPort == 67 && dstPort == 68 {
-							bootp := ipPkt[ihl+8:]
-							if binary.BigEndian.Uint32(bootp[4:8]) == dhcpXid && len(bootp) > 240 {
-								yiaddr := bootp[16:20]
-								var msgType byte
-								var srvID, subnetMask, routerOpt, dnsOpt []byte
-								opts := bootp[240:]
-								for k := 0; k < len(opts); {
-									code := opts[k]
-									if code == 255 {
-										break
-									}
-									if code == 0 {
-										k++
-										continue
-									}
-									if k+1 >= len(opts) {
-										break
-									}
-									olen := int(opts[k+1])
-									if k+2+olen > len(opts) {
-										break
-									}
-									if code == 1 && olen == 4 {
-										subnetMask = opts[k+2 : k+6]
-									} else if code == 3 && olen >= 4 {
-										routerOpt = opts[k+2 : k+6]
-									} else if code == 6 && olen >= 4 {
-										dnsOpt = opts[k+2 : k+6]
-									} else if code == 53 && olen >= 1 {
-										msgType = opts[k+2]
-									} else if code == 54 && olen == 4 {
-										srvID = opts[k+2 : k+6]
-									}
-									k += 2 + olen
-								}
-								if !gwARPResolved.Load() {
-									var srcMAC [6]byte
-									copy(srcMAC[:], eth[6:12])
-									sess.gwMAC.Store(srcMAC)
-								}
-								if msgType == 2 {
-									offerReceived.Store(true)
-									_ = sess.writeSoftEtherFrames([][]byte{buildDHCPFrame(3, dhcpXid, myMAC, yiaddr, srvID)})
-								} else if msgType == 5 {
-									copy(assignedIP[:], yiaddr)
-									if len(routerOpt) == 4 {
-										copy(gatewayIP[:], routerOpt)
-									}
-									if len(dnsOpt) == 4 {
-										copy(sess.dhcpDNS[:], dnsOpt)
-										sess.hasDHCPDNS.Store(true)
-									}
-									hasIP.Store(true)
-									if gatewayIP != ([4]byte{}) {
-										_ = sess.writeSoftEtherFrames([][]byte{buildARPFrame(1, myMAC, assignedIP, [6]byte{}, gatewayIP)})
-									}
-									addr := tcpip.AddrFromSlice(yiaddr)
-									prefixLen := 16
-									if len(subnetMask) == 4 {
-										mask := binary.BigEndian.Uint32(subnetMask)
-										if mask != 0 && (^mask&(^mask+1)) == 0 {
-											prefixLen = bits.OnesCount32(mask)
-										}
-									}
-									errors.LogInfo(bgCtx, fmt.Sprintf("[VPNGate] 隧道就绪 (%s) | 协议: SoftEther-SSL | 端口: %d | IP: %s/%d", slotKey, activePort, addr.String(), prefixLen))
-									once.Do(func() { ipReady <- dhcpLease{ip: addr, prefixLen: prefixLen} })
-								}
-							}
-							continue
-						}
-					}
-				}
-
-				lastActiveNano.Store(time.Now().UnixNano())
-				clampIPv4TCPMSSInPlace(ipPkt, 1320)
-				pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-					Payload: buffer.MakeWithData(ipPkt),
-				})
-				ep.InjectInbound(header.IPv4ProtocolNumber, pkt)
-				pkt.DecRef()
-			}
-		}
-	}()
-
-	// 128 帧大批量冲刷发包协程
+	// 多管道轮询 128 帧大批量冲刷发包协程
 	go func() {
 		defer markDead()
 		var batch [128]*stack.PacketBuffer
@@ -2131,7 +2481,7 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 			if pkt == nil {
 				return
 			}
-			lastActiveNano.Store(time.Now().UnixNano())
+			sess.seLastActiveNano.Store(time.Now().UnixNano())
 			batch[0] = pkt
 			nBatch := 1
 			for nBatch < 128 {
@@ -2143,12 +2493,21 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 				nBatch++
 			}
 
+			pipe := sess.pickActiveSETxPipe()
+			if pipe == nil {
+				for i := 0; i < nBatch; i++ {
+					batch[i].DecRef()
+					batch[i] = nil
+				}
+				return
+			}
+
 			gw := sess.gwMAC.Load().([6]byte)
 			copy(frameHdr[4:10], gw[:])
 			binary.BigEndian.PutUint32(countBuf[:], uint32(nBatch))
 
-			sess.writeMu.Lock()
-			_, wErr := sess.bw.Write(countBuf[:])
+			pipe.writeMu.Lock()
+			_, wErr := pipe.bw.Write(countBuf[:])
 			for i := 0; i < nBatch; i++ {
 				p := batch[i]
 				batch[i] = nil
@@ -2157,52 +2516,24 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 				clampIPv4TCPMSSInPlace(ipData, 1320)
 				binary.BigEndian.PutUint32(frameHdr[0:4], uint32(14+len(ipData)))
 				if wErr == nil {
-					_, wErr = sess.bw.Write(frameHdr[:])
+					_, wErr = pipe.bw.Write(frameHdr[:])
 				}
 				if wErr == nil {
-					_, wErr = sess.bw.Write(ipData)
+					_, wErr = pipe.bw.Write(ipData)
 				}
 				v.Release()
 				p.DecRef()
 			}
 			if wErr == nil {
-				wErr = sess.bw.Flush()
+				wErr = pipe.bw.Flush()
 			}
-			sess.writeMu.Unlock()
+			pipe.writeMu.Unlock()
+
 			if wErr != nil {
-				return
-			}
-		}
-	}()
-
-	go func() {
-		defer markDead()
-		var kaFrame [8 + 32]byte
-		binary.BigEndian.PutUint32(kaFrame[0:4], 0xFFFFFFFF)
-		binary.BigEndian.PutUint32(kaFrame[4:8], 32)
-		_, _ = rand.Read(kaFrame[8:])
-
-		kaInterval := kaTimeout / 4
-		if kaInterval < 3*time.Second {
-			kaInterval = 3 * time.Second
-		} else if kaInterval > 10*time.Second {
-			kaInterval = 10 * time.Second
-		}
-
-		ticker := time.NewTicker(kaInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-sess.dead:
-				return
-			case <-ticker.C:
-				now := time.Now().UnixNano()
-				if now-lastRxNano.Load() > int64(kaTimeout+15*time.Second) || now-lastActiveNano.Load() > int64(600*time.Second) {
+				if pipe == primaryPipe {
 					return
 				}
-				if err := sess.writeFrame(kaFrame[:]); err != nil {
-					return
-				}
+				sess.removeSEPipe(pipe)
 			}
 		}
 	}()
@@ -2378,7 +2709,7 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
             raise RuntimeError("❌ 未能在 proxy/socks/client.go 的 Process 函数中匹配到 server 变量赋值行！")
         with open(client_go, "w", encoding="utf-8") as f:
             f.write(new_code)
-        print("  ✔ [VPNGate 极速主引擎] 成功注入 (secon + 双隧道异步并发 + gVisor BBR 8MB + 零分配收包)")
+        print("  ✔ [VPNGate 极速主引擎] 成功注入 (SoftEther 原生 QoS=1 + 4连接聚合 + gVisor BBR 8MB)")
 
 # =========================================================================
 # 7. 注入 VPNGate OpenVPN 极速引擎 (250ms UDP ARQ + 长连接复用 DoT + 四路 DNS 竞速)
