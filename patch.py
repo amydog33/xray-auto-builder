@@ -326,7 +326,7 @@ func notifyHUD(tag string, dest string) {
         print("  ✔ [HUD] 广播钩子已存在 (幂等跳过)")
 
 # =========================================================================
-# 6. 注入 VPNGate 稳速主引擎 (SoftEther 原生 QoS + 流哈希 2连接聚合 + gVisor Cubic)
+# 6. 注入 VPNGate 弹性激进主引擎 (无主自愈 + half_connection=1 + 1->2->4 动态换挡 + gVisor Cubic)
 # =========================================================================
 socks_dir = "proxy/socks"
 if os.path.exists(socks_dir):
@@ -376,7 +376,7 @@ type sePipe struct {
 	br        *bufio.Reader
 	bw        *bufio.Writer
 	writeMu   sync.Mutex
-	direction uint32 // 0=TCP_BOTH, 1=TCP_SERVER_TO_CLIENT, 2=TCP_CLIENT_TO_SERVER
+	direction uint32 // 0=TCP_BOTH, 1=TCP_SERVER_TO_CLIENT(纯下行), 2=TCP_CLIENT_TO_SERVER(纯上行)
 	closed    atomic.Bool
 }
 
@@ -441,21 +441,23 @@ type sstpSession struct {
 	dhcpDNS     [4]byte
 	hasDHCPDNS  atomic.Bool
 
-	// SoftEther 原生单会话多 TCP 连接聚合字段
+	// SoftEther 无主多管自愈 + 弹性扩缩容字段
 	seSlotKey        string
 	seHost           string
 	seSNIHost        string
 	seActivePort     net.Port
 	seSessionKey     []byte
 	seMaxConns       int
+	seHalfConn       bool
 	seKATimeout      time.Duration
 	seFrameHandler   func(eth []byte)
 	seLastRxNano     atomic.Int64
 	seLastActiveNano atomic.Int64
-	seAddOnce        sync.Once
+	seDownBytes      atomic.Uint64
+	seMgrOnce        sync.Once
+	seHealCh         chan struct{}
 	sePipesMu        sync.RWMutex
 	sePipes          []*sePipe
-	sePrimaryPipe    *sePipe
 	seTxRR           atomic.Uint64
 
 	// 持久化复用的外层 DoT 长连接
@@ -493,36 +495,61 @@ func (sess *sstpSession) addSEPipe(p *sePipe) int {
 	return len(sess.sePipes)
 }
 
+func (sess *sstpSession) activeSEPipeCount() int {
+	sess.sePipesMu.RLock()
+	n := len(sess.sePipes)
+	sess.sePipesMu.RUnlock()
+	return n
+}
+
+// 无主断管摘除：仅当最后一条管道也断开时才销毁整个会话，否则触发后台静默自愈
 func (sess *sstpSession) removeSEPipe(target *sePipe) {
 	target.close()
 	sess.sePipesMu.Lock()
-	defer sess.sePipesMu.Unlock()
 	for i, p := range sess.sePipes {
 		if p == target {
 			sess.sePipes = append(sess.sePipes[:i], sess.sePipes[i+1:]...)
 			break
 		}
 	}
+	remaining := len(sess.sePipes)
+	sess.sePipesMu.Unlock()
+
+	if remaining == 0 {
+		if sess.markDead != nil {
+			sess.markDead()
+		}
+		return
+	}
+	if sess.seHealCh != nil {
+		select {
+		case sess.seHealCh <- struct{}{}:
+		default:
+		}
+	}
 }
 
 func (sess *sstpSession) pickActiveSETxPipe() *sePipe {
 	sess.sePipesMu.RLock()
+	defer sess.sePipesMu.RUnlock()
 	n := len(sess.sePipes)
 	if n == 0 {
-		sess.sePipesMu.RUnlock()
 		return nil
 	}
 	start := int(sess.seTxRR.Add(1) % uint64(n))
+	// 优先选双向(0)或纯上行(2)管道
 	for i := 0; i < n; i++ {
 		p := sess.sePipes[(start+i)%n]
 		if !p.closed.Load() && (p.direction == 0 || p.direction == 2) {
-			sess.sePipesMu.RUnlock()
 			return p
 		}
 	}
-	sess.sePipesMu.RUnlock()
-	if sess.sePrimaryPipe != nil && !sess.sePrimaryPipe.closed.Load() {
-		return sess.sePrimaryPipe
+	// 兜底：若极端情况下只剩下行管，仍返回存活管道避免卡死
+	for i := 0; i < n; i++ {
+		p := sess.sePipes[(start+i)%n]
+		if !p.closed.Load() {
+			return p
+		}
 	}
 	return nil
 }
@@ -532,6 +559,13 @@ func (sess *sstpSession) snapshotActiveSETxPipes(dst []*sePipe) []*sePipe {
 	for _, p := range sess.sePipes {
 		if !p.closed.Load() && (p.direction == 0 || p.direction == 2) {
 			dst = append(dst, p)
+		}
+	}
+	if len(dst) == 0 {
+		for _, p := range sess.sePipes {
+			if !p.closed.Load() {
+				dst = append(dst, p)
+			}
 		}
 	}
 	sess.sePipesMu.RUnlock()
@@ -658,7 +692,7 @@ func releaseProbeSlot() {
 
 func isDeadPort(addr string) bool {
 	if v, ok := vgDeadPortCache.Load(addr); ok {
-		if time.Since(v.(time.Time)) < 60*time.Second {
+		if time.Since(v.(time.Time)) < 20*time.Second {
 			return true
 		}
 		vgDeadPortCache.Delete(addr)
@@ -797,7 +831,7 @@ func dialTLSWatchdog(tunnelCtx context.Context, dialer internet.Dialer, dest net
 
 	rawConn, err := dialer.Dial(tunnelCtx, dest)
 	if err != nil {
-		if tunnelCtx.Err() == nil {
+		if tunnelCtx.Err() == nil && !stderrors.Is(err, context.DeadlineExceeded) {
 			markDeadPort(addrStr)
 		}
 		return nil, nil, err
@@ -809,7 +843,7 @@ func dialTLSWatchdog(tunnelCtx context.Context, dialer internet.Dialer, dest net
 		return tlsConn.Handshake()
 	}); err != nil {
 		_ = rawConn.Close()
-		if tunnelCtx.Err() == nil {
+		if tunnelCtx.Err() == nil && !stderrors.Is(err, context.DeadlineExceeded) {
 			markDeadPort(addrStr)
 		}
 		return nil, nil, err
@@ -817,6 +851,7 @@ func dialTLSWatchdog(tunnelCtx context.Context, dialer internet.Dialer, dest net
 	return rawConn, tlsConn, nil
 }
 
+// 放宽至 2000ms 的 Happy Eyeballs：给链式前置充足建连时间，避免误发冗余 443 连接
 func dialTLSSerialCandidate(tunnelCtx context.Context, dialer internet.Dialer, serverDest net.Destination, sniHost string) (net.Conn, *tls.Conn, net.Port, error) {
 	candidates := []net.Port{serverDest.Port}
 	addCand := func(p net.Port) {
@@ -838,7 +873,7 @@ func dialTLSSerialCandidate(tunnelCtx context.Context, dialer internet.Dialer, s
 	}
 
 	if len(candidates) == 1 {
-		raw, tc, err := dialTLSWatchdog(tunnelCtx, dialer, net.TCPDestination(serverDest.Address, candidates[0]), sniHost, 6000*time.Millisecond)
+		raw, tc, err := dialTLSWatchdog(tunnelCtx, dialer, net.TCPDestination(serverDest.Address, candidates[0]), sniHost, 6500*time.Millisecond)
 		return raw, tc, candidates[0], err
 	}
 
@@ -873,13 +908,13 @@ func dialTLSSerialCandidate(tunnelCtx context.Context, dialer internet.Dialer, s
 		}
 	}
 
-	go launch(candidates[0], 6000*time.Millisecond)
+	go launch(candidates[0], 6500*time.Millisecond)
 
 	go func() {
 		select {
-		case <-time.After(800 * time.Millisecond):
+		case <-time.After(2000 * time.Millisecond):
 			for _, p := range candidates[1:] {
-				go launch(p, 5000*time.Millisecond)
+				go launch(p, 5500*time.Millisecond)
 			}
 		case <-raceCtx.Done():
 		}
@@ -937,9 +972,6 @@ func (sess *sstpSession) sendPPPControl(proto uint16, data []byte) {
 	_ = sess.writeFrame(pkt)
 }
 
-// 智能并发调度：
-// - SoftEther-SSL：在同一个 Session 内原生拉起最多 2 条 TCP 聚合 + 按流哈希固定管道
-// - MS-SSTP / OpenVPN：维持后台双隧道（#0 + #1）轮询并发
 func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, targetDest net.Destination, dialer internet.Dialer) (*sstpSession, error) {
 	baseKey := serverDest.String()
 	s0 := getAliveSlot(baseKey + "#0")
@@ -947,7 +979,7 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, tar
 
 	if s0 != nil && s0.isSoftEther {
 		if !isProbeTestDomain(targetDest) {
-			s0.ensureAdditionalSEPipes(serverDest, dialer)
+			s0.ensureSEElasticManager(serverDest, dialer)
 		}
 		return s0, nil
 	}
@@ -992,7 +1024,7 @@ func getOrCreateSSTPSession(ctx context.Context, serverDest net.Destination, tar
 		return dialSlotSession(ctx, serverDest, dialer, baseKey, slot0Key, false)
 	})
 	if err == nil && sess != nil && sess.isSoftEther && !isProbeTestDomain(targetDest) {
-		sess.ensureAdditionalSEPipes(serverDest, dialer)
+		sess.ensureSEElasticManager(serverDest, dialer)
 	}
 	return sess, err
 }
@@ -1054,7 +1086,7 @@ func dialSlotSession(ctx context.Context, serverDest net.Destination, dialer int
 
 	if !isBackground {
 		if failTime, ok := failCache.Load(baseKey); ok {
-			if time.Since(failTime.(time.Time)) < 8*time.Second {
+			if time.Since(failTime.(time.Time)) < 6*time.Second {
 				return nil, fmt.Errorf("节点 %s 处于失败冷却中", baseKey)
 			}
 			failCache.Delete(baseKey)
@@ -1267,10 +1299,10 @@ func dialMSSSTPSessionWithHint(serverDest net.Destination, dialer internet.Diale
 		deadOnce.Do(func() {
 			close(sess.dead)
 			unbindSlotSession(baseKey, slotKey, sess)
-			sess.closeDoT()
 			connCancel()
 			_ = rawConn.Close()
 			s.Close()
+			go sess.closeDoT()
 		})
 	}
 	sess.markDead = markDead
@@ -1523,7 +1555,7 @@ func dialMSSSTPSessionWithHint(serverDest net.Destination, dialer internet.Diale
 }
 
 // =========================================================================
-// 标准 SoftEther 协议栈 (SHA-0 / PACK / QoS=1 / 流哈希 2连接聚合)
+// 标准 SoftEther 协议栈 (SHA-0 / PACK / QoS=1 / half_connection=1 / 无主弹性自愈)
 // =========================================================================
 
 const (
@@ -1813,9 +1845,9 @@ func buildSELoginPack(uniqueID []byte, random []byte) []byte {
 	p.addData("secure_password", sp[:])
 	p.addInt("use_encrypt", 1)
 	p.addInt("use_compress", 0)
-	p.addInt("max_connection", 2) // 稳速 2 连接聚合，兼顾高吞吐与低乱序
-	p.addInt("half_connection", 0)
-	p.addInt("qos", 1) // 开启服务端 ACK/SYN/DNS 小包插队 QoS
+	p.addInt("max_connection", 4)  // 协商上限 4 管，实际按 1->2->4 弹性按需拉起
+	p.addInt("half_connection", 1) // 开启收发物理分离（ACK 与视频下行互不抢占）
+	p.addInt("qos", 1)             // 开启服务端小包插队 QoS
 	p.addInt("protocol", 0)
 
 	const clientStr = "secon SoftEther Compatible Client"
@@ -1942,16 +1974,8 @@ func buildARPFrame(op uint16, srcMAC [6]byte, srcIP [4]byte, dstMAC [6]byte, dst
 	return f[:]
 }
 
-func (sess *sstpSession) runSEReceiveLoop(pipe *sePipe, isPrimary bool) {
-	defer func() {
-		if isPrimary {
-			if sess.markDead != nil {
-				sess.markDead()
-			}
-		} else {
-			sess.removeSEPipe(pipe)
-		}
-	}()
+func (sess *sstpSession) runSEReceiveLoop(pipe *sePipe) {
+	defer sess.removeSEPipe(pipe)
 
 	var hdr [4]byte
 	rxBuf := make([]byte, 65536)
@@ -2005,16 +2029,8 @@ func (sess *sstpSession) runSEReceiveLoop(pipe *sePipe, isPrimary bool) {
 	}
 }
 
-func (sess *sstpSession) runSEKeepaliveLoop(pipe *sePipe, isPrimary bool) {
-	defer func() {
-		if isPrimary {
-			if sess.markDead != nil {
-				sess.markDead()
-			}
-		} else {
-			sess.removeSEPipe(pipe)
-		}
-	}()
+func (sess *sstpSession) runSEKeepaliveLoop(pipe *sePipe) {
+	defer sess.removeSEPipe(pipe)
 
 	var kaFrame [8 + 32]byte
 	binary.BigEndian.PutUint32(kaFrame[0:4], 0xFFFFFFFF)
@@ -2042,13 +2058,6 @@ func (sess *sstpSession) runSEKeepaliveLoop(pipe *sePipe, isPrimary bool) {
 			if pipe.closed.Load() {
 				return
 			}
-			if isPrimary {
-				now := time.Now().UnixNano()
-				if now-sess.seLastRxNano.Load() > int64(kaTimeout+15*time.Second) ||
-					now-sess.seLastActiveNano.Load() > int64(600*time.Second) {
-					return
-				}
-			}
 			if err := pipe.writeFrame(kaFrame[:]); err != nil {
 				return
 			}
@@ -2056,37 +2065,96 @@ func (sess *sstpSession) runSEKeepaliveLoop(pipe *sePipe, isPrimary bool) {
 	}
 }
 
-func (sess *sstpSession) ensureAdditionalSEPipes(serverDest net.Destination, dialer internet.Dialer) {
+// 弹性多管管家：1管冷启动 -> 1秒后升2管(1上1下) -> 高清视频(>250KB/s)自动升4管 -> 断管自动静默补齐
+func (sess *sstpSession) ensureSEElasticManager(serverDest net.Destination, dialer internet.Dialer) {
 	if !sess.isSoftEther || len(sess.seSessionKey) != 20 || sess.seMaxConns <= 1 {
 		return
 	}
-	sess.seAddOnce.Do(func() {
-		extra := sess.seMaxConns - 1
-		if extra > 1 {
-			extra = 1
-		}
-		for i := 0; i < extra; i++ {
-			delay := time.Duration(i) * 80 * time.Millisecond
-			go func(wait time.Duration) {
-				if wait > 0 {
+	sess.seMgrOnce.Do(func() {
+		go func() {
+			// 错峰 1 秒避开冷启动握手和 DoT 并发高峰
+			select {
+			case <-time.After(1000 * time.Millisecond):
+			case <-sess.dead:
+				return
+			}
+
+			target := 2
+			if target > sess.seMaxConns {
+				target = sess.seMaxConns
+			}
+			lastBytes := sess.seDownBytes.Load()
+			consecFails := 0
+
+			tryFillToTarget := func() {
+				for isAlive(sess) && sess.activeSEPipeCount() < target {
+					if consecFails >= 3 {
+						break
+					}
+					if sess.dialSoftEtherAdditionalPipe(serverDest, dialer) {
+						consecFails = 0
+						select {
+						case <-time.After(250 * time.Millisecond):
+						case <-sess.dead:
+							return
+						}
+					} else {
+						consecFails++
+						select {
+						case <-time.After(time.Duration(consecFails) * 1200 * time.Millisecond):
+						case <-sess.dead:
+							return
+						}
+					}
+				}
+			}
+
+			// 首次升档至 2 管（1 上 1 下）
+			tryFillToTarget()
+
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-sess.dead:
+					return
+				case <-sess.seHealCh:
+					// 有管道被前置掐断，0.5 秒后静默自愈补齐
 					select {
-					case <-time.After(wait):
+					case <-time.After(500 * time.Millisecond):
 					case <-sess.dead:
 						return
 					}
+					consecFails = 0
+					tryFillToTarget()
+				case <-ticker.C:
+					curBytes := sess.seDownBytes.Load()
+					delta := curBytes - lastBytes
+					lastBytes = curBytes
+
+					// 2 秒内下行 > 500KB (~250KB/s，如 1080p/4K 视频或下载) 自动升档至 4 管拉满
+					if target < sess.seMaxConns && delta > 500*1024 {
+						target = sess.seMaxConns
+						consecFails = 0
+						errors.LogInfo(context.Background(), fmt.Sprintf("[VPNGate-SSL] 检测到高吞吐流 (%d KB/s)，弹性升档至 %d 管道 (%s)", delta/2048, target, sess.seSlotKey))
+					}
+
+					if sess.activeSEPipeCount() < target {
+						if consecFails > 0 {
+							consecFails--
+						}
+						tryFillToTarget()
+					}
 				}
-				if !isAlive(sess) {
-					return
-				}
-				sess.dialSoftEtherAdditionalPipe(serverDest, dialer)
-			}(delay)
-		}
+			}
+		}()
 	})
 }
 
-func (sess *sstpSession) dialSoftEtherAdditionalPipe(serverDest net.Destination, dialer internet.Dialer) {
+func (sess *sstpSession) dialSoftEtherAdditionalPipe(serverDest net.Destination, dialer internet.Dialer) bool {
 	if !isAlive(sess) {
-		return
+		return false
 	}
 	pipeCtx, pipeCancel := context.WithCancel(context.Background())
 	go func() {
@@ -2098,10 +2166,10 @@ func (sess *sstpSession) dialSoftEtherAdditionalPipe(serverDest net.Destination,
 	}()
 
 	dest := net.TCPDestination(serverDest.Address, sess.seActivePort)
-	rawConn, tlsConn, err := dialTLSWatchdog(pipeCtx, dialer, dest, sess.seSNIHost, 6000*time.Millisecond)
+	rawConn, tlsConn, err := dialTLSWatchdog(pipeCtx, dialer, dest, sess.seSNIHost, 6500*time.Millisecond)
 	if err != nil {
 		pipeCancel()
-		return
+		return false
 	}
 
 	br := bufio.NewReaderSize(tlsConn, 262144)
@@ -2118,7 +2186,7 @@ func (sess *sstpSession) dialSoftEtherAdditionalPipe(serverDest net.Destination,
 	if err != nil || helloPack.getInt("error") != 0 {
 		_ = rawConn.Close()
 		pipeCancel()
-		return
+		return false
 	}
 
 	addBytes := buildSEAdditionalConnectPack(sess.seSessionKey)
@@ -2142,7 +2210,7 @@ func (sess *sstpSession) dialSoftEtherAdditionalPipe(serverDest net.Destination,
 	if err != nil || addPack == nil || addPack.getInt("error") != 0 {
 		_ = rawConn.Close()
 		pipeCancel()
-		return
+		return false
 	}
 
 	dir := addPack.getInt("direction")
@@ -2157,22 +2225,23 @@ func (sess *sstpSession) dialSoftEtherAdditionalPipe(serverDest net.Destination,
 	if !isAlive(sess) {
 		pipe.close()
 		pipeCancel()
-		return
+		return false
 	}
 
 	totalPipes := sess.addSEPipe(pipe)
 	if pipe.closed.Load() {
 		pipeCancel()
-		return
+		return false
 	}
 
-	errors.LogInfo(context.Background(), fmt.Sprintf("[VPNGate-SSL] 原生多连接聚合已挂载 (%s) | 活跃管道: %d/%d | dir=%d", sess.seSlotKey, totalPipes, sess.seMaxConns, dir))
+	errors.LogInfo(context.Background(), fmt.Sprintf("[VPNGate-SSL] 弹性管道已挂载 (%s) | 活跃管道: %d/%d | dir=%d", sess.seSlotKey, totalPipes, sess.seMaxConns, dir))
 
 	go func() {
-		sess.runSEReceiveLoop(pipe, false)
+		sess.runSEReceiveLoop(pipe)
 		pipeCancel()
 	}()
-	go sess.runSEKeepaliveLoop(pipe, false)
+	go sess.runSEKeepaliveLoop(pipe)
+	return true
 }
 
 func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dialer, baseKey, slotKey string, knownPort net.Port) (*sstpSession, net.Port, error) {
@@ -2198,7 +2267,7 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 
 	if knownPort != 0 {
 		activePort = knownPort
-		rawConn, tlsConn, err = dialTLSWatchdog(connCtx, dialer, net.TCPDestination(serverDest.Address, knownPort), sniHost, 6000*time.Millisecond)
+		rawConn, tlsConn, err = dialTLSWatchdog(connCtx, dialer, net.TCPDestination(serverDest.Address, knownPort), sniHost, 6500*time.Millisecond)
 	} else {
 		rawConn, tlsConn, activePort, err = dialTLSSerialCandidate(connCtx, dialer, serverDest, sniHost)
 	}
@@ -2274,9 +2343,10 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 	maxConns := int(welcomePack.getInt("max_connection"))
 	if maxConns < 1 {
 		maxConns = 1
-	} else if maxConns > 2 {
-		maxConns = 2
+	} else if maxConns > 4 {
+		maxConns = 4
 	}
+	halfConn := welcomePack.getInt("half_connection") != 0
 
 	s, ep, err := newGVisorStack()
 	if err != nil {
@@ -2292,7 +2362,7 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 		defaultGW[i] = 0xff
 	}
 
-	primaryPipe := &sePipe{
+	initPipe := &sePipe{
 		rawConn:   rawConn,
 		tlsConn:   tlsConn,
 		br:        br,
@@ -2301,22 +2371,23 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 	}
 
 	sess := &sstpSession{
-		s:             s,
-		rawConn:       rawConn,
-		tlsConn:       tlsConn,
-		bw:            primaryPipe.bw,
-		dead:          make(chan struct{}),
-		isSoftEther:   true,
-		myMAC:         myMAC,
-		seSlotKey:     slotKey,
-		seHost:        host,
-		seSNIHost:     sniHost,
-		seActivePort:  activePort,
-		seSessionKey:  sessionKey,
-		seMaxConns:    maxConns,
-		seKATimeout:   kaTimeout,
-		sePrimaryPipe: primaryPipe,
-		sePipes:       []*sePipe{primaryPipe},
+		s:            s,
+		rawConn:      rawConn,
+		tlsConn:      tlsConn,
+		bw:           initPipe.bw,
+		dead:         make(chan struct{}),
+		isSoftEther:  true,
+		myMAC:        myMAC,
+		seSlotKey:    slotKey,
+		seHost:       host,
+		seSNIHost:    sniHost,
+		seActivePort: activePort,
+		seSessionKey: sessionKey,
+		seMaxConns:   maxConns,
+		seHalfConn:   halfConn,
+		seKATimeout:  kaTimeout,
+		seHealCh:     make(chan struct{}, 4),
+		sePipes:      []*sePipe{initPipe},
 	}
 	sess.gwMAC.Store(defaultGW)
 
@@ -2338,10 +2409,10 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 		deadOnce.Do(func() {
 			close(sess.dead)
 			unbindSlotSession(baseKey, slotKey, sess)
-			sess.closeDoT()
 			sess.closeAllSEPipes()
 			connCancel()
 			s.Close()
+			go sess.closeDoT()
 		})
 	}
 	sess.markDead = markDead
@@ -2350,7 +2421,6 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 	_, _ = rand.Read(xidBytes)
 	dhcpXid := binary.BigEndian.Uint32(xidBytes)
 
-	// 多管道共享的 L2 以太网帧处理器（完全线程安全）
 	sess.seFrameHandler = func(eth []byte) {
 		if len(eth) < 14 {
 			return
@@ -2456,7 +2526,7 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 										prefixLen = bits.OnesCount32(mask)
 									}
 								}
-								errors.LogInfo(bgCtx, fmt.Sprintf("[VPNGate] 隧道就绪 (%s) | 协议: SoftEther-SSL (QoS=1, maxConn=%d) | 端口: %d | IP: %s/%d", slotKey, maxConns, activePort, addr.String(), prefixLen))
+								errors.LogInfo(bgCtx, fmt.Sprintf("[VPNGate] 隧道就绪 (%s) | 协议: SoftEther-SSL (QoS=1, half=%v, maxConn=%d) | 端口: %d | IP: %s/%d", slotKey, halfConn, maxConns, activePort, addr.String(), prefixLen))
 								ipReady <- dhcpLease{ip: addr, prefixLen: prefixLen}
 							})
 						}
@@ -2467,6 +2537,7 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 		}
 
 		sess.seLastActiveNano.Store(time.Now().UnixNano())
+		sess.seDownBytes.Add(uint64(len(ipPkt)))
 		clampIPv4TCPMSSInPlace(ipPkt, 1320)
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 			Payload: buffer.MakeWithData(ipPkt),
@@ -2476,7 +2547,7 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 	}
 
 	discoverFrame := buildDHCPFrame(1, dhcpXid, myMAC, nil, nil)
-	_ = primaryPipe.writeSoftEtherFrames([][]byte{discoverFrame})
+	_ = initPipe.writeSoftEtherFrames([][]byte{discoverFrame})
 
 	go func() {
 		ticker := time.NewTicker(250 * time.Millisecond)
@@ -2489,15 +2560,34 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 				if hasIP.Load() || offerReceived.Load() {
 					return
 				}
-				_ = primaryPipe.writeSoftEtherFrames([][]byte{discoverFrame})
+				_ = initPipe.writeSoftEtherFrames([][]byte{discoverFrame})
 			}
 		}
 	}()
 
-	go sess.runSEReceiveLoop(primaryPipe, true)
-	go sess.runSEKeepaliveLoop(primaryPipe, true)
+	go sess.runSEReceiveLoop(initPipe)
+	go sess.runSEKeepaliveLoop(initPipe)
 
-	// 按 IPv4 流哈希固定管道 + 128 帧大批量冲刷发包协程，消除跨管道上行乱序
+	// 会话级统一活性看门狗（独立于单条管道生死）
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-sess.dead:
+				return
+			case <-ticker.C:
+				now := time.Now().UnixNano()
+				if now-sess.seLastRxNano.Load() > int64(kaTimeout+15*time.Second) ||
+					now-sess.seLastActiveNano.Load() > int64(600*time.Second) {
+					markDead()
+					return
+				}
+			}
+		}
+	}()
+
+	// 按 IPv4 流哈希固定上行管道 + 128 帧大批量冲刷（断管自动切走、不杀会话）
 	go func() {
 		defer markDead()
 		var batch [128]*stack.PacketBuffer
@@ -2511,9 +2601,9 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 		copy(frameHdr[10:16], myMAC[:])
 		frameHdr[16], frameHdr[17] = 0x08, 0x00
 
-		flushBucket := func(pipe *sePipe, pkts []*stack.PacketBuffer) bool {
+		flushBucket := func(pipe *sePipe, pkts []*stack.PacketBuffer) {
 			if len(pkts) == 0 {
-				return true
+				return
 			}
 			gw := sess.gwMAC.Load().([6]byte)
 			copy(frameHdr[4:10], gw[:])
@@ -2542,12 +2632,8 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 			pipe.writeMu.Unlock()
 
 			if wErr != nil {
-				if pipe == primaryPipe {
-					return false
-				}
 				sess.removeSEPipe(pipe)
 			}
-			return true
 		}
 
 		for {
@@ -2581,9 +2667,7 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 			}
 
 			if nPipes == 1 {
-				if !flushBucket(txPipes[0], batch[:nBatch]) {
-					return
-				}
+				flushBucket(txPipes[0], batch[:nBatch])
 				continue
 			}
 
@@ -2599,15 +2683,7 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 				buckets[idx] = append(buckets[idx], p)
 			}
 			for i := 0; i < nPipes; i++ {
-				if !flushBucket(txPipes[i], buckets[i]) {
-					for j := i + 1; j < nPipes; j++ {
-						for k, rem := range buckets[j] {
-							rem.DecRef()
-							buckets[j][k] = nil
-						}
-					}
-					return
-				}
+				flushBucket(txPipes[i], buckets[i])
 			}
 		}
 	}()
@@ -2783,7 +2859,7 @@ func handleVPNGateFixedNode(ctx context.Context, serverDest net.Destination, tar
             raise RuntimeError("❌ 未能在 proxy/socks/client.go 的 Process 函数中匹配到 server 变量赋值行！")
         with open(client_go, "w", encoding="utf-8") as f:
             f.write(new_code)
-        print("  ✔ [VPNGate 稳速主引擎] 成功注入 (SoftEther QoS=1 + 流哈希 2连接聚合 + gVisor Cubic 300ms RTO)")
+        print("  ✔ [VPNGate 弹性激进主引擎] 成功注入 (无主自愈 + half_connection=1 + 1->2->4 弹性换挡)")
 
 # =========================================================================
 # 7. 注入 VPNGate OpenVPN 极速引擎 (250ms UDP ARQ + 长连接复用 DoT + 四路 DNS 竞速)
