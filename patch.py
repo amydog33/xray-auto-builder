@@ -380,7 +380,7 @@ type sePipe struct {
 	br        *bufio.Reader
 	bw        *bufio.Writer
 	writeMu   sync.Mutex
-	direction uint32 // 0=TCP_BOTH, 1=TCP_SERVER_TO_CLIENT, 2=TCP_CLIENT_TO_SERVER
+	direction uint32
 	closed    atomic.Bool
 }
 
@@ -431,9 +431,6 @@ func (p *sePipe) writeSoftEtherFrames(ethFrames [][]byte) error {
 	return p.bw.Flush()
 }
 
-// =========================================================================
-// SoftEther 原生 UDP Acceleration 加速通道 (支持 V2 ChaCha20-Poly1305 与 V1 SHA0+RC4)
-// =========================================================================
 type seUDPAccel struct {
 	conn         net.Conn
 	version      uint32
@@ -483,10 +480,9 @@ func (u *seUDPAccel) sendFrame(eth []byte) error {
 	if u == nil || u.closed.Load() || u.conn == nil || len(eth) > 0xFFFF {
 		return io.ErrClosedPipe
 	}
-
 	extra := 0
 	if u.version == 1 {
-		extra = 20 // V1 尾部 20 字节全零校验区
+		extra = 20
 	}
 	plainLen := 23 + len(eth) + extra
 	plain := make([]byte, plainLen)
@@ -494,14 +490,14 @@ func (u *seUDPAccel) sendFrame(eth []byte) error {
 	binary.BigEndian.PutUint64(plain[4:12], u.myTick())
 	binary.BigEndian.PutUint64(plain[12:20], u.serverTick.Load())
 	binary.BigEndian.PutUint16(plain[20:22], uint16(len(eth)))
-	plain[22] = 0 // compress_flag = 0
+	plain[22] = 0
 	copy(plain[23:23+len(eth)], eth)
 
 	var out []byte
 	if u.version == 2 && u.aeadSend != nil {
 		var nonce [12]byte
 		_, _ = rand.Read(nonce[:])
-		nonce[0] |= 0x01 // 避免全零 IV
+		nonce[0] |= 0x01
 		out = make([]byte, 12, 12+plainLen+16)
 		copy(out[:12], nonce[:])
 		out = u.aeadSend.Seal(out, nonce[:], plain, nil)
@@ -588,7 +584,6 @@ type sstpSession struct {
 	dhcpDNS     [4]byte
 	hasDHCPDNS  atomic.Bool
 
-	// SoftEther 无主多管自愈 + UDP 加速字段
 	seSlotKey        string
 	seHost           string
 	seSNIHost        string
@@ -606,7 +601,6 @@ type sstpSession struct {
 	seTxRR           atomic.Uint64
 	seUDP            *seUDPAccel
 
-	// 持久化复用的外层 DoT 长连接
 	dotMu   sync.Mutex
 	dotConn *tls.Conn
 }
@@ -1299,7 +1293,6 @@ func dialSlotSession(ctx context.Context, serverDest net.Destination, dialer int
 			return sess, nil
 		}
 		errors.LogWarning(bgCtx, fmt.Sprintf("[VPNGate-SSL] %s 失败: %v", serverDest.String(), seErr))
-		// 仅当端口 TLS 确认可达时才回退尝试其他协议，死端口 1 轮直接熔断
 		if hitPort != 0 {
 			if sstpSess, sstpErr := dialMSSSTPSession(net.TCPDestination(serverDest.Address, hitPort), dialer, baseKey, slotKey); sstpErr == nil {
 				ovpnProtoCache.Store(baseKey, "ms-sstp")
@@ -1472,7 +1465,8 @@ func dialMSSSTPSessionWithHint(serverDest net.Destination, dialer internet.Diale
 		rxBuf := make([]byte, 16384)
 		papSent := false
 		connSent := false
-		var serverNonce [32]bytesendCallConnected := func() {
+		var serverNonce [32]byte
+		sendCallConnected := func() {
 			if connSent {
 				return
 			}
@@ -1710,10 +1704,6 @@ func dialMSSSTPSessionWithHint(serverDest net.Destination, dialer internet.Diale
 	bindSlotSession(baseKey, slotKey, sess)
 	return sess, activePort, false, nil
 }
-
-// =========================================================================
-// 标准 SoftEther 协议栈 (SHA-0 / PACK / QoS=1 / UDP 加速 V1&V2 / TCP 4管自愈)
-// =========================================================================
 
 const (
 	seTypeInt    uint32 = 0
@@ -1992,7 +1982,7 @@ func readSEPackResponse(br *bufio.Reader) (*sePack, error) {
 	return unmarshalSEPack(raw)
 }
 
-func buildSELoginPack(uniqueID []byte, random []byte, enableUDP bool, cliKeyV1 [20]byte, cliKeyV2 [32]byte, cliCookie uint32) []byte {
+func buildSELoginPack(uniqueID, random []byte, enableUDP bool, cliKeyV1 [20]byte, cliKeyV2 [32]byte, cliCookie uint32) []byte {
 	p := &sePack{}
 	p.addStr("method", "login")
 	p.addStr("hubname", "VPNGATE")
@@ -2003,7 +1993,7 @@ func buildSELoginPack(uniqueID []byte, random []byte, enableUDP bool, cliKeyV1 [
 	p.addInt("use_encrypt", 1)
 	p.addInt("use_compress", 0)
 	if enableUDP {
-		p.addInt("max_connection", 1) // UDP 加速模式下 TCP 仅作信令与兜底，1 管最快
+		p.addInt("max_connection", 1)
 		p.addInt("use_udp_acceleration", 1)
 		p.addInt("udp_acceleration_max_version", 2)
 		p.addInt("udp_acceleration_client_cookie", cliCookie)
@@ -2152,7 +2142,6 @@ func (sess *sstpSession) startSEUDPAccel(connCtx context.Context, serverDest net
 	u.conn = udpConn
 
 	var readyOnce sync.Once
-	// UDP 收包循环
 	go func() {
 		defer u.close()
 		rxBuf := make([]byte, 4096)
@@ -2179,7 +2168,6 @@ func (sess *sstpSession) startSEUDPAccel(connCtx context.Context, serverDest net
 		}
 	}()
 
-	// UDP 初始打洞 + 1秒高频保活（保持前置 NAT 映射与加速激活态）
 	go func() {
 		for i := 0; i < 3; i++ {
 			if u.closed.Load() || !isAlive(sess) {
@@ -2298,7 +2286,6 @@ func (sess *sstpSession) runSEKeepaliveLoop(pipe *sePipe) {
 	}
 }
 
-// 纯 TCP 直拉满管管家（UDP 加速模式已设为 maxConns=1，自动跳过）
 func (sess *sstpSession) ensureSEElasticManager(serverDest net.Destination, dialer internet.Dialer) {
 	if !sess.isSoftEther || len(sess.seSessionKey) != 20 || sess.seMaxConns <= 1 || sess.seUDP != nil {
 		return
@@ -2346,7 +2333,6 @@ func (sess *sstpSession) ensureSEElasticManager(serverDest net.Destination, dial
 
 			ticker := time.NewTicker(5 * time.Second)
 			defer ticker.Stop()
-
 			for {
 				select {
 				case <-sess.dead:
@@ -2578,7 +2564,6 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 		maxConns = 4
 	}
 
-	// 解析服务端下发的 UDP Acceleration 参数
 	var udpAccel *seUDPAccel
 	if enableUDP && welcomePack.getInt("use_udp_acceleration") != 0 {
 		srvPort := welcomePack.getInt("udp_acceleration_server_port")
@@ -2849,10 +2834,9 @@ func dialSoftEtherNativeSession(serverDest net.Destination, dialer internet.Dial
 		}
 	}()
 
-go sess.runSEReceiveLoop(initPipe)
+	go sess.runSEReceiveLoop(initPipe)
 	go sess.runSEKeepaliveLoop(initPipe)
 
-	// 会话级统一活性看门狗
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
@@ -2871,7 +2855,6 @@ go sess.runSEReceiveLoop(initPipe)
 		}
 	}()
 
-	// 上行发包循环：UDP 加速就绪时直走 UDP，未就绪或异常时无感回落 TCP 管道
 	go func() {
 		defer markDead()
 		var batch [128]*stack.PacketBuffer
@@ -2941,7 +2924,6 @@ go sess.runSEReceiveLoop(initPipe)
 				nBatch++
 			}
 
-			// 优先尝试走原生 UDP 加速通道
 			startIdx := 0
 			if sess.seUDP != nil && sess.seUDP.isReady() {
 				gw := sess.gwMAC.Load().([6]byte)
